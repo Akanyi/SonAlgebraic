@@ -1,0 +1,30 @@
+10 REM 第三批特性验证：位运算 + SYS.STRING 字符串操作
+20 USE SYS.STRING AS STR
+30 DIM flags AS NUM AS LONG AS VAR
+40 DIM name AS STRING AS VAR
+50 DIM upper AS STRING AS VAR
+60 DIM greeting AS STRING AS VAR
+70 DIM len AS NUM AS LONG AS VAR
+80 DIM pos AS NUM AS LONG AS VAR
+90 SUB main AS PUBLIC AS VOID
+100 REM 位运算做权限标志位
+110 flags = 0x01 BOR 0x04
+120 PRINT F"flags = {flags}"
+130 IF flags BAND 0x04 THEN
+140 PRINT "flag 0x04 is set"
+150 END IF
+160 PRINT F"shifted = {1 SHL 8}"
+170 REM 字符串操作
+180 name = "sonalgebraic"
+190 len = STR.LENGTH(name)
+200 PRINT F"len = {len}"
+210 upper = STR.UPPER(name)
+220 PRINT F"upper = {upper}"
+230 greeting = STR.CONCAT("Hello, ", name)
+240 PRINT F"greeting = {greeting}"
+250 pos = STR.FIND(name, "algebra")
+260 PRINT F"pos = {pos}"
+270 PRINT F"slice = {STR.SLICE(name, 0, 3)}"
+280 .ENDSUB
+290 CALL main
+300 END

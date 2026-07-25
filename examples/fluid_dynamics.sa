@@ -1,0 +1,102 @@
+10 REM 流体动力学方程符号计算示例
+20 REM 使用 SYMBOL 类型表示和打印流体力学方程
+30 REM
+40 REM Bernoulli 方程: P + (1/2)*ρ*v^2 + ρ*g*h = constant
+50 REM 连续性方程: ρ*A*v = constant (一维)
+60 REM 简化纳维-斯托克斯（1D）: ρ*a = -∇P + η*∇^2*v
+70 REM
+80 DIM P AS NUM AS DOUBLE AS VAR
+90 DIM rho AS NUM AS DOUBLE AS VAR
+100 DIM v AS NUM AS DOUBLE AS VAR
+110 DIM g AS NUM AS DOUBLE AS VAR
+120 DIM h AS NUM AS DOUBLE AS VAR
+130 DIM A AS NUM AS DOUBLE AS VAR
+140 DIM eta AS NUM AS DOUBLE AS VAR
+150 DIM accel AS NUM AS DOUBLE AS VAR
+160 REM
+170 DIM bernoulli AS SYMBOL AS VAR
+180 DIM continuity AS SYMBOL AS VAR
+190 DIM navier_stokes_term AS SYMBOL AS VAR
+200 DIM pressure_term AS SYMBOL AS VAR
+210 DIM kinetic_term AS SYMBOL AS VAR
+220 DIM potential_term AS SYMBOL AS VAR
+230 DIM total_energy AS SYMBOL AS VAR
+240 DIM volumetric_flow AS SYMBOL AS VAR
+250 DIM mass_flow AS SYMBOL AS VAR
+260 DIM reynolds_numerator AS SYMBOL AS VAR
+270 DIM reynolds_denominator AS SYMBOL AS VAR
+280 REM
+290 SUB main AS PUBLIC AS VOID
+300 REM 初始化常数（以双精度浮点数表示）
+310 P = 101325.0
+320 rho = 1000.0
+330 v = 5.0
+340 g = 9.81
+350 h = 10.0
+360 A = 0.1
+370 eta = 0.001
+380 accel = 2.5
+390 REM
+400 REM 符号计算：Bernoulli 方程
+410 REM P + (1/2)*ρ*v^2 + ρ*g*h = constant
+420 bernoulli = P + 0.5 * rho * v * v + rho * g * h
+430 PRINT "Bernoulli 方程（能量守恒）:"
+440 PRINT F"E_total = {bernoulli}"
+450 PRINT ""
+460 REM
+470 REM 符号计算：连续性方程
+480 REM ρ*A*v = constant (质量守恒)
+490 continuity = rho * A * v
+500 PRINT "连续性方程（质量守恒）:"
+510 PRINT F"Q_volumetric = {continuity} (立方米/秒)"
+520 PRINT ""
+530 REM
+540 REM 符号计算：简化纳维-斯托克斯方程
+550 REM 加速度项与力的关系
+560 REM ρ*a = pressure_gradient_term + viscous_term
+570 navier_stokes_term = rho * accel
+580 PRINT "纳维-斯托克斯方程（动量守恒）:"
+590 PRINT F"ρ*accel (惯性项) = {navier_stokes_term}"
+600 PRINT "完整形式: ρ*a = -∇P + η*∇²v"
+610 PRINT ""
+620 REM
+630 REM 额外计算：各项的物理意义
+640 pressure_term = P
+650 kinetic_term = 0.5 * rho * v * v
+660 potential_term = rho * g * h
+670 PRINT "Bernoulli 方程各项分解:"
+680 PRINT F"  静压能: {pressure_term}"
+690 PRINT F"  动能: {kinetic_term}"
+700 PRINT F"  重力势能: {potential_term}"
+710 PRINT ""
+720 REM
+730 REM 流量计算
+740 volumetric_flow = A * v
+750 mass_flow = rho * volumetric_flow
+760 PRINT "流量计算（连续性方程应用）:"
+770 PRINT F"  体积流量 Q = A*v = {volumetric_flow}"
+780 PRINT F"  质量流量 ṁ = ρ*Q = {mass_flow}"
+790 PRINT ""
+800 REM
+810 REM 能量守恒演示
+820 total_energy = pressure_term + kinetic_term + potential_term
+830 PRINT "单位体积流体的总能量:"
+840 PRINT F"  E_total = {total_energy}"
+850 PRINT ""
+860 REM
+870 REM 雷诺数（无量纲参数）：表示流体的惯性力与粘性力比
+880 reynolds_numerator = rho * v * 1.0
+890 reynolds_denominator = eta
+900 PRINT "雷诺数计算（无量纲）:"
+910 PRINT F"  分子（惯性）= {reynolds_numerator}"
+920 PRINT F"  分母（粘性）= {reynolds_denominator}"
+930 PRINT "  Re = (ρ*v*L) / η"
+940 PRINT ""
+950 REM
+960 PRINT "说明:"
+970 PRINT "  此示例演示用 SYMBOL 类型捕获流体动力学方程的表达式树。"
+980 PRINT "  每个方程都作为符号表达式存储，保留数学结构供后续分析。"
+990 PRINT "  未来可扩展支持求导、化简、参数代入等符号计算操作。"
+1000 .ENDSUB
+1010 CALL main
+1020 END

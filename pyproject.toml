@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sonalgebraic"
+version = "0.1.0"
+description = "SonAlgebraic：强制行号的小语言，稳定 C 后端与实验 native/LLVM 后端平行开发"
+requires-python = ">=3.10"
+dependencies = [
+    "jinja2>=3.1",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+sonc = "sonalgebraic.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sonalgebraic*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# 按主题分类的标记；e2e/ffi 需要本机 C 工具链，可用 -m "not e2e" 跳过
+markers = [
+    "e2e: 端到端测试，需要可用的 C 编译器",
+    "ffi: 反向 FFI 测试，需要 gcc 生成/链接动态库",
+]
+addopts = "-ra --tb=short"

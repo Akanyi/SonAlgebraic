@@ -1,0 +1,5 @@
+# 仓库内统一存 LF，checkout 按平台转换，避免跨平台 CI 上 diff 噪音
+* text=auto
+*.sa text
+*.py text
+*.md text

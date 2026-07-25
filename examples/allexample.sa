@@ -1,0 +1,166 @@
+10 REM SonAlgebraic all-in-one smoke example
+20 USE SYS.MATH AS M
+30 USE SYS.STRING AS STR
+40 USEC "stdio.h" AS STDIO
+50 DECLARE C SUB STDIO.puts(s AS STRING) AS NUM AS LONG
+60 REM --- 枚举 ---
+70 ENUM Color
+80 RED
+90 GREEN
+100 BLUE
+110 .ENDENUM
+120 REM --- 实体 ---
+130 FOR ENTITY AS NameBox
+140 DIM text AS STRING AS VAR
+150 .ENDENTITY
+160 FOR ENTITY AS Profile
+170 DIM name AS ENTITY AS NameBox AS VAR
+180 DIM score AS NUM AS LONG AS VAR
+190 .ENDENTITY
+200 REM --- 全局声明 ---
+210 DIM trap AS ERROR AS VAR
+220 DIM x AS NUM AS LONG AS VAR
+230 DIM area AS NUM AS DOUBLE AS VAR
+240 DIM expr AS SYMBOL AS VAR
+250 DIM df AS SYMBOL AS VAR
+260 DIM p AS PTR TO NUM AS LONG AS VAR
+270 DIM raw AS CPTR AS VAR
+280 DIM nullp AS PTR TO NUM AS LONG AS VAR
+290 DIM flag AS BOOL AS VAR
+300 DIM hexval AS NUM AS LONG AS VAR
+310 DIM sci AS NUM AS DOUBLE AS VAR
+320 DIM big AS NUM AS LONG AS VAR
+330 DIM mask AS NUM AS LONG AS VAR
+340 DIM i AS NUM AS LONG AS VAR
+350 DIM total AS NUM AS LONG AS VAR
+360 DIM scores[4] AS NUM AS LONG AS VAR
+370 DIM names[3] AS STRING AS VAR
+380 DIM greeting AS STRING AS VAR
+390 DIM evalAt AS NUM AS DOUBLE AS VAR
+400 REM --- 子程序 ---
+410 SUB add(a AS NUM AS LONG, b AS NUM AS LONG) AS NUM AS LONG
+420 RETURN a + b
+430 .ENDSUB
+440 SUB bump(value AS NUM AS LONG AS REF) AS VOID
+450 value = value + 1
+460 .ENDSUB
+470 SUB showProfile(item AS ENTITY AS Profile) AS VOID
+480 PRINT F"Profile {item.name.text}: {item.score}"
+490 .ENDSUB
+500 SUB risky AS VOID
+510 THROW NEW ERR_DEMO, "controlled failure"
+520 .ENDSUB
+530 REM grade 靠完整 IF/ELSE IF/ELSE 各分支返回，无需末尾兜底 RETURN
+540 SUB grade(s AS NUM AS LONG) AS STRING
+550 IF s >= 90 THEN
+560 RETURN "A"
+570 ELSE IF s >= 80 THEN
+580 RETURN "B"
+590 ELSE IF s >= 60 THEN
+600 RETURN "C"
+610 ELSE
+620 RETURN "F"
+630 END IF
+640 .ENDSUB
+650 SUB main AS PUBLIC AS VOID
+660 PRINT "== SonAlgebraic All Example =="
+670 REM --- 函数 + REF 传参 ---
+680 x = CALL add(2, 3)
+690 CALL bump(x)
+700 PRINT F"add + ref bump = {x}"
+710 REM --- 内置数学常量 ---
+720 area = M.PI * M.POW(3.0, 2.0)
+730 PRINT F"circle area = {area}, e = {M.E}, tau = {M.TAU}"
+740 PRINT F"max long = {M.MAX_LONG}"
+750 REM --- 数值字面量：十六进制 / 科学计数 / 下划线 ---
+760 hexval = 0xFF
+770 sci = 1.5e3
+780 big = 1_000_000
+790 PRINT F"hex={hexval} sci={sci} big={big}"
+800 REM --- BOOL / 位运算 / ELSE ---
+810 flag = TRUE
+820 mask = 0x0F BAND 0x3C BOR 1 SHL 4
+830 IF flag AND mask > 0 THEN
+840 PRINT F"flag on, mask = {mask}"
+850 ELSE
+860 PRINT "flag off"
+870 END IF
+880 REM --- NULL ---
+890 nullp = NULL
+900 IF nullp = NULL THEN
+910 PRINT "nullp is null"
+920 END IF
+930 REM --- 枚举 ---
+940 IF Color.GREEN = 1 THEN
+950 PRINT F"Color.GREEN = {Color.GREEN}, Color.BLUE = {Color.BLUE}"
+960 END IF
+970 REM --- 数值数组 + FOR 循环 ---
+980 FOR i = 0 TO 3
+990 scores[i] = i * i
+1000 .ENDFOR
+1010 total = 0
+1020 FOR i = 0 TO 3
+1030 total = total + scores[i]
+1040 .ENDFOR
+1050 PRINT F"sum of squares 0..3 = {total}"
+1060 REM --- WHILE 循环 ---
+1070 i = 3
+1080 WHILE i > 0
+1090 PRINT F"countdown {i}"
+1100 i = i - 1
+1110 .ENDWHILE
+1120 REM --- 字符串数组 + SYS.STRING ---
+1130 names[0] = "lans"
+1140 names[1] = STR.UPPER("son")
+1150 names[2] = STR.REPLACE("a-b-c", "-", "+")
+1160 FOR i = 0 TO 2
+1170 PRINT F"names[{i}] = {names[i]} (len {STR.LENGTH(names[i])})"
+1180 .ENDFOR
+1190 greeting = STR.CONCAT("Hello, ", STR.SLICE("SonAlgebraic", 0, 3))
+1200 PRINT F"greeting = {greeting}"
+1205 total = STR.FIND(greeting, "lo")
+1207 PRINT F"find 'lo' in greeting = {total}"
+1210 REM --- ELSE IF 返回值函数 ---
+1220 greeting = CALL grade(85)
+1225 PRINT F"grade(85) = {greeting}"
+1228 greeting = CALL grade(50)
+1229 PRINT F"grade(50) = {greeting}"
+1230 REM --- 实体深拷贝 ---
+1240 DIM first AS ENTITY AS Profile AS VAR
+1250 DIM second AS ENTITY AS Profile AS VAR
+1260 first.name.text = "LANS"
+1270 first.score = 99
+1280 second = first
+1290 second.name.text = "SA"
+1300 second.score = 100
+1310 CALL showProfile(first)
+1320 CALL showProfile(second)
+1330 REM --- SYMBOL 完整代数：捕获 / 求导 / 化简 / 代入求值 ---
+1340 expr = x * x + 2 * x
+1350 PRINT F"symbol f = {expr}"
+1360 df = SIMPLIFY(DERIV(expr, "x"))
+1370 PRINT F"derivative f' = {df}"
+1380 evalAt = EVAL(SUBST(expr, "x", 4))
+1390 PRINT F"f(4) = {evalAt}"
+1400 REM --- 指针 / 解引用 / CAST ---
+1410 p = @x
+1420 ^p = ^p + 10
+1430 PRINT F"pointer updated x = {x}"
+1440 raw = CAST CPTR p
+1450 PRINT F"raw pointer = {raw}"
+1460 REM --- 结构化异常 ---
+1470 TRY CALL risky TRACEBACK ERROR AS trap
+1480 CATCH ERR_DEMO AS e
+1490 PRINT F"caught error = {e}"
+1500 .ENDTRY
+1510 REM --- C FFI ---
+1520 CALL STDIO.puts("ffi puts ok")
+1530 REM --- GOSUB ---
+1540 GOSUB ::tail
+1550 RETURN
+1560 ::tail
+1570 PRINT "gosub tail ok"
+1580 RETURN
+1590 .ENDSUB
+1600 CALL main
+1610 END

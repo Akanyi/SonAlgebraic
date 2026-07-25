@@ -1,0 +1,15 @@
+10 USE SAMATH AS M
+20 DIM value AS NUM AS DOUBLE AS VAR
+30 DIM close AS BOOL AS VAR
+40 SUB main AS PUBLIC AS VOID
+50 value = M.pow(2.0, 8.0) + M.sin(M.PI / 2.0)
+60 PRINT F"value={value}"
+70 value = M.gaussian_pdf(0.0, 0.0, 1.0)
+80 PRINT F"normal_pdf={value}"
+90 close = M.is_close(value, 0.3989422804014327, 0.000001)
+100 IF close THEN
+110 PRINT "samath ok"
+120 END IF
+130 .ENDSUB
+140 CALL main
+150 END

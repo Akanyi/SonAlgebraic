@@ -1,0 +1,127 @@
+10 REM 偏微分方程符号计算示例
+20 REM 使用 SYMBOL 和 DERIV 求解热传导、波动等经典 PDE
+30 REM
+40 USE SYS.MATH AS MATH
+50 REM
+60 DIM u AS SYMBOL AS VAR
+70 DIM u_t AS SYMBOL AS VAR
+80 DIM u_xx AS SYMBOL AS VAR
+90 DIM u_tt AS SYMBOL AS VAR
+100 DIM u_xx_2 AS SYMBOL AS VAR
+110 DIM u_yy AS SYMBOL AS VAR
+120 REM
+130 DIM diff_u_x AS SYMBOL AS VAR
+140 DIM diff_u_t AS SYMBOL AS VAR
+150 DIM diff_u_xx AS SYMBOL AS VAR
+160 DIM diff_u_tt AS SYMBOL AS VAR
+170 REM
+180 DIM heat_eq AS SYMBOL AS VAR
+190 DIM wave_eq AS SYMBOL AS VAR
+200 DIM laplace_eq AS SYMBOL AS VAR
+210 REM
+220 DIM laplacian_symbolic AS SYMBOL AS VAR
+230 DIM result_deriv AS SYMBOL AS VAR
+240 REM
+250 DIM alpha AS NUM AS DOUBLE AS VAR
+260 DIM c_wave AS NUM AS DOUBLE AS VAR
+270 REM
+280 SUB main AS PUBLIC AS VOID
+290 REM 初始化参数
+300 alpha = 0.1
+310 c_wave = 1.0
+320 REM
+330 PRINT "════════════════════════════════════════════════════════"
+340 PRINT "偏微分方程（PDE）的符号表示与求导"
+350 PRINT "════════════════════════════════════════════════════════"
+360 PRINT ""
+370 REM
+380 PRINT "【PDE 1】一维热传导方程"
+390 PRINT "─────────────────────────────────────"
+400 REM 一维热传导方程：∂u/∂t = α·∂²u/∂x²
+410 REM u(x,t) 是温度，α 是热扩散系数
+420 REM 我们用符号表示：u_t = α·u_xx
+430 u_t = alpha * 1.0
+440 u_xx = 1.0
+450 heat_eq = u_t - alpha * u_xx
+460 PRINT "方程形式：∂u/∂t = α·∂²u/∂x²"
+470 PRINT F"符号表示：{heat_eq}"
+480 PRINT ""
+490 REM 对 u_xx 再求导（求三阶导数）
+500 diff_u_xx = DERIV(u_xx, "x")
+510 PRINT "对 u_xx 对 x 再求导："
+520 PRINT F"  ∂³u/∂x³ = {diff_u_xx}"
+530 PRINT ""
+540 REM 热传导的时间导数
+550 diff_u_t = DERIV(u_t, "t")
+560 PRINT "对 u_t 对 t 求导："
+570 PRINT F"  ∂²u/∂t² = {diff_u_t}"
+580 PRINT ""
+590 PRINT ""
+600 REM
+610 PRINT "【PDE 2】一维波动方程"
+620 PRINT "─────────────────────────────────────"
+630 REM 一维波动方程：∂²u/∂t² = c²·∂²u/∂x²
+640 REM u(x,t) 是波场，c 是波速
+650 u_tt = 1.0
+660 u_xx_2 = 1.0
+670 wave_eq = u_tt - c_wave * c_wave * u_xx_2
+680 PRINT "方程形式：∂²u/∂t² = c²·∂²u/∂x²"
+690 PRINT F"符号表示：{wave_eq}"
+700 PRINT ""
+710 REM 对波方程的二阶空间导数进行四阶导数
+720 diff_u_tt = DERIV(u_tt, "t")
+730 PRINT "对 u_tt 对 t 求导："
+740 PRINT F"  ∂³u/∂t³ = {diff_u_tt}"
+750 PRINT ""
+760 REM
+770 REM 波动方程与热方程的对比
+780 REM
+790 PRINT "波热方程对比："
+800 PRINT ""
+810 PRINT "热传导（扩散）：∂u/∂t = α·∂²u/∂x²"
+820 PRINT "  • 一阶时间导数、二阶空间导数"
+830 PRINT "  • 平滑化现象、快速衰减"
+840 PRINT "  • 无振荡，单调演化"
+850 PRINT ""
+860 PRINT "波动方程（双曲线）：∂²u/∂t² = c²·∂²u/∂x²"
+870 PRINT "  • 二阶时间导数、二阶空间导数"
+880 PRINT "  • 波传播、能量守恒"
+890 PRINT "  • 产生振荡和干涉现象"
+900 PRINT ""
+910 PRINT ""
+920 REM
+930 PRINT "【PDE 3】二维拉普拉斯方程（泊松方程）"
+940 PRINT "─────────────────────────────────────"
+950 REM ∇²u = ∂²u/∂x² + ∂²u/∂y² = 0（边值问题）
+960 u_xx = 1.0
+970 u_yy = 1.0
+980 laplace_eq = u_xx + u_yy
+990 PRINT "方程形式：∇²u = ∂²u/∂x² + ∂²u/∂y² = 0"
+1000 PRINT F"拉普拉斯算子：∇²u = {laplace_eq}"
+1010 PRINT ""
+1020 REM 拉普拉斯算子的混合导数
+1030 laplacian_symbolic = u_xx + u_yy
+1040 result_deriv = DERIV(laplacian_symbolic, "x")
+1050 PRINT "对拉普拉斯算子对 x 求导："
+1060 PRINT F"  ∂(∇²u)/∂x = {result_deriv}"
+1070 PRINT ""
+1080 PRINT ""
+1090 REM
+1100 PRINT "════════════════════════════════════════════════════════"
+1110 PRINT "PDE 求解方法论："
+1120 PRINT ""
+1130 PRINT "1. 符号表示：用 SYMBOL 类型描述 PDE"
+1140 PRINT "2. 符号求导：DERIV() 对任意变量求偏导"
+1150 PRINT "3. 代入求解：SUBST() 代入边界条件或初值"
+1160 PRINT "4. 数值求解：EVAL() 计算特定点的值"
+1170 PRINT "5. 方程化简：SIMPLIFY() 简化复杂表达式"
+1180 PRINT ""
+1190 PRINT "应用领域："
+1200 PRINT "  • 热学与扩散过程"
+1210 PRINT "  • 声学与电磁波"
+1220 PRINT "  • 流体力学（Navier-Stokes）"
+1230 PRINT "  • 量子力学（Schrödinger 方程）"
+1240 PRINT "════════════════════════════════════════════════════════"
+1250 .ENDSUB
+1260 CALL main
+1270 END

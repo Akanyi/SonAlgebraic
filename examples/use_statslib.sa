@@ -1,0 +1,18 @@
+10 USE STATSLIB AS ST
+20 DIM avg AS NUM AS DOUBLE AS VAR
+30 DIM weighted AS NUM AS DOUBLE AS VAR
+40 DIM safe AS NUM AS DOUBLE AS VAR
+50 DIM ok AS NUM AS LONG AS VAR
+60 SUB main AS PUBLIC AS VOID
+70 avg = ST.average(72.0, 88.0, 95.0)
+80 weighted = ST.weighted(78.0, 91.0)
+90 safe = ST.clamp(103.0)
+100 ok = ST.passed(weighted)
+110 PRINT F"avg={avg}"
+120 PRINT F"weighted={weighted}"
+130 PRINT F"safe={safe}"
+140 PRINT F"passed={ok}"
+150 PRINT F"pass_line={ST.PASS_LINE}"
+160 .ENDSUB
+170 CALL main
+180 END

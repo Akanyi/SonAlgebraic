@@ -1,0 +1,10 @@
+10 SUB main AS PUBLIC AS VOID
+20 GOSUB ::helper
+30 PRINT "Back!"
+40 RETURN
+50 ::helper
+60 PRINT "In helper"
+70 RETURN
+80 .ENDSUB
+90 CALL main
+100 END

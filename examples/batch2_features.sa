@@ -1,0 +1,30 @@
+10 REM 第二批特性验证：数组 + FOR/WHILE 循环
+20 DIM scores[5] AS NUM AS LONG AS VAR
+30 DIM total AS NUM AS LONG AS VAR
+40 DIM i AS NUM AS LONG AS VAR
+50 DIM countdown AS NUM AS LONG AS VAR
+60 SUB main AS PUBLIC AS VOID
+70 REM 用 FOR 填充数组
+80 FOR i = 0 TO 4
+90 scores[i] = i * 10
+100 .ENDFOR
+110 REM 用 FOR 累加
+120 total = 0
+130 FOR i = 0 TO 4
+140 total = total + scores[i]
+150 .ENDFOR
+160 PRINT F"total = {total}"
+170 REM 带 STEP 的倒序
+180 FOR i = 10 TO 0 STEP -5
+190 PRINT F"step i = {i}"
+200 .ENDFOR
+210 REM WHILE 循环
+220 countdown = 3
+230 WHILE countdown > 0
+240 PRINT F"countdown = {countdown}"
+250 countdown = countdown - 1
+260 .ENDWHILE
+270 PRINT F"first={scores[0]} last={scores[4]}"
+280 .ENDSUB
+290 CALL main
+300 END

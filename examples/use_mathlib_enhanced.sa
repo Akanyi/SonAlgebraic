@@ -1,0 +1,101 @@
+10 REM 增强数学库使用示例
+20 REM 演示矩阵运算、超越函数和偏微分方程符号计算
+30 REM
+40 USE mathlib_enhanced AS MATH_LIB
+50 USE SYS.MATH AS SYSM
+60 USE SYS.IO AS IO
+70 REM
+80 DIM result AS NUM AS DOUBLE AS VAR
+90 DIM val1 AS NUM AS DOUBLE AS VAR
+100 DIM val2 AS NUM AS DOUBLE AS VAR
+110 DIM det AS NUM AS DOUBLE AS VAR
+120 DIM inv AS NUM AS DOUBLE AS VAR
+130 DIM trace AS NUM AS DOUBLE AS VAR
+140 REM
+150 SUB main AS PUBLIC AS VOID
+160 PRINT "═══════════════════════════════════════════════════════"
+170 PRINT "增强数学库演示"
+180 PRINT "═══════════════════════════════════════════════════════"
+190 PRINT ""
+200 REM
+210 PRINT "【第一部分】超越函数计算"
+220 PRINT "─────────────────────────────────────"
+230 REM 正弦函数
+240 result = CALL MATH_LIB.sin_approx
+250 PRINT F"sin(0.5) ≈ {result}"
+260 PRINT F"参考值（系统 SYS.MATH）: sin需要 arcsin/asin 支持"
+270 PRINT ""
+280 REM 余弦函数
+290 val1 = CALL MATH_LIB.cos_approx
+300 PRINT F"cos(0.5) ≈ {val1}"
+310 PRINT ""
+320 REM 指数函数
+330 val2 = CALL MATH_LIB.exp_approx
+340 PRINT F"exp(1.0) ≈ {val2}"
+350 PRINT F"标准值 e = {MATH_LIB.E}"
+360 PRINT ""
+370 REM 平方根
+380 result = CALL MATH_LIB.sqrt_newton
+390 PRINT F"sqrt(2.0) ≈ {result}"
+400 PRINT F"√2 理论值 = {MATH_LIB.SQRT2}"
+410 PRINT ""
+420 PRINT ""
+430 REM
+440 PRINT "【第二部分】矩阵运算"
+450 PRINT "─────────────────────────────────────"
+460 PRINT "矩阵 A 的元素:"
+470 PRINT "  [ 1.0  2.0 ]"
+480 PRINT "  [ 3.0  4.0 ]"
+490 PRINT ""
+500 REM 行列式
+510 det = CALL MATH_LIB.det_2x2
+520 PRINT F"det(A) = 1*4 - 2*3 = {det}"
+530 PRINT ""
+540 REM 矩阵的迹（对角线元素之和）
+550 trace = CALL MATH_LIB.trace_2x2
+560 PRINT F"trace(A) = 1 + 4 = {trace}"
+570 PRINT ""
+580 REM 逆矩阵
+590 inv = CALL MATH_LIB.inv_2x2
+600 PRINT F"det(A)⁻¹ = 1/(-2) = {inv}"
+610 PRINT ""
+620 PRINT ""
+630 REM
+640 PRINT "【第三部分】辅助函数"
+650 PRINT "─────────────────────────────────────"
+660 REM 值域限制
+670 result = CALL MATH_LIB.clamp_val
+680 PRINT F"clamp(0.5, [0,1]) = {result}"
+690 PRINT ""
+700 REM 线性插值
+710 result = CALL MATH_LIB.lerp
+720 PRINT F"lerp(1.0, 5.0, 0.5) = {result}"
+730 PRINT "（在 1 和 5 之间取中点）"
+740 PRINT ""
+750 PRINT ""
+760 REM
+770 PRINT "【第四部分】数学常数"
+780 PRINT "─────────────────────────────────────"
+790 PRINT F"π = {MATH_LIB.PI}"
+800 PRINT F"e = {MATH_LIB.E}"
+810 PRINT F"√2 = {MATH_LIB.SQRT2}"
+820 PRINT F"1/π = {MATH_LIB.INV_PI}"
+830 PRINT ""
+840 PRINT ""
+850 REM
+860 PRINT "═══════════════════════════════════════════════════════"
+870 PRINT "库功能总结："
+880 PRINT ""
+890 PRINT "超越函数：sin, cos, exp, sqrt (泰勒级数/牛顿法)"
+900 PRINT "矩阵运算：det_2x2, inv_2x2, trace_2x2"
+910 PRINT "辅助函数：clamp_val, lerp"
+920 PRINT "数学常数：PI, E, SQRT2, INV_PI"
+930 PRINT ""
+940 PRINT "可用于："
+950 PRINT "  • 科学计算和数值分析"
+960 PRINT "  • 线性代数运算"
+970 PRINT "  • 物理仿真（与 PDE 求解结合）"
+980 PRINT "═══════════════════════════════════════════════════════"
+990 .ENDSUB
+1000 CALL main
+1010 END

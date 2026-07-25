@@ -1,0 +1,19 @@
+10 USE SYS.NET AS N
+20 USE SYS.STRING AS S
+30 DIM stream AS HANDLE AS NET_STREAM AS VAR
+40 DIM response AS STRING AS VAR
+50 DIM sent AS NUM AS LONG AS VAR
+60 DIM ok AS BOOL AS VAR
+70 SUB main AS PUBLIC AS VOID
+80 stream = N.TLS_CONNECT("example.com", 443, 10000)
+90 IF stream = NULL THEN
+100 PRINT F"tls=0 error={N.LAST_ERROR()}"
+110 RETURN
+120 .ENDIF
+130 sent = N.STREAM_SEND(stream, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+140 response = N.STREAM_RECV(stream, 4096)
+150 PRINT F"tls={S.FIND(response, \"HTTP/\") = 0} sent={sent} bytes={S.LENGTH(response)}"
+160 ok = N.STREAM_CLOSE(stream)
+170 .ENDSUB
+180 CALL main
+190 END

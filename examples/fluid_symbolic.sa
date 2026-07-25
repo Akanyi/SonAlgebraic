@@ -1,0 +1,122 @@
+10 REM 流体动力学方程的符号代数计算
+20 REM 演示 SYMBOL 的求导、化简、代入等操作
+30 REM 正确处理符号变量和参数代入
+40 REM
+50 USE SYS.IO AS IO
+60 USE SYS.MATH AS MATH
+70 REM
+80 REM ============================================
+90 REM 基础参数
+100 REM ============================================
+110 DIM rho AS NUM AS DOUBLE AS VAR
+120 DIM g AS NUM AS DOUBLE AS VAR
+130 DIM v AS NUM AS DOUBLE AS VAR
+140 DIM h AS NUM AS DOUBLE AS VAR
+150 DIM mu AS NUM AS DOUBLE AS VAR
+160 DIM D AS NUM AS DOUBLE AS VAR
+170 REM
+180 REM ============================================
+190 REM 符号表达式
+200 REM ============================================
+210 DIM expr1 AS SYMBOL AS VAR
+220 DIM expr1_deriv AS SYMBOL AS VAR
+230 DIM expr1_simplified AS SYMBOL AS VAR
+240 DIM expr1_eval AS NUM AS DOUBLE AS VAR
+250 REM
+260 DIM expr2 AS SYMBOL AS VAR
+270 DIM expr2_deriv AS SYMBOL AS VAR
+280 DIM expr2_simplified AS SYMBOL AS VAR
+290 DIM expr2_eval AS NUM AS DOUBLE AS VAR
+300 REM
+310 DIM expr3 AS SYMBOL AS VAR
+320 DIM expr3_deriv AS SYMBOL AS VAR
+330 DIM expr3_simplified AS SYMBOL AS VAR
+340 DIM expr3_eval AS NUM AS DOUBLE AS VAR
+350 REM
+360 SUB main AS PUBLIC AS VOID
+370 REM 参数初始化
+380 rho = 1000.0
+390 g = 9.81
+400 v = 2.0
+410 h = 0
+420 mu = 0.001
+430 D = 0.05
+440 REM
+450 PRINT "═══════════════════════════════════════════════════════"
+460 PRINT "流体动力学方程的符号代数计算"
+470 PRINT "═══════════════════════════════════════════════════════"
+480 PRINT ""
+490 REM
+500 PRINT "【示例 1】重力势能方程: E(h) = ρ*g*h"
+510 PRINT "─────────────────────────────────────"
+520 REM 构造方程：E = ρ*g*h （其中 ρ、g 是常数，h 是变量）
+530 expr1 = rho * g * h
+540 PRINT F"原始表达式: E = {expr1}"
+550 PRINT ""
+560 REM 对 h 求导
+570 expr1_deriv = DERIV(expr1, "h")
+580 PRINT "对 h 求导："
+590 PRINT F"  dE/dh = {expr1_deriv}"
+600 expr1_simplified = SIMPLIFY(expr1_deriv)
+610 PRINT F"  化简后 = {expr1_simplified}"
+620 PRINT ""
+630 REM 代入所有符号变量并计算
+640 expr1_eval = EVAL(SUBST(SUBST(SUBST(expr1, "rho", 1000), "g", 9.81), "h", 5))
+650 PRINT F"当 h = 5m 时: E(5) = {expr1_eval} J/m³"
+660 PRINT ""
+670 PRINT ""
+680 REM
+690 PRINT "【示例 2】动能方程: K = (1/2)*ρ*v²"
+700 PRINT "─────────────────────────────────────"
+710 REM 构造方程：K = 0.5*ρ*v² （ρ 是常数，v 是变量）
+720 expr2 = 0.5 * rho * v * v
+730 PRINT F"原始表达式: K = {expr2}"
+740 PRINT ""
+750 REM 对 v 求导
+760 expr2_deriv = DERIV(expr2, "v")
+770 PRINT "对 v 求导："
+780 PRINT F"  dK/dv = {expr2_deriv}"
+790 expr2_simplified = SIMPLIFY(expr2_deriv)
+800 PRINT F"  化简后 = {expr2_simplified}"
+810 PRINT ""
+820 REM 代入所有符号变量并计算
+830 expr2_eval = EVAL(SUBST(SUBST(SUBST(expr2, "rho", 1000), "v", 3), "v", 3))
+840 PRINT F"当 v = 3 m/s 时: K(3) = {expr2_eval} J/m³"
+850 PRINT ""
+860 PRINT ""
+870 REM
+880 PRINT "【示例 3】剪切应力方程: τ = μ*v/D"
+890 PRINT "─────────────────────────────────────"
+900 REM 构造方程：τ = μ*v/D （μ、D 是常数，v 是变量）
+910 expr3 = mu * v / D
+920 PRINT F"原始表达式: τ = {expr3}"
+930 PRINT ""
+940 REM 对 v 求导
+950 expr3_deriv = DERIV(expr3, "v")
+960 PRINT "对 v 求导（应力对速度的敏感性）："
+970 PRINT F"  dτ/dv = {expr3_deriv}"
+980 expr3_simplified = SIMPLIFY(expr3_deriv)
+990 PRINT F"  化简后 = {expr3_simplified}"
+1000 PRINT ""
+1010 REM 代入所有符号变量并计算
+1020 expr3_eval = EVAL(SUBST(SUBST(SUBST(expr3, "mu", 0.001), "D", 0.05), "v", 2))
+1030 PRINT F"当 v = 2 m/s 时: τ(2) = {expr3_eval} Pa"
+1040 PRINT ""
+1050 PRINT ""
+1060 REM
+1070 PRINT "═══════════════════════════════════════════════════════"
+1080 PRINT "参数总结："
+1090 PRINT F"  ρ (密度) = {rho} kg/m³"
+1100 PRINT F"  g (重力加速度) = {g} m/s²"
+1110 PRINT F"  μ (粘度) = {mu} Pa·s"
+1120 PRINT F"  D (管径) = {D} m"
+1130 PRINT "═══════════════════════════════════════════════════════"
+1140 PRINT ""
+1150 PRINT "符号代数操作总结："
+1160 PRINT "  ✓ DERIV(expr, var) - 对变量求偏导"
+1170 PRINT "  ✓ SIMPLIFY(expr)   - 化简表达式树"
+1180 PRINT "  ✓ SUBST(expr, var, val) - 代入变量值"
+1190 PRINT "  ✓ EVAL(expr)  - 计算最终数值结果"
+1200 .ENDSUB
+1210 CALL main
+1220 END

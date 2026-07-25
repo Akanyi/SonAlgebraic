@@ -1,0 +1,100 @@
+10 REM 高级流体动力学符号计算
+20 REM 演示流体方程的符号表达和数值计算结合
+30 REM
+40 USE SYS.IO AS IO
+50 USE SYS.MATH AS MATH
+60 REM
+70 REM 基本变量声明
+80 DIM rho AS NUM AS DOUBLE AS VAR
+90 DIM mu AS NUM AS DOUBLE AS VAR
+100 DIM nu AS NUM AS DOUBLE AS VAR
+110 DIM v AS NUM AS DOUBLE AS VAR
+120 DIM D AS NUM AS DOUBLE AS VAR
+130 DIM L AS NUM AS DOUBLE AS VAR
+140 REM
+150 REM 符号表达式声明
+160 DIM reynolds AS SYMBOL AS VAR
+170 DIM velocity_prod AS SYMBOL AS VAR
+180 DIM pressure_loss AS SYMBOL AS VAR
+190 DIM shear_stress AS SYMBOL AS VAR
+200 DIM kinetic_energy AS SYMBOL AS VAR
+210 DIM viscous_term AS SYMBOL AS VAR
+220 DIM momentum AS SYMBOL AS VAR
+230 REM
+240 SUB main AS PUBLIC AS VOID
+250 REM 流体参数设置（水在 20°C）
+260 rho = 998.0
+270 mu = 0.001
+280 nu = mu / rho
+290 v = 2.5
+300 D = 0.05
+310 L = 10.0
+320 REM
+330 PRINT "════════════════════════════════════"
+340 PRINT "高级流体动力学符号计算"
+350 PRINT "════════════════════════════════════"
+360 PRINT ""
+370 REM
+380 REM 1. 雷诺数符号表达 Re = (ρ*v*D) / μ
+390 reynolds = rho * v * D / mu
+400 PRINT "1. 雷诺数（无量纲流数）:"
+410 PRINT F"   Re = (ρ*v*D)/μ = {reynolds}"
+420 PRINT ""
+430 REM
+440 REM 2. 速度平方项 v²
+450 velocity_prod = v * v
+460 PRINT "2. 速度平方项（动能相关）:"
+470 PRINT F"   v² = {velocity_prod}"
+480 PRINT ""
+490 REM
+500 REM 3. 沿程压力损失符号表达
+510 REM ΔP ≈ f * (L/D) * (ρ*v²/2)
+520 REM 取 f ≈ 0.03（近似值）
+530 pressure_loss = 0.03 * L / D * rho * v * v / 2.0
+540 PRINT "3. 沿程压力损失（Darcy-Weisbach）:"
+550 PRINT F"   ΔP = 0.03*(L/D)*(ρ*v²/2) = {pressure_loss}"
+560 PRINT ""
+570 REM
+580 REM 4. 剪切应力 τ = μ*(v/D)
+590 shear_stress = mu * v / D
+600 PRINT "4. 剪切应力（粘性作用）:"
+610 PRINT F"   τ = μ*(v/D) = {shear_stress}"
+620 PRINT ""
+630 REM
+640 REM 5. 单位体积动能 = (1/2)*ρ*v²
+650 kinetic_energy = 0.5 * rho * v * v
+660 PRINT "5. 单位体积动能："
+670 PRINT F"   e_k = (1/2)*ρ*v² = {kinetic_energy}"
+680 PRINT ""
+690 REM
+700 REM 6. 粘性耗散 = μ/ρ * Re = μ/ρ * (ρ*v*D/μ)
+710 viscous_term = mu / rho * (rho * v * D / mu)
+720 PRINT "6. 粘性项化简（恒等式验证）:"
+725 PRINT F"   μ/ρ * Re = {viscous_term}"
+730 PRINT "   （应等于 v*D）"
+740 PRINT ""
+750 REM
+760 REM 7. 动量方程 ρ*A*v = const 中的 ρ*v 项
+770 momentum = rho * v
+780 PRINT "7. 单位面积动量通量："
+785 PRINT F"   ρ*v = {momentum} kg/(m²·s)"
+790 PRINT ""
+800 REM
+810 PRINT "════════════════════════════════════"
+820 PRINT "参数总结（水，20°C）:"
+830 PRINT F"  密度 ρ = {rho} kg/m³"
+840 PRINT F"  动力粘度 μ = {mu} Pa·s"
+850 PRINT F"  运动粘度 ν = {nu} m²/s"
+860 PRINT F"  流速 v = {v} m/s"
+870 PRINT F"  管径 D = {D} m"
+880 PRINT F"  长度 L = {L} m"
+890 PRINT "════════════════════════════════════"
+900 REM
+910 PRINT ""
+920 PRINT "说明:"
+930 PRINT "  ✓ 使用 SYMBOL 类型捕获流体方程的表达式树"
+940 PRINT "  ✓ 保留完整的数学结构和运算次序"
+950 PRINT "  ✓ 未来可扩展求导、化简等符号操作"
+960 .ENDSUB
+970 CALL main
+980 END

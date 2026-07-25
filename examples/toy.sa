@@ -1,0 +1,58 @@
+10 REM === SonAlgebraic 特性演示 (无 NULL/ELSE/求值) ===
+20 USE SYS.MATH AS M
+30 USEC "stdio.h" AS STDIO
+40 DECLARE C SUB STDIO.puts(s AS STRING) AS NUM AS LONG
+
+50 DIM p AS PTR TO NUM AS LONG AS VAR
+60 DIM x AS NUM AS LONG AS VAR
+70 DIM trap AS ERROR AS VAR
+
+80 SUB demo_throw AS VOID
+90     THROW NEW ERR_DEMO, "this is a test error"
+100 .ENDSUB
+
+110 SUB main AS PUBLIC AS VOID
+120 CALL STDIO.puts("=== SonAlgebraic 特性演示 ===")
+130
+140 REM 符号表达式构建并输出
+150 DIM e1 AS SYMBOL AS VAR
+160 DIM e2 AS SYMBOL AS VAR
+170 DIM e3 AS SYMBOL AS VAR
+180
+190 e1 = (3 + 5) * 2
+200 e2 = 10 / (6 - 6)
+210 e3 = 42
+220
+230 PRINT F"符号表达式1: {e1}"
+240 PRINT F"符号表达式2: {e2}"
+250 PRINT F"符号表达式3: {e3}"
+260
+270 REM 异常捕获演示
+280 TRY CALL demo_throw TRACEBACK ERROR AS trap
+290 CATCH ERR_DEMO AS d
+300     PRINT F"捕获到错误: {d}"
+310 CATCH ANY AS a
+320     PRINT F"其他错误: {a}"
+330 .ENDTRY
+340
+350 REM 指针操作演示
+360 x = 100
+370 p = @x
+380 ^p = ^p + 200
+390 PRINT F"指针修改后的 x = {x}"    
+400
+410 REM GOSUB 演示
+420 GOSUB ::sub_label
+430
+440 CALL STDIO.puts("=== 演示结束 ===")
+450 GOTO ::done
+460
+470 ::sub_label
+480 CALL STDIO.puts("GOSUB 成功跳转到标签")
+490 RETURN
+500
+510 ::done
+520 .ENDSUB
+530
+540 CALL main
+550 END

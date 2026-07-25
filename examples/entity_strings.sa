@@ -1,0 +1,23 @@
+10 FOR ENTITY AS NameBox
+20 DIM text AS STRING AS VAR
+30 .ENDENTITY
+40 FOR ENTITY AS Profile
+50 DIM name AS ENTITY AS NameBox AS VAR
+60 DIM score AS NUM AS LONG AS VAR
+70 .ENDENTITY
+80 SUB show(item AS ENTITY AS Profile) AS VOID
+90 PRINT F"{item.name.text}: {item.score}"
+100 .ENDSUB
+110 SUB main AS PUBLIC AS VOID
+120 DIM first AS ENTITY AS Profile AS VAR
+130 DIM second AS ENTITY AS Profile AS VAR
+140 first.name.text = "LANS"
+150 first.score = 99
+160 second = first
+170 second.name.text = "SA"
+180 second.score = 100
+190 CALL show(first)
+200 CALL show(second)
+210 .ENDSUB
+220 CALL main
+230 END

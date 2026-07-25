@@ -1,0 +1,151 @@
+10 CONST PI AS NUM AS DOUBLE = 3.141592653589793
+20 CONST E AS NUM AS DOUBLE = 2.718281828459045
+30 CONST SQRT2 AS NUM AS DOUBLE = 1.414213562373095
+40 CONST INV_PI AS NUM AS DOUBLE = 0.318309886183791
+50 REM
+60 REM ================================================
+70 REM 超越函数 - 正弦函数（泰勒级数）
+80 REM ================================================
+90 SUB sin_approx AS PUBLIC AS NUM AS DOUBLE
+100 DIM x AS NUM AS DOUBLE AS VAR
+110 DIM result AS NUM AS DOUBLE AS VAR
+120 DIM term AS NUM AS DOUBLE AS VAR
+130 DIM n AS NUM AS LONG AS VAR
+140 DIM x_sq AS NUM AS DOUBLE AS VAR
+150 x = 0.5
+160 x_sq = x * x
+170 result = x
+180 term = x
+190 FOR n = 1 TO 10 STEP 1
+200 term = term * (-1.0) * x_sq / (2.0 * n * (2.0 * n + 1.0))
+210 result = result + term
+220 .ENDFOR
+230 RETURN result
+240 .ENDSUB
+250 REM
+260 REM ================================================
+270 REM 超越函数 - 余弦函数（泰勒级数）
+280 REM ================================================
+290 SUB cos_approx AS PUBLIC AS NUM AS DOUBLE
+300 DIM y AS NUM AS DOUBLE AS VAR
+310 DIM result AS NUM AS DOUBLE AS VAR
+320 DIM term AS NUM AS DOUBLE AS VAR
+330 DIM n AS NUM AS LONG AS VAR
+340 DIM y_sq AS NUM AS DOUBLE AS VAR
+350 y = 0.5
+360 y_sq = y * y
+370 result = 1.0
+380 term = 1.0
+390 FOR n = 1 TO 10 STEP 1
+400 term = term * (-1.0) * y_sq / (2.0 * n * (2.0 * n - 1.0))
+410 result = result + term
+420 .ENDFOR
+430 RETURN result
+440 .ENDSUB
+450 REM
+460 REM ================================================
+470 REM 超越函数 - 指数函数（泰勒级数）
+480 REM ================================================
+490 SUB exp_approx AS PUBLIC AS NUM AS DOUBLE
+500 DIM z AS NUM AS DOUBLE AS VAR
+510 DIM result AS NUM AS DOUBLE AS VAR
+520 DIM term AS NUM AS DOUBLE AS VAR
+530 DIM n AS NUM AS LONG AS VAR
+540 z = 1.0
+550 result = 1.0
+560 term = 1.0
+570 FOR n = 1 TO 15 STEP 1
+580 term = term * z / n
+590 result = result + term
+600 .ENDFOR
+610 RETURN result
+620 .ENDSUB
+630 REM
+640 REM ================================================
+650 REM 超越函数 - 平方根（牛顿法）
+660 REM ================================================
+670 SUB sqrt_newton AS PUBLIC AS NUM AS DOUBLE
+680 DIM x AS NUM AS DOUBLE AS VAR
+690 DIM result AS NUM AS DOUBLE AS VAR
+700 DIM iter AS NUM AS LONG AS VAR
+710 x = 2.0
+720 result = 1.0
+730 FOR iter = 0 TO 10 STEP 1
+740 result = (result + x / result) / 2.0
+750 .ENDFOR
+760 RETURN result
+770 .ENDSUB
+780 REM
+790 REM ================================================
+800 REM 矩阵运算 - 2x2 行列式
+810 REM ================================================
+820 SUB det_2x2 AS PUBLIC AS NUM AS DOUBLE
+830 DIM a AS NUM AS DOUBLE AS VAR
+840 DIM b AS NUM AS DOUBLE AS VAR
+850 DIM c AS NUM AS DOUBLE AS VAR
+860 DIM d AS NUM AS DOUBLE AS VAR
+870 a = 1.0
+880 b = 2.0
+890 c = 3.0
+900 d = 4.0
+910 RETURN a * d - b * c
+920 .ENDSUB
+930 REM
+940 REM ================================================
+950 REM 矩阵运算 - 2x2 矩阵求逆
+960 REM ================================================
+970 SUB inv_2x2 AS PUBLIC AS NUM AS DOUBLE
+980 DIM det_val AS NUM AS DOUBLE AS VAR
+990 det_val = CALL det_2x2
+1000 IF det_val = 0 THEN
+1010 RETURN 0.0
+1020 END IF
+1030 RETURN 1.0 / det_val
+1040 .ENDSUB
+1050 REM
+1060 REM ================================================
+1070 REM 矩阵运算 - 矩阵迹（2x2）
+1080 REM ================================================
+1090 SUB trace_2x2 AS PUBLIC AS NUM AS DOUBLE
+1100 DIM a AS NUM AS DOUBLE AS VAR
+1110 DIM d AS NUM AS DOUBLE AS VAR
+1120 a = 1.0
+1130 d = 4.0
+1140 RETURN a + d
+1150 .ENDSUB
+1160 REM
+1170 REM ================================================
+1180 REM 辅助函数 - 值域限制
+1190 REM ================================================
+1200 SUB clamp_val AS PUBLIC AS NUM AS DOUBLE
+1210 DIM val AS NUM AS DOUBLE AS VAR
+1220 DIM minv AS NUM AS DOUBLE AS VAR
+1230 DIM maxv AS NUM AS DOUBLE AS VAR
+1240 val = 0.5
+1250 minv = 0.0
+1260 maxv = 1.0
+1270 IF val < minv THEN
+1280 RETURN minv
+1290 END IF
+1300 IF val > maxv THEN
+1310 RETURN maxv
+1320 END IF
+1330 RETURN val
+1340 .ENDSUB
+1350 REM
+1360 REM ================================================
+1370 REM 辅助函数 - 线性插值
+1380 REM ================================================
+1390 SUB lerp AS PUBLIC AS NUM AS DOUBLE
+1400 DIM a AS NUM AS DOUBLE AS VAR
+1410 DIM b AS NUM AS DOUBLE AS VAR
+1420 DIM t AS NUM AS DOUBLE AS VAR
+1430 a = 1.0
+1440 b = 5.0
+1450 t = 0.5
+1460 RETURN a * (1.0 - t) + b * t
+1470 .ENDSUB
+1480 REM
+1490 SUB main AS PUBLIC AS VOID
+1500 REM 这是模块的入口点，作为库使用时不会被调用
+1510 .ENDSUB

@@ -1,0 +1,16 @@
+10 SUB area(width AS NUM AS DOUBLE, height AS NUM AS DOUBLE) AS NUM AS DOUBLE
+20 RETURN width * height
+30 .ENDSUB
+40 SUB bump(value AS NUM AS LONG AS REF) AS VOID
+50 value = value + 1
+60 .ENDSUB
+70 DIM result AS NUM AS DOUBLE AS VAR
+80 DIM counter AS NUM AS LONG AS VAR
+90 SUB main AS PUBLIC AS VOID
+100 result = CALL area(3.0, 4.0)
+110 counter = 10
+120 CALL bump(counter)
+130 PRINT F"area={result}, counter={counter}"
+140 .ENDSUB
+150 CALL main
+160 END

@@ -1,0 +1,19 @@
+10 REM SonAlgebraic v0.1 smoke program
+20 DIM counter AS NUM AS LONG AS VAR
+30 DIM message AS STRING AS VAR
+40 SUB main AS PUBLIC AS VOID
+50 counter = 1
+60 message = "Hello from SonAlgebraic!"
+70 PRINT message
+80 ::loop_start
+90 IF counter > 5 THEN
+100 GOTO ::loop_end
+110 END IF
+120 PRINT F"Counter is now: {counter}"
+130 counter = counter + 1
+140 GOTO ::loop_start
+150 ::loop_end
+160 PRINT "Loop finished."
+170 .ENDSUB
+180 CALL main
+190 END

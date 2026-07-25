@@ -1,0 +1,17 @@
+10 FOR ENTITY AS Vector2D
+20 DIM x AS NUM AS DOUBLE AS VAR
+30 DIM y AS NUM AS DOUBLE AS VAR
+40 .ENDENTITY
+50 SUB move(point AS ENTITY AS Vector2D AS REF) AS VOID
+60 point.x = point.x + 1.5
+70 point.y = point.y + 2.0
+80 .ENDSUB
+90 SUB main AS PUBLIC AS VOID
+100 DIM hero AS ENTITY AS Vector2D AS VAR
+110 hero.x = 2.0
+120 hero.y = 3.0
+130 CALL move(hero)
+140 PRINT F"hero=({hero.x}, {hero.y})"
+150 .ENDSUB
+160 CALL main
+170 END

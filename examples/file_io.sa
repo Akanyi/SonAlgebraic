@@ -1,0 +1,19 @@
+10 USE SYS.FILE AS F
+20 DIM file AS HANDLE AS FILE AS VAR
+30 DIM text AS STRING AS VAR
+40 DIM ok AS BOOL AS VAR
+50 SUB main AS PUBLIC AS VOID
+60 file = F.OPEN("sa-note.txt", "WRITE")
+70 IF file = NULL THEN
+80 PRINT F.LAST_ERROR()
+90 RETURN
+100 END IF
+110 PRINT F.WRITE(file, "hello from SonAlgebraic")
+120 ok = F.CLOSE(file)
+130 file = NULL
+140 text = F.READ_TEXT("sa-note.txt")
+150 PRINT text
+160 PRINT F.ABSOLUTE("sa-note.txt")
+170 .ENDSUB
+180 CALL main
+190 END

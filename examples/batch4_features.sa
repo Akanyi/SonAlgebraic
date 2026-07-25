@@ -1,0 +1,36 @@
+10 REM 第四批特性验证：内置常量 + 枚举 + SYMBOL 代数
+20 USE SYS.MATH AS M
+30 ENUM Planet
+40 MERCURY
+50 VENUS
+60 EARTH
+70 MARS
+80 .ENDENUM
+90 DIM home AS NUM AS LONG AS VAR
+100 DIM circ AS NUM AS DOUBLE AS VAR
+110 DIM f AS SYMBOL AS VAR
+120 DIM df AS SYMBOL AS VAR
+130 DIM x AS NUM AS LONG AS VAR
+140 DIM at3 AS NUM AS DOUBLE AS VAR
+150 SUB main AS PUBLIC AS VOID
+160 REM 内置常量
+170 circ = M.TAU * 2.0
+180 PRINT F"circ = {circ}, e = {M.E}"
+190 PRINT F"max long = {M.MAX_LONG}"
+200 REM 枚举
+210 home = Planet.EARTH
+220 PRINT F"home planet index = {home}"
+230 IF home = Planet.EARTH THEN
+240 PRINT "we are home"
+250 END IF
+260 REM SYMBOL 完整代数：f = x^2 + 2x（用 x*x 表示平方）
+270 x = 0
+280 f = x * x + 2 * x
+290 PRINT F"f(x) = {f}"
+300 df = SIMPLIFY(DERIV(f, "x"))
+310 PRINT F"f'(x) = {df}"
+320 at3 = EVAL(SUBST(f, "x", 3))
+330 PRINT F"f(3) = {at3}"
+340 .ENDSUB
+350 CALL main
+360 END
