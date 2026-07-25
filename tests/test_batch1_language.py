@@ -107,8 +107,11 @@ def test_else_if_chain_generates_nested_c() -> None:
         "80 ELSE\n90 PRINT \"neg\"\n100 END IF"
     )
     c = compile_c(source)
-    # 展开成嵌套 if-else
-    assert c.count("else {") == 2
+    # 展开成嵌套 if-else。runtime 全文嵌在生成的 C 里，自身也含 else 块，
+    # 扣掉 runtime 的计数只数用户代码段，避免 runtime 演进把这个测试搞脆。
+    from sonalgebraic.backend.c_runtime import RUNTIME
+
+    assert c.count("else {") - RUNTIME.count("else {") == 2
 
 
 def test_dot_endif_is_accepted() -> None:

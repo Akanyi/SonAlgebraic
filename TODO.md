@@ -25,6 +25,7 @@
 ## P1: 语言能力
 
 - [x] 增加基础数组或固定长度 buffer 语法，避免用户直接靠指针模拟一切集合（`DIM xs[N]` 定长数组，值类型元素）。
+- [x] 增加可变长集合：`SYS.LIST` 动态列表（数值 LIST + 字符串 STR_LIST 两种句柄 kind，C/native 双后端）。
 - [x] 增加 `ELSE` / `ELSE IF`，补齐基础条件分支（并改进非 VOID SUB 返回路径分析）。
 - [x] 增加基础循环语法，至少提供比 `GOTO` 更可维护的循环形式（`FOR ... TO ... STEP` / `WHILE`）。
 - [x] 引入 `BOOL` 或明确布尔表达式统一类型规则（`BOOL` 类型 + `TRUE`/`FALSE`，比较/逻辑运算返回 BOOL）。

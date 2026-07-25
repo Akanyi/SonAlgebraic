@@ -16,6 +16,7 @@
 - [SYMBOL 代数](#symbol-代数)
 - [原生句柄 HANDLE](#原生句柄-handle)
 - [二进制 SYS.BINARY](#二进制-sysbinary)
+- [动态列表 SYS.LIST](#动态列表-syslist)
 - [网络 SYS.NET](#网络-sysnet)
 - [文件 SYS.FILE](#文件-sysfile)
 - [桌面 SYS.DESKTOP](#桌面-sysdesktop)
@@ -285,6 +286,51 @@ f(3) = 33
 | `LAST_ERROR()` | `STRING` | 最近一次二进制操作错误 |
 
 BUFFER 是显式资源。返回 BUFFER 的函数必须直接赋给 `HANDLE AS BUFFER` 变量（或从同类型 SUB 直接 RETURN），不能写成 `B.LENGTH(B.SLICE(...))` 这种匿名嵌套，否则没有句柄可供 CLOSE。
+
+## 动态列表 SYS.LIST
+
+定长数组 `DIM xs[N]` 覆盖不了"边跑边收集"的场景。`SYS.LIST` 提供可变长列表，数值和字符串分成两个 HANDLE kind，把"字符串列表传给数值函数"这类错误留在编译期：
+
+```basic
+10 USE SYS.LIST AS L
+20 DIM xs AS HANDLE AS LIST AS VAR
+30 DIM names AS HANDLE AS STR_LIST AS VAR
+40 DIM ok AS BOOL AS VAR
+50 SUB main AS PUBLIC AS VOID
+60 xs = L.NEW()
+70 ok = L.PUSH(xs, 10)
+80 PRINT L.GET(xs, 0)
+90 ok = L.CLOSE(xs)
+100 names = L.NEW_STR()
+110 ok = L.PUSH_STR(names, "alpha")
+120 ok = L.PUSH_STR(names, "beta")
+130 PRINT L.JOIN_STR(names, ",")
+140 ok = L.CLOSE_STR(names)
+150 .ENDSUB
+160 CALL main
+170 END
+```
+
+数值列表（`HANDLE AS LIST`，元素按 `DOUBLE` 存储）：
+
+| 函数 | 返回 | 说明 |
+|---|---|---|
+| `NEW()` | `HANDLE AS LIST` | 创建空列表 |
+| `PUSH(list, value)` | `BOOL` | 尾部追加 |
+| `POP(list)` | `DOUBLE` | 弹出尾元素，空表返回 0 并记录错误 |
+| `GET(list, index)` / `SET(list, index, value)` | `DOUBLE` / `BOOL` | 按下标读写 |
+| `INSERT(list, index, value)` | `BOOL` | 在 index 处插入（0..LENGTH） |
+| `REMOVE(list, index)` | `BOOL` | 删除指定下标元素 |
+| `LENGTH(list)` | `LONG` | 元素个数，失败为 -1 |
+| `CLEAR(list)` | `BOOL` | 清空但保留列表 |
+| `CLOSE(list)` | `BOOL` | 显式释放 |
+
+字符串列表（`HANDLE AS STR_LIST`）：同名函数带 `_STR` 后缀（`NEW_STR` / `PUSH_STR` / `POP_STR` / `GET_STR` / `SET_STR` / `INSERT_STR` / `REMOVE_STR` / `LENGTH_STR` / `CLEAR_STR` / `CLOSE_STR`），另有 `JOIN_STR(list, separator)` 返回拼接结果。`LAST_ERROR()` 返回最近一次列表操作错误。
+
+注意事项：
+
+- 数值元素统一按 `DOUBLE` 存储，约 2^53 以内的整数无损；需要精确 64 位整数序列时用 `SYS.BINARY` 的 BUFFER。
+- 与 BUFFER 相同，返回列表句柄的函数必须直接赋给对应 `HANDLE AS LIST` / `STR_LIST` 变量并显式 CLOSE；进程退出时 runtime 会兜底清理。
 
 ## 网络 SYS.NET
 

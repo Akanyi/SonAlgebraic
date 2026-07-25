@@ -71,7 +71,7 @@ python -m sonalgebraic run examples/allexample.sa
 - 非 `VOID` 返回值函数、参数、`AS REF` 引用传参（含基于完整 IF/ELSE 的返回路径分析）。
 - `ENTITY` 支持嵌套结构、字段访问、字符串字段深拷贝和常规生命周期清理。
 - `ERROR` / `TRY` / `CATCH` / `THROW` 结构化异常处理。
-- `ENUM` 枚举；`SYS.MATH` / `SYS.IO` / `SYS.STRING` / `SYS.BINARY` / `SYS.NET` / `SYS.FILE` / `SYS.DESKTOP` 内置模块。
+- `ENUM` 枚举；`SYS.MATH` / `SYS.IO` / `SYS.STRING` / `SYS.BINARY` / `SYS.LIST` / `SYS.NET` / `SYS.FILE` / `SYS.DESKTOP` 内置模块。
 - `SYMBOL` 完整代数：表达式树捕获、求导 `DERIV`、化简 `SIMPLIFY`、代入 `SUBST`、数值求值 `EVAL`。
 - 字符串操作 `SYS.STRING`：LENGTH / CONCAT / SLICE / FIND / UPPER / LOWER / REPLACE。
 - 用户模块分离编译、头文件导出、模块循环依赖诊断。
@@ -247,6 +247,7 @@ examples/broken.sa:40:10 error: 变量未声明: missing
 - `errors.sa`：`TRY` / `CATCH` / `THROW`。
 - `gosub.sa`：`GOSUB` / 无参 `RETURN`。
 - `symbol.sa`：`SYMBOL` 公式树捕获和打印。
+- `lists.sa`：`SYS.LIST` 数值/字符串动态列表。
 - `ptr_basic.sa`、`ptr_arith.sa`、`ptr_cast.sa`：typed pointer、取址、解引用和 CAST。
 - `ffi_hello.sa`：C FFI 的 `USEC` / `DECLARE C`。
 - `use_math.sa`、`use_io.sa`：内置系统模块导入。
@@ -504,6 +505,7 @@ python -m pytest -m ffi
 - `USE SYS.MATH AS <任意别名>` 的内置 `<别名>.PI` / `<别名>.POW()`；`**` 作为语言级幂运算符
 - `USE SYS.IO AS <任意别名>` 的 `<别名>.INPUT`
 - `SYS.BINARY`：BUFFER 创建/切片/复制、HEX、大小端 U16/U32/U64、校验和
+- `SYS.LIST`：可变长动态列表，数值 LIST 与字符串 STR_LIST 两种句柄 kind，PUSH/POP/GET/SET/INSERT/REMOVE/JOIN
 - `SYS.NET`：HTTP/HTTPS、DNS、TCP client/server、TLS client stream、UDP、字符串与 BUFFER 收发
 - `SYS.FILE`：文件句柄读写/定位/关闭、文本便捷读写、存在性、目录、删除、当前目录和绝对路径
 - `SYS.DESKTOP`：Windows 消息框、系统打开路径/URL、Unicode 文本剪贴板
@@ -529,7 +531,8 @@ python -m pytest -m ffi
 - `SYMBOL` 超越函数直接建树的表层语法还没接入；幂求导内部会生成 `LOG(...)` 节点。
 - `ENTITY` 内 `SYMBOL` 字段暂不做深层 clone/free 托管，避免浅拷贝导致双释放；后续需要给 SYMBOL runtime 增加 clone 能力。
 - MSVC 支持仍需要完整验证；`GOSUB` 本身已不再依赖 GCC/Clang 的 label-address 扩展。
-- `HANDLE` 是可复制的资源 token，不会自动关闭；FILE、BUFFER、NET_STREAM、TCP_LISTENER、UDP_SOCKET 都必须调用对应 CLOSE。runtime 会让已关闭句柄的旧副本失效，并在进程退出时兜底清理。
+- `HANDLE` 是可复制的资源 token，不会自动关闭；FILE、BUFFER、LIST、STR_LIST、NET_STREAM、TCP_LISTENER、UDP_SOCKET 都必须调用对应 CLOSE。runtime 会让已关闭句柄的旧副本失效，并在进程退出时兜底清理。
+- `SYS.LIST` 数值列表元素按 `DOUBLE` 存储，约 2^53 以内整数无损；需要精确 64 位整数序列时用 `SYS.BINARY`。
 - BUFFER 返回值必须直接赋给 `HANDLE AS BUFFER` 变量（或从同类型 SUB 直接 RETURN），不能匿名嵌套进参数/F-string；否则无法显式 CLOSE。
 - POSIX TLS/HTTPS 需要 OpenSSL 开发文件和 `libssl` / `libcrypto`；Windows 使用系统 Schannel，不要求外部 TLS SDK。
 - POSIX 网络 runtime 当前只支持 HTTP，HTTPS 仍需接入 TLS 库；`SYS.DESKTOP` 的非 Windows 实现当前返回失败并提供 `LAST_ERROR()`，不会拼 shell 命令执行用户输入。

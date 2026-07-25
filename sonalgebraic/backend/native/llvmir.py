@@ -1633,7 +1633,10 @@ class NativeLLVMGen:
         desktop_call = self.desktop_function_call(expr)
         if desktop_call is not None:
             return desktop_call
-        return self.binary_function_call(expr)
+        binary_call = self.binary_function_call(expr)
+        if binary_call is not None:
+            return binary_call
+        return self.list_function_call(expr)
 
     def symbol_algebra_call(self, expr: ast.CallExpr) -> LLVMValue | None:
         name = expr.name.upper()
@@ -2094,6 +2097,102 @@ class NativeLLVMGen:
         self.emit(f"  {temp} = icmp ne i32 {value}, 0")
         return LLVMValue("i1", temp, ast.TypeSpec("BOOL"))
 
+    def list_function_call(self, expr: ast.CallExpr) -> LLVMValue | None:
+        split = split_module_member(expr.name)
+        if split is None or self.checked.uses.get(split[0]) != "SYS.LIST":
+            return None
+        member = split[1].upper()
+        args = [LLVMValue("i64", "0", ast.TypeSpec("HANDLE")) if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
+        if member in {"NEW", "NEW_STR"}:
+            fn = "sa_list_new" if member == "NEW" else "sa_strlist_new"
+            kind = "LIST" if member == "NEW" else "STR_LIST"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @{fn}()")
+            return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", kind))
+        if member == "PUSH":
+            self.use_runtime("sa_list_push")
+            value = self.cast_to_double(args[1])
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @sa_list_push(i64 {args[0].value}, double {value.value})")
+            return self.i32_status(raw)
+        if member in {"POP", "GET"}:
+            fn = "sa_list_pop" if member == "POP" else "sa_list_get"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            if member == "GET":
+                index = self.cast_to_i64(args[1])
+                self.emit(f"  {temp} = call double @{fn}(i64 {args[0].value}, i64 {index.value})")
+            else:
+                self.emit(f"  {temp} = call double @{fn}(i64 {args[0].value})")
+            return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
+        if member in {"SET", "INSERT"}:
+            fn = "sa_list_set" if member == "SET" else "sa_list_insert"
+            self.use_runtime(fn)
+            index = self.cast_to_i64(args[1])
+            value = self.cast_to_double(args[2])
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @{fn}(i64 {args[0].value}, i64 {index.value}, double {value.value})")
+            return self.i32_status(raw)
+        if member in {"REMOVE", "REMOVE_STR"}:
+            fn = "sa_list_remove" if member == "REMOVE" else "sa_strlist_remove"
+            self.use_runtime(fn)
+            index = self.cast_to_i64(args[1])
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @{fn}(i64 {args[0].value}, i64 {index.value})")
+            return self.i32_status(raw)
+        if member in {"LENGTH", "LENGTH_STR"}:
+            fn = "sa_list_length" if member == "LENGTH" else "sa_strlist_length"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @{fn}(i64 {args[0].value})")
+            return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
+        if member in {"CLEAR", "CLOSE", "CLEAR_STR", "CLOSE_STR"}:
+            fn = {
+                "CLEAR": "sa_list_clear",
+                "CLOSE": "sa_list_close",
+                "CLEAR_STR": "sa_strlist_clear",
+                "CLOSE_STR": "sa_strlist_close",
+            }[member]
+            self.use_runtime(fn)
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @{fn}(i64 {args[0].value})")
+            return self.i32_status(raw)
+        if member == "PUSH_STR":
+            self.use_runtime("sa_strlist_push")
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @sa_strlist_push(i64 {args[0].value}, ptr {args[1].value})")
+            return self.i32_status(raw)
+        if member in {"SET_STR", "INSERT_STR"}:
+            fn = "sa_strlist_set" if member == "SET_STR" else "sa_strlist_insert"
+            self.use_runtime(fn)
+            index = self.cast_to_i64(args[1])
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @{fn}(i64 {args[0].value}, i64 {index.value}, ptr {args[2].value})")
+            return self.i32_status(raw)
+        if member in {"POP_STR", "GET_STR", "JOIN_STR", "LAST_ERROR"}:
+            fn = {
+                "POP_STR": "sa_strlist_pop",
+                "GET_STR": "sa_strlist_get",
+                "JOIN_STR": "sa_strlist_join",
+                "LAST_ERROR": "sa_list_last_error_copy",
+            }[member]
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            if member == "GET_STR":
+                index = self.cast_to_i64(args[1])
+                self.emit(f"  {temp} = call ptr @{fn}(i64 {args[0].value}, i64 {index.value})")
+            elif member == "JOIN_STR":
+                self.emit(f"  {temp} = call ptr @{fn}(i64 {args[0].value}, ptr {args[1].value})")
+            elif member == "POP_STR":
+                self.emit(f"  {temp} = call ptr @{fn}(i64 {args[0].value})")
+            else:
+                self.emit(f"  {temp} = call ptr @{fn}()")
+            self.use_runtime("free")
+            self.add_temp_cleanup(f"  call void @free(ptr {temp})")
+            return LLVMValue("ptr", temp, ast.TypeSpec("STRING"))
+        return None
+
     def coerce_str_arg(self, value: LLVMValue) -> str:
         # SLICE 的 start/count 是 i64，其余字符串参数是 ptr。这里按已求值的类型直接取值，
         # 数值参数确保是 i64（SLICE 第 2、3 参数）。
@@ -2513,6 +2612,29 @@ RUNTIME_SIGNATURES: dict[str, str] = {
     "sa_net_udp_local_port": "declare i64 @sa_net_udp_local_port(i64)",
     # BINARY
     "sa_binary_new": "declare i64 @sa_binary_new(i64)",
+    # LIST
+    "sa_list_new": "declare i64 @sa_list_new()",
+    "sa_list_push": "declare i32 @sa_list_push(i64, double)",
+    "sa_list_pop": "declare double @sa_list_pop(i64)",
+    "sa_list_get": "declare double @sa_list_get(i64, i64)",
+    "sa_list_set": "declare i32 @sa_list_set(i64, i64, double)",
+    "sa_list_insert": "declare i32 @sa_list_insert(i64, i64, double)",
+    "sa_list_remove": "declare i32 @sa_list_remove(i64, i64)",
+    "sa_list_length": "declare i64 @sa_list_length(i64)",
+    "sa_list_clear": "declare i32 @sa_list_clear(i64)",
+    "sa_list_close": "declare i32 @sa_list_close(i64)",
+    "sa_strlist_new": "declare i64 @sa_strlist_new()",
+    "sa_strlist_push": "declare i32 @sa_strlist_push(i64, ptr)",
+    "sa_strlist_pop": "declare ptr @sa_strlist_pop(i64)",
+    "sa_strlist_get": "declare ptr @sa_strlist_get(i64, i64)",
+    "sa_strlist_set": "declare i32 @sa_strlist_set(i64, i64, ptr)",
+    "sa_strlist_insert": "declare i32 @sa_strlist_insert(i64, i64, ptr)",
+    "sa_strlist_remove": "declare i32 @sa_strlist_remove(i64, i64)",
+    "sa_strlist_length": "declare i64 @sa_strlist_length(i64)",
+    "sa_strlist_clear": "declare i32 @sa_strlist_clear(i64)",
+    "sa_strlist_close": "declare i32 @sa_strlist_close(i64)",
+    "sa_strlist_join": "declare ptr @sa_strlist_join(i64, ptr)",
+    "sa_list_last_error_copy": "declare ptr @sa_list_last_error_copy()",
     "sa_binary_close": "declare i32 @sa_binary_close(i64)",
     "sa_binary_length": "declare i64 @sa_binary_length(i64)",
     "sa_binary_slice": "declare i64 @sa_binary_slice(i64, i64, i64)",

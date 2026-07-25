@@ -1,0 +1,30 @@
+10 USE SYS.LIST AS L
+20 DIM xs AS HANDLE AS LIST AS VAR
+30 DIM names AS HANDLE AS STR_LIST AS VAR
+40 DIM ok AS BOOL AS VAR
+50 DIM n AS NUM AS LONG AS VAR
+60 DIM joined AS STRING AS VAR
+70 SUB main AS PUBLIC AS VOID
+80 xs = L.NEW()
+90 ok = L.PUSH(xs, 10)
+100 ok = L.PUSH(xs, 20)
+110 ok = L.PUSH(xs, 30)
+120 n = L.LENGTH(xs)
+130 PRINT F"len={n}"
+140 PRINT L.GET(xs, 1)
+150 ok = L.SET(xs, 1, 99)
+160 PRINT L.GET(xs, 1)
+170 ok = L.REMOVE(xs, 0)
+180 PRINT L.LENGTH(xs)
+190 ok = L.CLOSE(xs)
+200 names = L.NEW_STR()
+210 ok = L.PUSH_STR(names, "alpha")
+220 ok = L.PUSH_STR(names, "beta")
+230 ok = L.INSERT_STR(names, 1, "middle")
+240 joined = L.JOIN_STR(names, ",")
+250 PRINT joined
+260 PRINT L.GET_STR(names, 0)
+270 ok = L.CLOSE_STR(names)
+280 .ENDSUB
+290 CALL main
+300 END

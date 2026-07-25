@@ -138,7 +138,9 @@ enum {
     SA_HANDLE_BUFFER = 2,
     SA_HANDLE_TCP_LISTENER = 3,
     SA_HANDLE_NET_STREAM = 4,
-    SA_HANDLE_UDP_SOCKET = 5
+    SA_HANDLE_UDP_SOCKET = 5,
+    SA_HANDLE_LIST = 6,
+    SA_HANDLE_STR_LIST = 7
 };
 
 static SaHandle sa_handle_make(unsigned int kind, uint32_t generation, size_t index) {
@@ -405,6 +407,295 @@ static long long sa_binary_checksum8(SaHandle handle, long long offset, long lon
     unsigned int sum = 0;
     for (size_t i = 0; i < len; i++) sum = (sum + slot->data[start + i]) & 0xffu;
     return (long long)sum;
+}
+#endif
+
+#ifdef SA_ENABLE_LIST
+/* 动态列表沿用 BUFFER 的槽位 + generation 句柄机制：kind 分 LIST(double 元素) 和
+   STR_LIST(char* 元素)，静态类型层面就区分开，把元素类型错误留在编译期而不是运行期。 */
+#define SA_LIST_SLOT_COUNT 128
+typedef struct {
+    double* nums;
+    char** strs;
+    size_t len;
+    size_t cap;
+    uint32_t generation;
+} SaListSlot;
+
+static SaListSlot sa_list_slots[SA_LIST_SLOT_COUNT];
+static char sa_list_last_error[512] = "";
+static int sa_list_cleanup_registered = 0;
+
+static void sa_list_clear_error(void) { sa_list_last_error[0] = '\0'; }
+static void sa_list_set_error(const char* message) { snprintf(sa_list_last_error, sizeof(sa_list_last_error), "%s", message ? message : "list error"); }
+static char* sa_list_last_error_copy(void) { return sa_strdup(sa_list_last_error); }
+
+static int sa_list_slot_live(const SaListSlot* slot) { return slot->nums != NULL || slot->strs != NULL; }
+
+static void sa_list_slot_free(SaListSlot* slot) {
+    if (slot->strs) {
+        for (size_t i = 0; i < slot->len; i++) free(slot->strs[i]);
+    }
+    free(slot->nums);
+    free(slot->strs);
+    slot->nums = NULL;
+    slot->strs = NULL;
+    slot->len = 0;
+    slot->cap = 0;
+}
+
+static void sa_list_close_all(void) {
+    for (size_t i = 0; i < SA_LIST_SLOT_COUNT; i++) {
+        sa_list_slot_free(&sa_list_slots[i]);
+        sa_list_slots[i].generation++;
+    }
+}
+
+static SaListSlot* sa_list_slot(SaHandle handle, unsigned int kind) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, kind, SA_LIST_SLOT_COUNT, &index, &generation)) return NULL;
+    SaListSlot* slot = &sa_list_slots[index];
+    return sa_list_slot_live(slot) && slot->generation == generation ? slot : NULL;
+}
+
+static SaHandle sa_list_alloc(unsigned int kind) {
+    sa_list_clear_error();
+    for (size_t i = 0; i < SA_LIST_SLOT_COUNT; i++) {
+        SaListSlot* slot = &sa_list_slots[i];
+        if (sa_list_slot_live(slot)) continue;
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->len = 0;
+        slot->cap = 8;
+        /* cap 常驻非空指针，这样 live 判定可以复用 BUFFER 的“data 非 NULL”惯用法 */
+        if (kind == SA_HANDLE_LIST) {
+            slot->nums = (double*)malloc(slot->cap * sizeof(double));
+            if (!slot->nums) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+        } else {
+            slot->strs = (char**)malloc(slot->cap * sizeof(char*));
+            if (!slot->strs) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+        }
+        if (!sa_list_cleanup_registered) {
+            atexit(sa_list_close_all);
+            sa_list_cleanup_registered = 1;
+        }
+        return sa_handle_make(kind, slot->generation, i);
+    }
+    sa_list_set_error("too many live lists");
+    return 0;
+}
+
+static SaHandle sa_list_new(void) { return sa_list_alloc(SA_HANDLE_LIST); }
+static SaHandle sa_strlist_new(void) { return sa_list_alloc(SA_HANDLE_STR_LIST); }
+
+static int sa_list_grow(SaListSlot* slot) {
+    if (slot->len < slot->cap) return 1;
+    size_t new_cap = slot->cap * 2;
+    if (slot->nums) {
+        double* grown = (double*)realloc(slot->nums, new_cap * sizeof(double));
+        if (!grown) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+        slot->nums = grown;
+    } else {
+        char** grown = (char**)realloc(slot->strs, new_cap * sizeof(char*));
+        if (!grown) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+        slot->strs = grown;
+    }
+    slot->cap = new_cap;
+    return 1;
+}
+
+static int sa_list_index_ok(SaListSlot* slot, long long index) {
+    return index >= 0 && (unsigned long long)index < (unsigned long long)slot->len;
+}
+
+static int sa_list_push(SaHandle handle, double value) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0; }
+    sa_list_grow(slot);
+    slot->nums[slot->len++] = value;
+    return 1;
+}
+
+static double sa_list_pop(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0.0; }
+    if (slot->len == 0) { sa_list_set_error("pop from empty LIST"); return 0.0; }
+    return slot->nums[--slot->len];
+}
+
+static double sa_list_get(SaHandle handle, long long index) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0.0; }
+    if (!sa_list_index_ok(slot, index)) { sa_list_set_error("LIST index is out of range"); return 0.0; }
+    return slot->nums[index];
+}
+
+static int sa_list_set(SaHandle handle, long long index, double value) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0; }
+    if (!sa_list_index_ok(slot, index)) { sa_list_set_error("LIST index is out of range"); return 0; }
+    slot->nums[index] = value;
+    return 1;
+}
+
+static int sa_list_insert(SaHandle handle, long long index, double value) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0; }
+    if (index < 0 || (unsigned long long)index > (unsigned long long)slot->len) { sa_list_set_error("LIST insert index is out of range"); return 0; }
+    sa_list_grow(slot);
+    memmove(slot->nums + index + 1, slot->nums + index, (slot->len - (size_t)index) * sizeof(double));
+    slot->nums[index] = value;
+    slot->len++;
+    return 1;
+}
+
+static int sa_list_remove(SaHandle handle, long long index) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0; }
+    if (!sa_list_index_ok(slot, index)) { sa_list_set_error("LIST index is out of range"); return 0; }
+    memmove(slot->nums + index, slot->nums + index + 1, (slot->len - (size_t)index - 1) * sizeof(double));
+    slot->len--;
+    return 1;
+}
+
+static long long sa_list_length(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return -1; }
+    return (long long)slot->len;
+}
+
+static int sa_list_clear(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0; }
+    slot->len = 0;
+    return 1;
+}
+
+static int sa_list_close(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed LIST handle"); return 0; }
+    sa_list_slot_free(slot);
+    slot->generation++;
+    return 1;
+}
+
+static int sa_strlist_push(SaHandle handle, const char* value) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return 0; }
+    sa_list_grow(slot);
+    slot->strs[slot->len++] = sa_strdup(value);
+    return 1;
+}
+
+static char* sa_strlist_pop(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return sa_strdup(""); }
+    if (slot->len == 0) { sa_list_set_error("pop from empty STR_LIST"); return sa_strdup(""); }
+    return slot->strs[--slot->len];
+}
+
+static char* sa_strlist_get(SaHandle handle, long long index) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return sa_strdup(""); }
+    if (!sa_list_index_ok(slot, index)) { sa_list_set_error("STR_LIST index is out of range"); return sa_strdup(""); }
+    return sa_strdup(slot->strs[index]);
+}
+
+static int sa_strlist_set(SaHandle handle, long long index, const char* value) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return 0; }
+    if (!sa_list_index_ok(slot, index)) { sa_list_set_error("STR_LIST index is out of range"); return 0; }
+    free(slot->strs[index]);
+    slot->strs[index] = sa_strdup(value);
+    return 1;
+}
+
+static int sa_strlist_insert(SaHandle handle, long long index, const char* value) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return 0; }
+    if (index < 0 || (unsigned long long)index > (unsigned long long)slot->len) { sa_list_set_error("STR_LIST insert index is out of range"); return 0; }
+    sa_list_grow(slot);
+    memmove(slot->strs + index + 1, slot->strs + index, (slot->len - (size_t)index) * sizeof(char*));
+    slot->strs[index] = sa_strdup(value);
+    slot->len++;
+    return 1;
+}
+
+static int sa_strlist_remove(SaHandle handle, long long index) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return 0; }
+    if (!sa_list_index_ok(slot, index)) { sa_list_set_error("STR_LIST index is out of range"); return 0; }
+    free(slot->strs[index]);
+    memmove(slot->strs + index, slot->strs + index + 1, (slot->len - (size_t)index - 1) * sizeof(char*));
+    slot->len--;
+    return 1;
+}
+
+static long long sa_strlist_length(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return -1; }
+    return (long long)slot->len;
+}
+
+static int sa_strlist_clear(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return 0; }
+    for (size_t i = 0; i < slot->len; i++) free(slot->strs[i]);
+    slot->len = 0;
+    return 1;
+}
+
+static int sa_strlist_close(SaHandle handle) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return 0; }
+    sa_list_slot_free(slot);
+    slot->generation++;
+    return 1;
+}
+
+static char* sa_strlist_join(SaHandle handle, const char* separator) {
+    sa_list_clear_error();
+    SaListSlot* slot = sa_list_slot(handle, SA_HANDLE_STR_LIST);
+    if (!slot) { sa_list_set_error("invalid or closed STR_LIST handle"); return sa_strdup(""); }
+    const char* sep = separator ? separator : "";
+    size_t sep_len = strlen(sep);
+    size_t total = 1;
+    for (size_t i = 0; i < slot->len; i++) {
+        total += strlen(slot->strs[i]);
+        if (i + 1 < slot->len) total += sep_len;
+    }
+    char* out = (char*)malloc(total);
+    if (!out) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    char* cursor = out;
+    for (size_t i = 0; i < slot->len; i++) {
+        size_t item_len = strlen(slot->strs[i]);
+        memcpy(cursor, slot->strs[i], item_len);
+        cursor += item_len;
+        if (i + 1 < slot->len) {
+            memcpy(cursor, sep, sep_len);
+            cursor += sep_len;
+        }
+    }
+    *cursor = '\0';
+    return out;
 }
 #endif
 

@@ -26,15 +26,18 @@ BUFFER_HANDLE = ast.TypeSpec("HANDLE", "BUFFER")
 NET_STREAM_HANDLE = ast.TypeSpec("HANDLE", "NET_STREAM")
 TCP_LISTENER_HANDLE = ast.TypeSpec("HANDLE", "TCP_LISTENER")
 UDP_SOCKET_HANDLE = ast.TypeSpec("HANDLE", "UDP_SOCKET")
+LIST_HANDLE = ast.TypeSpec("HANDLE", "LIST")
+STR_LIST_HANDLE = ast.TypeSpec("HANDLE", "STR_LIST")
 # NULL 字面量的占位类型，可赋给任意指针/CPTR
 NULLT = ast.TypeSpec("NULLT")
 
-BUILTIN_MODULES = {"SYS.MATH", "SYS.IO", "SYS.STRING", "SYS.NET", "SYS.FILE", "SYS.DESKTOP", "SYS.BINARY", "SYS.LINT"}
+BUILTIN_MODULES = {"SYS.MATH", "SYS.IO", "SYS.STRING", "SYS.NET", "SYS.FILE", "SYS.DESKTOP", "SYS.BINARY", "SYS.LIST", "SYS.LINT"}
 RUNTIME_FEATURE_MODULES = {
     "SYS.NET": "net",
     "SYS.FILE": "file",
     "SYS.DESKTOP": "desktop",
     "SYS.BINARY": "binary",
+    "SYS.LIST": "list",
 }
 
 
@@ -225,6 +228,9 @@ def type_of(
         binary_fn = resolve_binary_function(expr.name, uses)
         if binary_fn is not None:
             return binary_fn[1]
+        list_fn = resolve_list_function(expr.name, uses)
+        if list_fn is not None:
+            return list_fn[1]
         c_func = resolve_c_func(expr.name, c_funcs)
         if c_func is not None:
             return c_func.return_type
@@ -532,3 +538,41 @@ def resolve_binary_function(name: str, uses: dict[str, str]) -> tuple[list[ast.T
     if uses.get(alias) != "SYS.BINARY":
         return None
     return BINARY_FUNCTIONS.get(member.upper())
+
+
+# SYS.LIST 动态列表：数值列表(LIST，元素按 DOUBLE 存储)和字符串列表(STR_LIST)分成
+# 两个 HANDLE kind，把“字符串列表传给数值函数”这类错误留在编译期。
+LIST_FUNCTIONS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
+    "NEW": ([], LIST_HANDLE),
+    "PUSH": ([LIST_HANDLE, DOUBLE], BOOL),
+    "POP": ([LIST_HANDLE], DOUBLE),
+    "GET": ([LIST_HANDLE, LONG], DOUBLE),
+    "SET": ([LIST_HANDLE, LONG, DOUBLE], BOOL),
+    "INSERT": ([LIST_HANDLE, LONG, DOUBLE], BOOL),
+    "REMOVE": ([LIST_HANDLE, LONG], BOOL),
+    "LENGTH": ([LIST_HANDLE], LONG),
+    "CLEAR": ([LIST_HANDLE], BOOL),
+    "CLOSE": ([LIST_HANDLE], BOOL),
+    "NEW_STR": ([], STR_LIST_HANDLE),
+    "PUSH_STR": ([STR_LIST_HANDLE, STRING], BOOL),
+    "POP_STR": ([STR_LIST_HANDLE], STRING),
+    "GET_STR": ([STR_LIST_HANDLE, LONG], STRING),
+    "SET_STR": ([STR_LIST_HANDLE, LONG, STRING], BOOL),
+    "INSERT_STR": ([STR_LIST_HANDLE, LONG, STRING], BOOL),
+    "REMOVE_STR": ([STR_LIST_HANDLE, LONG], BOOL),
+    "LENGTH_STR": ([STR_LIST_HANDLE], LONG),
+    "CLEAR_STR": ([STR_LIST_HANDLE], BOOL),
+    "CLOSE_STR": ([STR_LIST_HANDLE], BOOL),
+    "JOIN_STR": ([STR_LIST_HANDLE, STRING], STRING),
+    "LAST_ERROR": ([], STRING),
+}
+
+
+def resolve_list_function(name: str, uses: dict[str, str]) -> tuple[list[ast.TypeSpec], ast.TypeSpec] | None:
+    split = split_module_member(name)
+    if split is None:
+        return None
+    alias, member = split
+    if uses.get(alias) != "SYS.LIST":
+        return None
+    return LIST_FUNCTIONS.get(member.upper())

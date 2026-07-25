@@ -731,6 +731,9 @@ class CGen:
         binary_call = self.binary_function_call(expr)
         if binary_call is not None:
             return binary_call
+        list_call = self.list_function_call(expr)
+        if list_call is not None:
+            return list_call
         c_func = self.resolve_c_func(expr.name)
         if c_func is not None:
             prelude, args, cleanup = self.c_call_args_with_prelude(c_func, expr.args)
@@ -990,6 +993,47 @@ class CGen:
         heap = {
             "HEX_ENCODE": "sa_binary_hex_encode",
             "LAST_ERROR": "sa_binary_last_error_copy",
+        }
+        if member in heap:
+            temp = self.next_temp()
+            self.add_prelude(f"char* {temp} = {heap[member]}({', '.join(args)});")
+            self.add_cleanup(f"free({temp});")
+            return temp
+        return None
+
+    def list_function_call(self, expr: ast.CallExpr) -> str | None:
+        split = split_module_member(expr.name)
+        if split is None or self.checked.uses.get(split[0]) != "SYS.LIST":
+            return None
+        member = split[1].upper()
+        args = ["0" if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
+        direct = {
+            "NEW": "sa_list_new",
+            "PUSH": "sa_list_push",
+            "POP": "sa_list_pop",
+            "GET": "sa_list_get",
+            "SET": "sa_list_set",
+            "INSERT": "sa_list_insert",
+            "REMOVE": "sa_list_remove",
+            "LENGTH": "sa_list_length",
+            "CLEAR": "sa_list_clear",
+            "CLOSE": "sa_list_close",
+            "NEW_STR": "sa_strlist_new",
+            "PUSH_STR": "sa_strlist_push",
+            "SET_STR": "sa_strlist_set",
+            "INSERT_STR": "sa_strlist_insert",
+            "REMOVE_STR": "sa_strlist_remove",
+            "LENGTH_STR": "sa_strlist_length",
+            "CLEAR_STR": "sa_strlist_clear",
+            "CLOSE_STR": "sa_strlist_close",
+        }
+        if member in direct:
+            return f"{direct[member]}({', '.join(args)})"
+        heap = {
+            "POP_STR": "sa_strlist_pop",
+            "GET_STR": "sa_strlist_get",
+            "JOIN_STR": "sa_strlist_join",
+            "LAST_ERROR": "sa_list_last_error_copy",
         }
         if member in heap:
             temp = self.next_temp()
@@ -1527,6 +1571,7 @@ class CGen:
             "file": "#define SA_ENABLE_FILE",
             "desktop": "#define SA_ENABLE_DESKTOP",
             "binary": "#define SA_ENABLE_BINARY",
+            "list": "#define SA_ENABLE_LIST",
         }
         return [macros[feature] for feature in sorted(runtime_features_for_program(self.checked.program, self.checked.uses)) if feature in macros]
 

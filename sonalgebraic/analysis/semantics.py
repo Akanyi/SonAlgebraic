@@ -7,7 +7,7 @@ from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
 from ..core.lines import LINT_OPTIONS
-from .typesys import BUILTIN_MODULES, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_net_function, resolve_string_function, same_handle_kind, type_of
+from .typesys import BUILTIN_MODULES, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_list_function, resolve_net_function, resolve_string_function, same_handle_kind, type_of
 
 
 @dataclass(frozen=True)
@@ -274,7 +274,7 @@ def collect_symbols(
         if decl.expr is not None:
             check_expr(decl.expr, symbols, {}, entities, uses, external_modules, {}, {}, c_funcs or {})
             expr_type = type_of(decl.expr, symbols, {}, entities, uses, external_modules, c_funcs)
-            reject_unowned_buffer_calls(decl.expr, uses, allow_root=is_buffer_handle(decl.type_spec) and is_buffer_handle(expr_type))
+            reject_unowned_buffer_calls(decl.expr, uses, allow_root=owned_handle_root_ok(decl.type_spec, expr_type))
             require_assignable(decl.type_spec, expr_type, decl.line_no)
     return symbols
 
@@ -414,7 +414,7 @@ def check_return(
         raise SonCompileError("非 VOID SUB 必须 RETURN 一个值", stmt.line_no)
     if stmt.expr is not None:
         expr_type = type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs)
-        reject_unowned_buffer_calls(stmt.expr, uses, allow_root=is_buffer_handle(return_type) and is_buffer_handle(expr_type))
+        reject_unowned_buffer_calls(stmt.expr, uses, allow_root=owned_handle_root_ok(return_type, expr_type))
         require_assignable(return_type, expr_type, stmt.line_no)
 
 
@@ -439,7 +439,7 @@ def check_stmt(
         if stmt.expr is not None:
             check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
             expr_type = type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs)
-            reject_unowned_buffer_calls(stmt.expr, uses, allow_root=is_buffer_handle(stmt.type_spec) and is_buffer_handle(expr_type))
+            reject_unowned_buffer_calls(stmt.expr, uses, allow_root=owned_handle_root_ok(stmt.type_spec, expr_type))
             require_assignable(stmt.type_spec, expr_type, stmt.line_no)
     elif isinstance(stmt, ast.Assign):
         if isinstance(stmt.target, ast.VarRef):
@@ -460,7 +460,7 @@ def check_stmt(
             raise SonCompileError("赋值目标必须是变量、数组元素或 ^指针", stmt.line_no)
         check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         expr_type = type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs)
-        reject_unowned_buffer_calls(stmt.expr, uses, allow_root=is_buffer_handle(target_type) and is_buffer_handle(expr_type))
+        reject_unowned_buffer_calls(stmt.expr, uses, allow_root=owned_handle_root_ok(target_type, expr_type))
         require_assignable(target_type, expr_type, stmt.line_no)
     elif isinstance(stmt, ast.Print):
         if stmt.expr is not None:
@@ -605,6 +605,7 @@ def check_expr(
         file_fn = resolve_file_function(expr.name, uses)
         desktop_fn = resolve_desktop_function(expr.name, uses)
         binary_fn = resolve_binary_function(expr.name, uses)
+        list_fn = resolve_list_function(expr.name, uses)
         if is_math_function(expr.name, "POW", uses):
             if len(expr.args) != 2:
                 raise SonCompileError("POW() 需要 2 个参数", expr.line_no)
@@ -627,8 +628,8 @@ def check_expr(
                 reject_unowned_buffer_calls(arg, uses)
                 require_assignable(param_type, arg_type, arg.line_no)
             return
-        elif net_fn is not None or file_fn is not None or desktop_fn is not None or binary_fn is not None:
-            params, _ret = net_fn or file_fn or desktop_fn or binary_fn
+        elif net_fn is not None or file_fn is not None or desktop_fn is not None or binary_fn is not None or list_fn is not None:
+            params, _ret = net_fn or file_fn or desktop_fn or binary_fn or list_fn
             if len(expr.args) != len(params):
                 raise SonCompileError(f"{expr.name} 需要 {len(params)} 个参数，实际给了 {len(expr.args)} 个", expr.line_no)
             for arg, param_type in zip(expr.args, params):
@@ -768,10 +769,23 @@ def is_buffer_handle(type_spec: ast.TypeSpec) -> bool:
     return is_handle(type_spec) and (type_spec.subtype or "").upper() == "BUFFER"
 
 
+def is_list_handle(type_spec: ast.TypeSpec) -> bool:
+    return is_handle(type_spec) and (type_spec.subtype or "").upper() in {"LIST", "STR_LIST"}
+
+
+def owned_handle_root_ok(target: ast.TypeSpec, source: ast.TypeSpec) -> bool:
+    """BUFFER/LIST 这类必须显式 CLOSE 的句柄，其返回值只允许直接赋给同 kind 变量。"""
+    if is_buffer_handle(target) and is_buffer_handle(source):
+        return True
+    return is_list_handle(target) and same_handle_kind(target, source)
+
+
 def reject_unowned_buffer_calls(expr: ast.Expr, uses: dict[str, str], allow_root: bool = False) -> None:
     if isinstance(expr, ast.CallExpr):
         if not allow_root and buffer_producing_call(expr, uses):
             raise SonCompileError("BUFFER 返回值必须先赋给 HANDLE AS BUFFER 变量并在使用后显式 CLOSE", expr.line_no)
+        if not allow_root and list_producing_call(expr, uses):
+            raise SonCompileError("LIST 返回值必须先赋给对应 HANDLE AS LIST / STR_LIST 变量并在使用后显式 CLOSE", expr.line_no)
         for arg in expr.args:
             reject_unowned_buffer_calls(arg, uses)
         return
@@ -796,6 +810,11 @@ def buffer_producing_call(expr: ast.CallExpr, uses: dict[str, str]) -> bool:
     binary_fn = resolve_binary_function(expr.name, uses)
     net_fn = resolve_net_function(expr.name, uses)
     return bool((binary_fn and is_buffer_handle(binary_fn[1])) or (net_fn and is_buffer_handle(net_fn[1])))
+
+
+def list_producing_call(expr: ast.CallExpr, uses: dict[str, str]) -> bool:
+    list_fn = resolve_list_function(expr.name, uses)
+    return bool(list_fn and is_list_handle(list_fn[1]))
 
 
 def reject_unsupported_type(
