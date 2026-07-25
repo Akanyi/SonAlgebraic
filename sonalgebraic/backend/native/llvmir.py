@@ -1636,7 +1636,10 @@ class NativeLLVMGen:
         binary_call = self.binary_function_call(expr)
         if binary_call is not None:
             return binary_call
-        return self.list_function_call(expr)
+        list_call = self.list_function_call(expr)
+        if list_call is not None:
+            return list_call
+        return self.map_function_call(expr)
 
     def symbol_algebra_call(self, expr: ast.CallExpr) -> LLVMValue | None:
         name = expr.name.upper()
@@ -2193,6 +2196,82 @@ class NativeLLVMGen:
             return LLVMValue("ptr", temp, ast.TypeSpec("STRING"))
         return None
 
+    def map_function_call(self, expr: ast.CallExpr) -> LLVMValue | None:
+        split = split_module_member(expr.name)
+        if split is None or self.checked.uses.get(split[0]) != "SYS.MAP":
+            return None
+        member = split[1].upper()
+        args = [LLVMValue("i64", "0", ast.TypeSpec("HANDLE")) if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
+        if member in {"NEW", "NEW_STR"}:
+            fn = "sa_map_new" if member == "NEW" else "sa_strmap_new"
+            kind = "MAP" if member == "NEW" else "STR_MAP"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @{fn}()")
+            return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", kind))
+        if member == "SET":
+            self.use_runtime("sa_map_set")
+            value = self.cast_to_double(args[2])
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @sa_map_set(i64 {args[0].value}, ptr {args[1].value}, double {value.value})")
+            return self.i32_status(raw)
+        if member == "SET_STR":
+            self.use_runtime("sa_strmap_set")
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @sa_strmap_set(i64 {args[0].value}, ptr {args[1].value}, ptr {args[2].value})")
+            return self.i32_status(raw)
+        if member == "GET":
+            self.use_runtime("sa_map_get")
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call double @sa_map_get(i64 {args[0].value}, ptr {args[1].value})")
+            return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
+        if member in {"HAS", "HAS_STR", "REMOVE", "REMOVE_STR"}:
+            fn = {
+                "HAS": "sa_map_has",
+                "HAS_STR": "sa_strmap_has",
+                "REMOVE": "sa_map_remove",
+                "REMOVE_STR": "sa_strmap_remove",
+            }[member]
+            self.use_runtime(fn)
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @{fn}(i64 {args[0].value}, ptr {args[1].value})")
+            return self.i32_status(raw)
+        if member in {"LENGTH", "LENGTH_STR"}:
+            fn = "sa_map_length" if member == "LENGTH" else "sa_strmap_length"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @{fn}(i64 {args[0].value})")
+            return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
+        if member in {"KEYS", "KEYS_STR"}:
+            fn = "sa_map_keys" if member == "KEYS" else "sa_strmap_keys"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @{fn}(i64 {args[0].value})")
+            return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", "STR_LIST"))
+        if member in {"CLEAR", "CLOSE", "CLEAR_STR", "CLOSE_STR"}:
+            fn = {
+                "CLEAR": "sa_map_clear",
+                "CLOSE": "sa_map_close",
+                "CLEAR_STR": "sa_strmap_clear",
+                "CLOSE_STR": "sa_strmap_close",
+            }[member]
+            self.use_runtime(fn)
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @{fn}(i64 {args[0].value})")
+            return self.i32_status(raw)
+        if member in {"GET_STR", "LAST_ERROR"}:
+            fn = "sa_strmap_get" if member == "GET_STR" else "sa_map_last_error_copy"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            if member == "GET_STR":
+                self.emit(f"  {temp} = call ptr @{fn}(i64 {args[0].value}, ptr {args[1].value})")
+            else:
+                self.emit(f"  {temp} = call ptr @{fn}()")
+            self.use_runtime("free")
+            self.add_temp_cleanup(f"  call void @free(ptr {temp})")
+            return LLVMValue("ptr", temp, ast.TypeSpec("STRING"))
+        return None
+
     def coerce_str_arg(self, value: LLVMValue) -> str:
         # SLICE 的 start/count 是 i64，其余字符串参数是 ptr。这里按已求值的类型直接取值，
         # 数值参数确保是 i64（SLICE 第 2、3 参数）。
@@ -2635,6 +2714,26 @@ RUNTIME_SIGNATURES: dict[str, str] = {
     "sa_strlist_close": "declare i32 @sa_strlist_close(i64)",
     "sa_strlist_join": "declare ptr @sa_strlist_join(i64, ptr)",
     "sa_list_last_error_copy": "declare ptr @sa_list_last_error_copy()",
+    # MAP
+    "sa_map_new": "declare i64 @sa_map_new()",
+    "sa_map_set": "declare i32 @sa_map_set(i64, ptr, double)",
+    "sa_map_get": "declare double @sa_map_get(i64, ptr)",
+    "sa_map_has": "declare i32 @sa_map_has(i64, ptr)",
+    "sa_map_remove": "declare i32 @sa_map_remove(i64, ptr)",
+    "sa_map_length": "declare i64 @sa_map_length(i64)",
+    "sa_map_keys": "declare i64 @sa_map_keys(i64)",
+    "sa_map_clear": "declare i32 @sa_map_clear(i64)",
+    "sa_map_close": "declare i32 @sa_map_close(i64)",
+    "sa_strmap_new": "declare i64 @sa_strmap_new()",
+    "sa_strmap_set": "declare i32 @sa_strmap_set(i64, ptr, ptr)",
+    "sa_strmap_get": "declare ptr @sa_strmap_get(i64, ptr)",
+    "sa_strmap_has": "declare i32 @sa_strmap_has(i64, ptr)",
+    "sa_strmap_remove": "declare i32 @sa_strmap_remove(i64, ptr)",
+    "sa_strmap_length": "declare i64 @sa_strmap_length(i64)",
+    "sa_strmap_keys": "declare i64 @sa_strmap_keys(i64)",
+    "sa_strmap_clear": "declare i32 @sa_strmap_clear(i64)",
+    "sa_strmap_close": "declare i32 @sa_strmap_close(i64)",
+    "sa_map_last_error_copy": "declare ptr @sa_map_last_error_copy()",
     "sa_binary_close": "declare i32 @sa_binary_close(i64)",
     "sa_binary_length": "declare i64 @sa_binary_length(i64)",
     "sa_binary_slice": "declare i64 @sa_binary_slice(i64, i64, i64)",

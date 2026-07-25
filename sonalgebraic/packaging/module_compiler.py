@@ -212,6 +212,7 @@ def _runtime_feature_prefix(features: set[str]) -> str:
         "desktop": "SA_ENABLE_DESKTOP",
         "binary": "SA_ENABLE_BINARY",
         "list": "SA_ENABLE_LIST",
+        "map": "SA_ENABLE_MAP",
     }
     lines = [f"#define {macros[feature]}" for feature in sorted(features) if feature in macros]
     return "" if not lines else "\n".join(lines) + "\n"

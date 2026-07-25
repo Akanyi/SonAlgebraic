@@ -140,7 +140,9 @@ enum {
     SA_HANDLE_NET_STREAM = 4,
     SA_HANDLE_UDP_SOCKET = 5,
     SA_HANDLE_LIST = 6,
-    SA_HANDLE_STR_LIST = 7
+    SA_HANDLE_STR_LIST = 7,
+    SA_HANDLE_MAP = 8,
+    SA_HANDLE_STR_MAP = 9
 };
 
 static SaHandle sa_handle_make(unsigned int kind, uint32_t generation, size_t index) {
@@ -697,6 +699,272 @@ static char* sa_strlist_join(SaHandle handle, const char* separator) {
     *cursor = '\0';
     return out;
 }
+#endif
+
+#ifdef SA_ENABLE_MAP
+/* STRING key 的关联容器，链地址哈希 + 负载超 1 翻倍 rehash。kind 分 MAP(double 值)
+   和 STR_MAP(char* 值)。KEYS 直接产出 STR_LIST 句柄，所以 map feature 总是连带启用 list。 */
+#define SA_MAP_SLOT_COUNT 128
+typedef struct SaMapEntry {
+    char* key;
+    double num;
+    char* str;
+    struct SaMapEntry* next;
+} SaMapEntry;
+
+typedef struct {
+    SaMapEntry** buckets;
+    size_t bucket_count;
+    size_t len;
+    int is_str;
+    uint32_t generation;
+} SaMapSlot;
+
+static SaMapSlot sa_map_slots[SA_MAP_SLOT_COUNT];
+static char sa_map_last_error[512] = "";
+static int sa_map_cleanup_registered = 0;
+
+static void sa_map_clear_error(void) { sa_map_last_error[0] = '\0'; }
+static void sa_map_set_error(const char* message) { snprintf(sa_map_last_error, sizeof(sa_map_last_error), "%s", message ? message : "map error"); }
+static char* sa_map_last_error_copy(void) { return sa_strdup(sa_map_last_error); }
+
+static size_t sa_map_hash(const char* key) {
+    unsigned int hash = 2166136261u;
+    const unsigned char* p = (const unsigned char*)(key ? key : "");
+    while (*p) {
+        hash ^= (unsigned int)(*p++);
+        hash *= 16777619u;
+    }
+    return (size_t)hash;
+}
+
+static void sa_map_slot_free(SaMapSlot* slot) {
+    for (size_t i = 0; i < slot->bucket_count; i++) {
+        SaMapEntry* entry = slot->buckets[i];
+        while (entry) {
+            SaMapEntry* next = entry->next;
+            free(entry->key);
+            free(entry->str);
+            free(entry);
+            entry = next;
+        }
+    }
+    free(slot->buckets);
+    slot->buckets = NULL;
+    slot->bucket_count = 0;
+    slot->len = 0;
+}
+
+static void sa_map_close_all(void) {
+    for (size_t i = 0; i < SA_MAP_SLOT_COUNT; i++) {
+        sa_map_slot_free(&sa_map_slots[i]);
+        sa_map_slots[i].generation++;
+    }
+}
+
+static SaMapSlot* sa_map_slot(SaHandle handle, unsigned int kind) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, kind, SA_MAP_SLOT_COUNT, &index, &generation)) return NULL;
+    SaMapSlot* slot = &sa_map_slots[index];
+    return slot->buckets && slot->generation == generation ? slot : NULL;
+}
+
+static SaHandle sa_map_alloc(unsigned int kind) {
+    sa_map_clear_error();
+    for (size_t i = 0; i < SA_MAP_SLOT_COUNT; i++) {
+        SaMapSlot* slot = &sa_map_slots[i];
+        if (slot->buckets) continue;
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->bucket_count = 16;
+        slot->len = 0;
+        slot->is_str = kind == SA_HANDLE_STR_MAP;
+        slot->buckets = (SaMapEntry**)calloc(slot->bucket_count, sizeof(SaMapEntry*));
+        if (!slot->buckets) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+        if (!sa_map_cleanup_registered) {
+            atexit(sa_map_close_all);
+            sa_map_cleanup_registered = 1;
+        }
+        return sa_handle_make(kind, slot->generation, i);
+    }
+    sa_map_set_error("too many live maps");
+    return 0;
+}
+
+static SaHandle sa_map_new(void) { return sa_map_alloc(SA_HANDLE_MAP); }
+static SaHandle sa_strmap_new(void) { return sa_map_alloc(SA_HANDLE_STR_MAP); }
+
+static SaMapEntry* sa_map_find(SaMapSlot* slot, const char* key) {
+    SaMapEntry* entry = slot->buckets[sa_map_hash(key) % slot->bucket_count];
+    while (entry) {
+        if (strcmp(entry->key, key ? key : "") == 0) return entry;
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+static void sa_map_rehash(SaMapSlot* slot) {
+    if (slot->len <= slot->bucket_count) return;
+    size_t new_count = slot->bucket_count * 2;
+    SaMapEntry** grown = (SaMapEntry**)calloc(new_count, sizeof(SaMapEntry*));
+    if (!grown) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    for (size_t i = 0; i < slot->bucket_count; i++) {
+        SaMapEntry* entry = slot->buckets[i];
+        while (entry) {
+            SaMapEntry* next = entry->next;
+            size_t target = sa_map_hash(entry->key) % new_count;
+            entry->next = grown[target];
+            grown[target] = entry;
+            entry = next;
+        }
+    }
+    free(slot->buckets);
+    slot->buckets = grown;
+    slot->bucket_count = new_count;
+}
+
+static int sa_map_put(SaHandle handle, unsigned int kind, const char* key, double num, const char* str) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, kind);
+    if (!slot) { sa_map_set_error(kind == SA_HANDLE_MAP ? "invalid or closed MAP handle" : "invalid or closed STR_MAP handle"); return 0; }
+    SaMapEntry* entry = sa_map_find(slot, key);
+    if (entry) {
+        entry->num = num;
+        if (slot->is_str) {
+            free(entry->str);
+            entry->str = sa_strdup(str);
+        }
+        return 1;
+    }
+    entry = (SaMapEntry*)malloc(sizeof(SaMapEntry));
+    if (!entry) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    entry->key = sa_strdup(key);
+    entry->num = num;
+    entry->str = slot->is_str ? sa_strdup(str) : NULL;
+    size_t target = sa_map_hash(entry->key) % slot->bucket_count;
+    entry->next = slot->buckets[target];
+    slot->buckets[target] = entry;
+    slot->len++;
+    sa_map_rehash(slot);
+    return 1;
+}
+
+static int sa_map_set(SaHandle handle, const char* key, double value) { return sa_map_put(handle, SA_HANDLE_MAP, key, value, NULL); }
+static int sa_strmap_set(SaHandle handle, const char* key, const char* value) { return sa_map_put(handle, SA_HANDLE_STR_MAP, key, 0.0, value); }
+
+static double sa_map_get(SaHandle handle, const char* key) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, SA_HANDLE_MAP);
+    if (!slot) { sa_map_set_error("invalid or closed MAP handle"); return 0.0; }
+    SaMapEntry* entry = sa_map_find(slot, key);
+    if (!entry) { sa_map_set_error("MAP key not found"); return 0.0; }
+    return entry->num;
+}
+
+static char* sa_strmap_get(SaHandle handle, const char* key) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, SA_HANDLE_STR_MAP);
+    if (!slot) { sa_map_set_error("invalid or closed STR_MAP handle"); return sa_strdup(""); }
+    SaMapEntry* entry = sa_map_find(slot, key);
+    if (!entry) { sa_map_set_error("STR_MAP key not found"); return sa_strdup(""); }
+    return sa_strdup(entry->str);
+}
+
+static int sa_map_has_impl(SaHandle handle, unsigned int kind, const char* key) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, kind);
+    if (!slot) { sa_map_set_error(kind == SA_HANDLE_MAP ? "invalid or closed MAP handle" : "invalid or closed STR_MAP handle"); return 0; }
+    return sa_map_find(slot, key) != NULL;
+}
+
+static int sa_map_has(SaHandle handle, const char* key) { return sa_map_has_impl(handle, SA_HANDLE_MAP, key); }
+static int sa_strmap_has(SaHandle handle, const char* key) { return sa_map_has_impl(handle, SA_HANDLE_STR_MAP, key); }
+
+static int sa_map_remove_impl(SaHandle handle, unsigned int kind, const char* key) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, kind);
+    if (!slot) { sa_map_set_error(kind == SA_HANDLE_MAP ? "invalid or closed MAP handle" : "invalid or closed STR_MAP handle"); return 0; }
+    SaMapEntry** cursor = &slot->buckets[sa_map_hash(key) % slot->bucket_count];
+    while (*cursor) {
+        SaMapEntry* entry = *cursor;
+        if (strcmp(entry->key, key ? key : "") == 0) {
+            *cursor = entry->next;
+            free(entry->key);
+            free(entry->str);
+            free(entry);
+            slot->len--;
+            return 1;
+        }
+        cursor = &entry->next;
+    }
+    sa_map_set_error(kind == SA_HANDLE_MAP ? "MAP key not found" : "STR_MAP key not found");
+    return 0;
+}
+
+static int sa_map_remove(SaHandle handle, const char* key) { return sa_map_remove_impl(handle, SA_HANDLE_MAP, key); }
+static int sa_strmap_remove(SaHandle handle, const char* key) { return sa_map_remove_impl(handle, SA_HANDLE_STR_MAP, key); }
+
+static long long sa_map_length_impl(SaHandle handle, unsigned int kind) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, kind);
+    if (!slot) { sa_map_set_error(kind == SA_HANDLE_MAP ? "invalid or closed MAP handle" : "invalid or closed STR_MAP handle"); return -1; }
+    return (long long)slot->len;
+}
+
+static long long sa_map_length(SaHandle handle) { return sa_map_length_impl(handle, SA_HANDLE_MAP); }
+static long long sa_strmap_length(SaHandle handle) { return sa_map_length_impl(handle, SA_HANDLE_STR_MAP); }
+
+static SaHandle sa_map_keys_impl(SaHandle handle, unsigned int kind) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, kind);
+    if (!slot) { sa_map_set_error(kind == SA_HANDLE_MAP ? "invalid or closed MAP handle" : "invalid or closed STR_MAP handle"); return 0; }
+    SaHandle keys = sa_strlist_new();
+    if (!keys) { sa_map_set_error("cannot allocate STR_LIST for keys"); return 0; }
+    for (size_t i = 0; i < slot->bucket_count; i++) {
+        for (SaMapEntry* entry = slot->buckets[i]; entry; entry = entry->next) {
+            sa_strlist_push(keys, entry->key);
+        }
+    }
+    return keys;
+}
+
+static SaHandle sa_map_keys(SaHandle handle) { return sa_map_keys_impl(handle, SA_HANDLE_MAP); }
+static SaHandle sa_strmap_keys(SaHandle handle) { return sa_map_keys_impl(handle, SA_HANDLE_STR_MAP); }
+
+static int sa_map_clear_impl(SaHandle handle, unsigned int kind) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, kind);
+    if (!slot) { sa_map_set_error(kind == SA_HANDLE_MAP ? "invalid or closed MAP handle" : "invalid or closed STR_MAP handle"); return 0; }
+    size_t bucket_count = slot->bucket_count;
+    for (size_t i = 0; i < bucket_count; i++) {
+        SaMapEntry* entry = slot->buckets[i];
+        while (entry) {
+            SaMapEntry* next = entry->next;
+            free(entry->key);
+            free(entry->str);
+            free(entry);
+            entry = next;
+        }
+        slot->buckets[i] = NULL;
+    }
+    slot->len = 0;
+    return 1;
+}
+
+static int sa_map_clear(SaHandle handle) { return sa_map_clear_impl(handle, SA_HANDLE_MAP); }
+static int sa_strmap_clear(SaHandle handle) { return sa_map_clear_impl(handle, SA_HANDLE_STR_MAP); }
+
+static int sa_map_close_impl(SaHandle handle, unsigned int kind) {
+    sa_map_clear_error();
+    SaMapSlot* slot = sa_map_slot(handle, kind);
+    if (!slot) { sa_map_set_error(kind == SA_HANDLE_MAP ? "invalid or closed MAP handle" : "invalid or closed STR_MAP handle"); return 0; }
+    sa_map_slot_free(slot);
+    slot->generation++;
+    return 1;
+}
+
+static int sa_map_close(SaHandle handle) { return sa_map_close_impl(handle, SA_HANDLE_MAP); }
+static int sa_strmap_close(SaHandle handle) { return sa_map_close_impl(handle, SA_HANDLE_STR_MAP); }
 #endif
 
 #ifdef _WIN32

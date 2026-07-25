@@ -734,6 +734,9 @@ class CGen:
         list_call = self.list_function_call(expr)
         if list_call is not None:
             return list_call
+        map_call = self.map_function_call(expr)
+        if map_call is not None:
+            return map_call
         c_func = self.resolve_c_func(expr.name)
         if c_func is not None:
             prelude, args, cleanup = self.c_call_args_with_prelude(c_func, expr.args)
@@ -1034,6 +1037,44 @@ class CGen:
             "GET_STR": "sa_strlist_get",
             "JOIN_STR": "sa_strlist_join",
             "LAST_ERROR": "sa_list_last_error_copy",
+        }
+        if member in heap:
+            temp = self.next_temp()
+            self.add_prelude(f"char* {temp} = {heap[member]}({', '.join(args)});")
+            self.add_cleanup(f"free({temp});")
+            return temp
+        return None
+
+    def map_function_call(self, expr: ast.CallExpr) -> str | None:
+        split = split_module_member(expr.name)
+        if split is None or self.checked.uses.get(split[0]) != "SYS.MAP":
+            return None
+        member = split[1].upper()
+        args = ["0" if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
+        direct = {
+            "NEW": "sa_map_new",
+            "SET": "sa_map_set",
+            "GET": "sa_map_get",
+            "HAS": "sa_map_has",
+            "REMOVE": "sa_map_remove",
+            "LENGTH": "sa_map_length",
+            "KEYS": "sa_map_keys",
+            "CLEAR": "sa_map_clear",
+            "CLOSE": "sa_map_close",
+            "NEW_STR": "sa_strmap_new",
+            "SET_STR": "sa_strmap_set",
+            "HAS_STR": "sa_strmap_has",
+            "REMOVE_STR": "sa_strmap_remove",
+            "LENGTH_STR": "sa_strmap_length",
+            "KEYS_STR": "sa_strmap_keys",
+            "CLEAR_STR": "sa_strmap_clear",
+            "CLOSE_STR": "sa_strmap_close",
+        }
+        if member in direct:
+            return f"{direct[member]}({', '.join(args)})"
+        heap = {
+            "GET_STR": "sa_strmap_get",
+            "LAST_ERROR": "sa_map_last_error_copy",
         }
         if member in heap:
             temp = self.next_temp()
@@ -1572,6 +1613,7 @@ class CGen:
             "desktop": "#define SA_ENABLE_DESKTOP",
             "binary": "#define SA_ENABLE_BINARY",
             "list": "#define SA_ENABLE_LIST",
+            "map": "#define SA_ENABLE_MAP",
         }
         return [macros[feature] for feature in sorted(runtime_features_for_program(self.checked.program, self.checked.uses)) if feature in macros]
 

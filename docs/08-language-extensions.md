@@ -17,6 +17,7 @@
 - [原生句柄 HANDLE](#原生句柄-handle)
 - [二进制 SYS.BINARY](#二进制-sysbinary)
 - [动态列表 SYS.LIST](#动态列表-syslist)
+- [关联容器 SYS.MAP](#关联容器-sysmap)
 - [网络 SYS.NET](#网络-sysnet)
 - [文件 SYS.FILE](#文件-sysfile)
 - [桌面 SYS.DESKTOP](#桌面-sysdesktop)
@@ -331,6 +332,47 @@ BUFFER 是显式资源。返回 BUFFER 的函数必须直接赋给 `HANDLE AS BU
 
 - 数值元素统一按 `DOUBLE` 存储，约 2^53 以内的整数无损；需要精确 64 位整数序列时用 `SYS.BINARY` 的 BUFFER。
 - 与 BUFFER 相同，返回列表句柄的函数必须直接赋给对应 `HANDLE AS LIST` / `STR_LIST` 变量并显式 CLOSE；进程退出时 runtime 会兜底清理。
+
+## 关联容器 SYS.MAP
+
+`SYS.MAP` 提供 STRING key 的哈希映射（链地址，负载超 1 自动翻倍 rehash）。值分数值和字符串两个 kind：`HANDLE AS MAP`（值按 `DOUBLE` 存储）和 `HANDLE AS STR_MAP`：
+
+```basic
+10 USE SYS.MAP AS M
+20 USE SYS.LIST AS L
+30 DIM scores AS HANDLE AS MAP AS VAR
+40 DIM keys AS HANDLE AS STR_LIST AS VAR
+50 DIM ok AS BOOL AS VAR
+60 SUB main AS PUBLIC AS VOID
+70 scores = M.NEW()
+80 ok = M.SET(scores, "alice", 99)
+90 PRINT M.GET(scores, "alice")
+100 keys = M.KEYS(scores)
+110 PRINT L.JOIN_STR(keys, ",")
+120 ok = L.CLOSE_STR(keys)
+130 ok = M.CLOSE(scores)
+140 .ENDSUB
+150 CALL main
+160 END
+```
+
+数值映射（`HANDLE AS MAP`）：
+
+| 函数 | 返回 | 说明 |
+|---|---|---|
+| `NEW()` | `HANDLE AS MAP` | 创建空映射 |
+| `SET(map, key, value)` | `BOOL` | 插入或覆盖 |
+| `GET(map, key)` | `DOUBLE` | 取值，缺 key 返回 0 并记录错误 |
+| `HAS(map, key)` | `BOOL` | key 是否存在 |
+| `REMOVE(map, key)` | `BOOL` | 删除 key |
+| `LENGTH(map)` | `LONG` | 键值对个数，失败为 -1 |
+| `KEYS(map)` | `HANDLE AS STR_LIST` | 所有 key 的快照列表（无序），用 `SYS.LIST` 遍历，用完记得 CLOSE_STR |
+| `CLEAR(map)` | `BOOL` | 清空但保留映射 |
+| `CLOSE(map)` | `BOOL` | 显式释放 |
+
+字符串映射（`HANDLE AS STR_MAP`）：同名函数带 `_STR` 后缀（`NEW_STR` / `SET_STR` / `GET_STR` / `HAS_STR` / `REMOVE_STR` / `LENGTH_STR` / `KEYS_STR` / `CLEAR_STR` / `CLOSE_STR`）。`LAST_ERROR()` 返回最近一次映射操作错误。
+
+`USE SYS.MAP` 会自动连带启用 list runtime，因为 `KEYS` 产出 STR_LIST 句柄。
 
 ## 网络 SYS.NET
 

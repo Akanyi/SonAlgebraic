@@ -28,21 +28,28 @@ TCP_LISTENER_HANDLE = ast.TypeSpec("HANDLE", "TCP_LISTENER")
 UDP_SOCKET_HANDLE = ast.TypeSpec("HANDLE", "UDP_SOCKET")
 LIST_HANDLE = ast.TypeSpec("HANDLE", "LIST")
 STR_LIST_HANDLE = ast.TypeSpec("HANDLE", "STR_LIST")
+MAP_HANDLE = ast.TypeSpec("HANDLE", "MAP")
+STR_MAP_HANDLE = ast.TypeSpec("HANDLE", "STR_MAP")
 # NULL 字面量的占位类型，可赋给任意指针/CPTR
 NULLT = ast.TypeSpec("NULLT")
 
-BUILTIN_MODULES = {"SYS.MATH", "SYS.IO", "SYS.STRING", "SYS.NET", "SYS.FILE", "SYS.DESKTOP", "SYS.BINARY", "SYS.LIST", "SYS.LINT"}
+BUILTIN_MODULES = {"SYS.MATH", "SYS.IO", "SYS.STRING", "SYS.NET", "SYS.FILE", "SYS.DESKTOP", "SYS.BINARY", "SYS.LIST", "SYS.MAP", "SYS.LINT"}
 RUNTIME_FEATURE_MODULES = {
     "SYS.NET": "net",
     "SYS.FILE": "file",
     "SYS.DESKTOP": "desktop",
     "SYS.BINARY": "binary",
     "SYS.LIST": "list",
+    "SYS.MAP": "map",
 }
 
 
 def runtime_features_for_uses(uses: dict[str, str]) -> set[str]:
-    return {feature for module in uses.values() if (feature := RUNTIME_FEATURE_MODULES.get(module)) is not None}
+    features = {feature for module in uses.values() if (feature := RUNTIME_FEATURE_MODULES.get(module)) is not None}
+    # MAP.KEYS() 产出 STR_LIST 句柄，map runtime 直接调用 list runtime，必须连带启用
+    if "map" in features:
+        features.add("list")
+    return features
 
 
 def runtime_features_for_program(program: ast.Program, uses: dict[str, str]) -> set[str]:
@@ -231,6 +238,9 @@ def type_of(
         list_fn = resolve_list_function(expr.name, uses)
         if list_fn is not None:
             return list_fn[1]
+        map_fn = resolve_map_function(expr.name, uses)
+        if map_fn is not None:
+            return map_fn[1]
         c_func = resolve_c_func(expr.name, c_funcs)
         if c_func is not None:
             return c_func.return_type
@@ -576,3 +586,38 @@ def resolve_list_function(name: str, uses: dict[str, str]) -> tuple[list[ast.Typ
     if uses.get(alias) != "SYS.LIST":
         return None
     return LIST_FUNCTIONS.get(member.upper())
+
+
+# SYS.MAP 关联容器：STRING key，值分数值(MAP)和字符串(STR_MAP)两个 HANDLE kind。
+# KEYS 返回 STR_LIST 句柄，与 SYS.LIST 打通遍历。
+MAP_FUNCTIONS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
+    "NEW": ([], MAP_HANDLE),
+    "SET": ([MAP_HANDLE, STRING, DOUBLE], BOOL),
+    "GET": ([MAP_HANDLE, STRING], DOUBLE),
+    "HAS": ([MAP_HANDLE, STRING], BOOL),
+    "REMOVE": ([MAP_HANDLE, STRING], BOOL),
+    "LENGTH": ([MAP_HANDLE], LONG),
+    "KEYS": ([MAP_HANDLE], STR_LIST_HANDLE),
+    "CLEAR": ([MAP_HANDLE], BOOL),
+    "CLOSE": ([MAP_HANDLE], BOOL),
+    "NEW_STR": ([], STR_MAP_HANDLE),
+    "SET_STR": ([STR_MAP_HANDLE, STRING, STRING], BOOL),
+    "GET_STR": ([STR_MAP_HANDLE, STRING], STRING),
+    "HAS_STR": ([STR_MAP_HANDLE, STRING], BOOL),
+    "REMOVE_STR": ([STR_MAP_HANDLE, STRING], BOOL),
+    "LENGTH_STR": ([STR_MAP_HANDLE], LONG),
+    "KEYS_STR": ([STR_MAP_HANDLE], STR_LIST_HANDLE),
+    "CLEAR_STR": ([STR_MAP_HANDLE], BOOL),
+    "CLOSE_STR": ([STR_MAP_HANDLE], BOOL),
+    "LAST_ERROR": ([], STRING),
+}
+
+
+def resolve_map_function(name: str, uses: dict[str, str]) -> tuple[list[ast.TypeSpec], ast.TypeSpec] | None:
+    split = split_module_member(name)
+    if split is None:
+        return None
+    alias, member = split
+    if uses.get(alias) != "SYS.MAP":
+        return None
+    return MAP_FUNCTIONS.get(member.upper())

@@ -7,7 +7,7 @@ from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
 from ..core.lines import LINT_OPTIONS
-from .typesys import BUILTIN_MODULES, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_list_function, resolve_net_function, resolve_string_function, same_handle_kind, type_of
+from .typesys import BUILTIN_MODULES, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, type_of
 
 
 @dataclass(frozen=True)
@@ -606,6 +606,7 @@ def check_expr(
         desktop_fn = resolve_desktop_function(expr.name, uses)
         binary_fn = resolve_binary_function(expr.name, uses)
         list_fn = resolve_list_function(expr.name, uses)
+        map_fn = resolve_map_function(expr.name, uses)
         if is_math_function(expr.name, "POW", uses):
             if len(expr.args) != 2:
                 raise SonCompileError("POW() 需要 2 个参数", expr.line_no)
@@ -628,8 +629,8 @@ def check_expr(
                 reject_unowned_buffer_calls(arg, uses)
                 require_assignable(param_type, arg_type, arg.line_no)
             return
-        elif net_fn is not None or file_fn is not None or desktop_fn is not None or binary_fn is not None or list_fn is not None:
-            params, _ret = net_fn or file_fn or desktop_fn or binary_fn or list_fn
+        elif net_fn is not None or file_fn is not None or desktop_fn is not None or binary_fn is not None or list_fn is not None or map_fn is not None:
+            params, _ret = net_fn or file_fn or desktop_fn or binary_fn or list_fn or map_fn
             if len(expr.args) != len(params):
                 raise SonCompileError(f"{expr.name} 需要 {len(params)} 个参数，实际给了 {len(expr.args)} 个", expr.line_no)
             for arg, param_type in zip(expr.args, params):
@@ -770,7 +771,7 @@ def is_buffer_handle(type_spec: ast.TypeSpec) -> bool:
 
 
 def is_list_handle(type_spec: ast.TypeSpec) -> bool:
-    return is_handle(type_spec) and (type_spec.subtype or "").upper() in {"LIST", "STR_LIST"}
+    return is_handle(type_spec) and (type_spec.subtype or "").upper() in {"LIST", "STR_LIST", "MAP", "STR_MAP"}
 
 
 def owned_handle_root_ok(target: ast.TypeSpec, source: ast.TypeSpec) -> bool:
@@ -785,7 +786,7 @@ def reject_unowned_buffer_calls(expr: ast.Expr, uses: dict[str, str], allow_root
         if not allow_root and buffer_producing_call(expr, uses):
             raise SonCompileError("BUFFER 返回值必须先赋给 HANDLE AS BUFFER 变量并在使用后显式 CLOSE", expr.line_no)
         if not allow_root and list_producing_call(expr, uses):
-            raise SonCompileError("LIST 返回值必须先赋给对应 HANDLE AS LIST / STR_LIST 变量并在使用后显式 CLOSE", expr.line_no)
+            raise SonCompileError("LIST/MAP 返回值必须先赋给对应 kind 的 HANDLE 变量并在使用后显式 CLOSE", expr.line_no)
         for arg in expr.args:
             reject_unowned_buffer_calls(arg, uses)
         return
@@ -813,8 +814,8 @@ def buffer_producing_call(expr: ast.CallExpr, uses: dict[str, str]) -> bool:
 
 
 def list_producing_call(expr: ast.CallExpr, uses: dict[str, str]) -> bool:
-    list_fn = resolve_list_function(expr.name, uses)
-    return bool(list_fn and is_list_handle(list_fn[1]))
+    fn = resolve_list_function(expr.name, uses) or resolve_map_function(expr.name, uses)
+    return bool(fn and is_list_handle(fn[1]))
 
 
 def reject_unsupported_type(

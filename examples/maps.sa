@@ -1,0 +1,30 @@
+10 USE SYS.MAP AS M
+20 USE SYS.LIST AS L
+30 DIM scores AS HANDLE AS MAP AS VAR
+40 DIM labels AS HANDLE AS STR_MAP AS VAR
+50 DIM keys AS HANDLE AS STR_LIST AS VAR
+60 DIM ok AS BOOL AS VAR
+70 DIM i AS NUM AS LONG AS VAR
+80 SUB main AS PUBLIC AS VOID
+90 scores = M.NEW()
+100 ok = M.SET(scores, "alice", 95)
+110 ok = M.SET(scores, "bob", 87)
+120 ok = M.SET(scores, "alice", 99)
+130 PRINT M.LENGTH(scores)
+140 PRINT M.GET(scores, "alice")
+150 PRINT M.HAS(scores, "bob")
+160 ok = M.REMOVE(scores, "bob")
+170 PRINT M.HAS(scores, "bob")
+180 keys = M.KEYS(scores)
+190 PRINT L.JOIN_STR(keys, ",")
+200 ok = L.CLOSE_STR(keys)
+210 ok = M.CLOSE(scores)
+220 labels = M.NEW_STR()
+230 ok = M.SET_STR(labels, "en", "hello")
+240 ok = M.SET_STR(labels, "zh", "nihao")
+250 PRINT M.GET_STR(labels, "zh")
+260 PRINT M.LENGTH_STR(labels)
+270 ok = M.CLOSE_STR(labels)
+280 .ENDSUB
+290 CALL main
+300 END
