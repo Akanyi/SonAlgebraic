@@ -73,6 +73,10 @@ RUNTIME = r'''
 #endif
 #endif
 
+#ifdef SA_ENABLE_GUI_GTK
+#include <gtk/gtk.h>
+#endif
+
 /* TRY/CATCH 的跳转原语按目标运行时分两套：
  * - MinGW（__MINGW32__）下用 __builtin_setjmp：MinGW 的标准 setjmp 走 SEH 帧展开
  *   (_setjmpex/RtlUnwindEx)，遇到含不可归约控制流（GOTO 跳进循环、GOSUB）的函数在
@@ -3494,28 +3498,15 @@ static void sa_gui_clear_error(void) { sa_gui_last_error[0] = '\0'; }
 static void sa_gui_set_error(const char* message) { snprintf(sa_gui_last_error, sizeof(sa_gui_last_error), "%s", message ? message : "gui error"); }
 static char* sa_gui_last_error_copy(void) { return sa_strdup(sa_gui_last_error); }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(SA_ENABLE_GUI_GTK)
 #define SA_GUI_WINDOW_COUNT 16
 #define SA_GUI_WIDGET_COUNT 128
 #define SA_GUI_EVENT_QUEUE 64
 
-typedef struct {
-    HWND hwnd;
-    uint32_t generation;
-} SaGuiWindowSlot;
-
-typedef struct {
-    HWND hwnd;
-    uint32_t generation;
-} SaGuiWidgetSlot;
-
-static SaGuiWindowSlot sa_gui_windows[SA_GUI_WINDOW_COUNT];
-static SaGuiWidgetSlot sa_gui_widgets[SA_GUI_WIDGET_COUNT];
 static long long sa_gui_events[SA_GUI_EVENT_QUEUE];
 static int sa_gui_event_head = 0;
 static int sa_gui_event_count = 0;
 static int sa_gui_live_windows = 0;
-static int sa_gui_class_registered = 0;
 
 static void sa_gui_push_event(long long id) {
     if (sa_gui_event_count >= SA_GUI_EVENT_QUEUE) return;
@@ -3529,6 +3520,22 @@ static long long sa_gui_pop_event(void) {
     sa_gui_event_count--;
     return id;
 }
+#endif
+
+#ifdef _WIN32
+typedef struct {
+    HWND hwnd;
+    uint32_t generation;
+} SaGuiWindowSlot;
+
+typedef struct {
+    HWND hwnd;
+    uint32_t generation;
+} SaGuiWidgetSlot;
+
+static SaGuiWindowSlot sa_gui_windows[SA_GUI_WINDOW_COUNT];
+static SaGuiWidgetSlot sa_gui_widgets[SA_GUI_WIDGET_COUNT];
+static int sa_gui_class_registered = 0;
 
 static LRESULT CALLBACK sa_gui_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
@@ -3601,6 +3608,88 @@ static HWND sa_gui_widget_hwnd(SaHandle handle) {
 }
 #endif
 
+#ifdef SA_ENABLE_GUI_GTK
+/* GTK3 后端：与 Win32 版共用事件队列和轮询语义。绝对坐标布局用 GtkFixed，
+   clicked 信号在 C 层把 control id 塞进队列，SA 层 API 完全一致。 */
+typedef struct {
+    GtkWidget* window;
+    GtkWidget* fixed;
+    uint32_t generation;
+} SaGuiWindowSlot;
+
+typedef struct {
+    GtkWidget* widget;
+    uint32_t generation;
+} SaGuiWidgetSlot;
+
+static SaGuiWindowSlot sa_gui_windows[SA_GUI_WINDOW_COUNT];
+static SaGuiWidgetSlot sa_gui_widgets[SA_GUI_WIDGET_COUNT];
+static int sa_gui_gtk_ready = 0;
+
+static int sa_gui_ensure_gtk(void) {
+    if (sa_gui_gtk_ready) return 1;
+    if (!gtk_init_check(NULL, NULL)) { sa_gui_set_error("gtk_init failed (is a display available?)"); return 0; }
+    sa_gui_gtk_ready = 1;
+    return 1;
+}
+
+static void sa_gui_on_button_clicked(GtkWidget* source, gpointer user_data) {
+    (void)source;
+    sa_gui_push_event((long long)(intptr_t)user_data);
+}
+
+static void sa_gui_on_widget_destroy(GtkWidget* source, gpointer user_data) {
+    (void)source;
+    SaGuiWidgetSlot* slot = (SaGuiWidgetSlot*)user_data;
+    slot->widget = NULL;
+    slot->generation++;
+}
+
+static void sa_gui_on_window_destroy(GtkWidget* source, gpointer user_data) {
+    (void)source;
+    SaGuiWindowSlot* slot = (SaGuiWindowSlot*)user_data;
+    slot->window = NULL;
+    slot->fixed = NULL;
+    slot->generation++;
+    if (sa_gui_live_windows > 0 && --sa_gui_live_windows == 0) {
+        sa_gui_push_event(0);
+    }
+}
+
+static SaGuiWindowSlot* sa_gui_window_slot(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_GUI_WINDOW, SA_GUI_WINDOW_COUNT, &index, &generation)) return NULL;
+    SaGuiWindowSlot* slot = &sa_gui_windows[index];
+    return slot->window && slot->generation == generation ? slot : NULL;
+}
+
+static GtkWidget* sa_gui_widget_ptr(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_GUI_WIDGET, SA_GUI_WIDGET_COUNT, &index, &generation)) return NULL;
+    SaGuiWidgetSlot* slot = &sa_gui_widgets[index];
+    return slot->widget && slot->generation == generation ? slot->widget : NULL;
+}
+
+static SaHandle sa_gui_register_widget(SaGuiWindowSlot* owner, GtkWidget* widget, long long x, long long y, long long width, long long height) {
+    for (size_t i = 0; i < SA_GUI_WIDGET_COUNT; i++) {
+        SaGuiWidgetSlot* slot = &sa_gui_widgets[i];
+        if (slot->widget) continue;
+        gtk_fixed_put(GTK_FIXED(owner->fixed), widget, (gint)x, (gint)y);
+        gtk_widget_set_size_request(widget, (gint)width, (gint)height);
+        gtk_widget_show(widget);
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->widget = widget;
+        g_signal_connect(widget, "destroy", G_CALLBACK(sa_gui_on_widget_destroy), slot);
+        return sa_handle_make(SA_HANDLE_GUI_WIDGET, slot->generation, i);
+    }
+    gtk_widget_destroy(widget);
+    sa_gui_set_error("too many live widgets");
+    return 0;
+}
+#endif
+
 static SaHandle sa_gui_window(const char* title, long long width, long long height) {
     sa_gui_clear_error();
 #ifdef _WIN32
@@ -3626,6 +3715,27 @@ static SaHandle sa_gui_window(const char* title, long long width, long long heig
         return sa_handle_make(SA_HANDLE_GUI_WINDOW, slot->generation, i);
     }
     free(title_w);
+    sa_gui_set_error("too many live windows");
+    return 0;
+#elif defined(SA_ENABLE_GUI_GTK)
+    if (!sa_gui_ensure_gtk()) return 0;
+    for (size_t i = 0; i < SA_GUI_WINDOW_COUNT; i++) {
+        SaGuiWindowSlot* slot = &sa_gui_windows[i];
+        if (slot->window) continue;
+        GtkWidget* created = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(created), title ? title : "");
+        gtk_window_set_default_size(GTK_WINDOW(created), (gint)width, (gint)height);
+        gtk_window_set_resizable(GTK_WINDOW(created), FALSE);
+        GtkWidget* fixed = gtk_fixed_new();
+        gtk_container_add(GTK_CONTAINER(created), fixed);
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->window = created;
+        slot->fixed = fixed;
+        g_signal_connect(created, "destroy", G_CALLBACK(sa_gui_on_window_destroy), slot);
+        sa_gui_live_windows++;
+        gtk_widget_show_all(created);
+        return sa_handle_make(SA_HANDLE_GUI_WINDOW, slot->generation, i);
+    }
     sa_gui_set_error("too many live windows");
     return 0;
 #else
@@ -3665,6 +3775,13 @@ static SaHandle sa_gui_button(SaHandle window, long long control_id, const char*
 #ifdef _WIN32
     if (control_id <= 0 || control_id > 65535) { sa_gui_set_error("BUTTON control id must be in 1..65535"); return 0; }
     return sa_gui_create_widget(window, L"BUTTON", BS_PUSHBUTTON, control_id, text, x, y, width, height);
+#elif defined(SA_ENABLE_GUI_GTK)
+    if (control_id <= 0 || control_id > 65535) { sa_gui_set_error("BUTTON control id must be in 1..65535"); return 0; }
+    SaGuiWindowSlot* owner = sa_gui_window_slot(window);
+    if (!owner) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
+    GtkWidget* created = gtk_button_new_with_label(text ? text : "");
+    g_signal_connect(created, "clicked", G_CALLBACK(sa_gui_on_button_clicked), (gpointer)(intptr_t)control_id);
+    return sa_gui_register_widget(owner, created, x, y, width, height);
 #else
     (void)window; (void)control_id; (void)text; (void)x; (void)y; (void)width; (void)height;
     sa_gui_set_error("SYS.GUI is only available on Windows");
@@ -3676,6 +3793,14 @@ static SaHandle sa_gui_label(SaHandle window, const char* text, long long x, lon
     sa_gui_clear_error();
 #ifdef _WIN32
     return sa_gui_create_widget(window, L"STATIC", 0, 0, text, x, y, width, height);
+#elif defined(SA_ENABLE_GUI_GTK)
+    SaGuiWindowSlot* owner = sa_gui_window_slot(window);
+    if (!owner) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
+    GtkWidget* created = gtk_label_new(text ? text : "");
+    /* GtkLabel 默认居中，Win32 STATIC 是左上对齐，行为对齐后 SA 程序跨平台观感一致 */
+    gtk_widget_set_halign(created, GTK_ALIGN_START);
+    gtk_widget_set_valign(created, GTK_ALIGN_START);
+    return sa_gui_register_widget(owner, created, x, y, width, height);
 #else
     (void)window; (void)text; (void)x; (void)y; (void)width; (void)height;
     sa_gui_set_error("SYS.GUI is only available on Windows");
@@ -3687,6 +3812,11 @@ static SaHandle sa_gui_textbox(SaHandle window, long long x, long long y, long l
     sa_gui_clear_error();
 #ifdef _WIN32
     return sa_gui_create_widget(window, L"EDIT", WS_BORDER | ES_AUTOHSCROLL, 0, "", x, y, width, height);
+#elif defined(SA_ENABLE_GUI_GTK)
+    SaGuiWindowSlot* owner = sa_gui_window_slot(window);
+    if (!owner) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
+    GtkWidget* created = gtk_entry_new();
+    return sa_gui_register_widget(owner, created, x, y, width, height);
 #else
     (void)window; (void)x; (void)y; (void)width; (void)height;
     sa_gui_set_error("SYS.GUI is only available on Windows");
@@ -3704,6 +3834,14 @@ static int sa_gui_set_text(SaHandle widget, const char* text) {
     int ok = SetWindowTextW(hwnd, text_w);
     free(text_w);
     if (!ok) { sa_gui_set_error("SetWindowTextW failed"); return 0; }
+    return 1;
+#elif defined(SA_ENABLE_GUI_GTK)
+    GtkWidget* target = sa_gui_widget_ptr(widget);
+    if (!target) { sa_gui_set_error("invalid or closed WIDGET handle"); return 0; }
+    if (GTK_IS_ENTRY(target)) gtk_entry_set_text(GTK_ENTRY(target), text ? text : "");
+    else if (GTK_IS_LABEL(target)) gtk_label_set_text(GTK_LABEL(target), text ? text : "");
+    else if (GTK_IS_BUTTON(target)) gtk_button_set_label(GTK_BUTTON(target), text ? text : "");
+    else { sa_gui_set_error("unsupported widget type"); return 0; }
     return 1;
 #else
     (void)widget; (void)text;
@@ -3726,6 +3864,15 @@ static char* sa_gui_get_text(SaHandle widget) {
     free(text_w);
     if (!result) { sa_gui_set_error("widget text conversion failed"); return sa_strdup(""); }
     return result;
+#elif defined(SA_ENABLE_GUI_GTK)
+    GtkWidget* target = sa_gui_widget_ptr(widget);
+    if (!target) { sa_gui_set_error("invalid or closed WIDGET handle"); return sa_strdup(""); }
+    const char* text = NULL;
+    if (GTK_IS_ENTRY(target)) text = gtk_entry_get_text(GTK_ENTRY(target));
+    else if (GTK_IS_LABEL(target)) text = gtk_label_get_text(GTK_LABEL(target));
+    else if (GTK_IS_BUTTON(target)) text = gtk_button_get_label(GTK_BUTTON(target));
+    else { sa_gui_set_error("unsupported widget type"); return sa_strdup(""); }
+    return sa_strdup(text);
 #else
     (void)widget;
     sa_gui_set_error("SYS.GUI is only available on Windows");
@@ -3748,6 +3895,13 @@ static long long sa_gui_wait_event(void) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+#elif defined(SA_ENABLE_GUI_GTK)
+    if (!sa_gui_gtk_ready) return 0;
+    for (;;) {
+        if (sa_gui_event_count > 0) return sa_gui_pop_event();
+        if (sa_gui_live_windows == 0) return 0;
+        gtk_main_iteration();
+    }
 #else
     sa_gui_set_error("SYS.GUI is only available on Windows");
     return 0;
@@ -3765,6 +3919,12 @@ static int sa_gui_close(SaHandle window) {
     DestroyWindow(slot->hwnd);
     slot->hwnd = NULL;
     slot->generation++;
+    return 1;
+#elif defined(SA_ENABLE_GUI_GTK)
+    SaGuiWindowSlot* slot = sa_gui_window_slot(window);
+    if (!slot) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
+    /* destroy 信号回调负责清槽位、减窗口计数 */
+    gtk_widget_destroy(slot->window);
     return 1;
 #else
     (void)window;

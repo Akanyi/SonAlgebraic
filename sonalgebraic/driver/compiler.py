@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile
 
@@ -235,7 +236,7 @@ def build_exe(
         compiler = find_c_compiler(target)
         if compiler is None:
             raise SonCompileError("未找到 C 编译器，请安装 gcc、clang、tcc、zig 或 Visual Studio cl")
-        run_c_compiler(compiler, plan.c_files, output_path, include_dir=out_dir, libs=plan.libs, link_libs=plan.link_libs, target=target)
+        run_c_compiler(compiler, plan.c_files, output_path, include_dir=out_dir, libs=plan.libs, link_libs=plan.link_libs, target=target, extra_args=gui_backend_args(plan.runtime_features, target))
         for dll in plan.dlls:
             shutil.copy2(dll, output_path.parent / dll.name)
         return BuildResult(plan.main_c, output_path, compiler)
@@ -251,7 +252,7 @@ def build_exe(
 
     features = runtime_features_for_program(checked.program, checked.uses)
     link_libs = [lib.library for lib in checked.c_libs.values()] + builtin_link_libs(checked.uses, target, features)
-    run_c_compiler(compiler, [c_file], output_path, link_libs=link_libs, target=target)
+    run_c_compiler(compiler, [c_file], output_path, link_libs=link_libs, target=target, extra_args=gui_backend_args(features, target))
     if not keep_c and c_path is None:
         c_file.unlink(missing_ok=True)
     return BuildResult(c_file, output_path, compiler)
@@ -275,7 +276,7 @@ def build_native_exe(
             raise SonCompileError("native 后端需要 clang 或 zig cc 来编译 LLVM IR")
         module_sources = [Path(unit.c_path) for unit in plan.modules.values() if unit.c_path]
         extra_sources = [*( [plan.runtime_c] if plan.runtime_c is not None else [] ), *module_sources]
-        run_native_compiler(compiler, ir_file, output_path, target=target, extra_sources=extra_sources, libs=plan.libs, link_libs=plan.link_libs)
+        run_native_compiler(compiler, ir_file, output_path, target=target, extra_sources=extra_sources, libs=plan.libs, link_libs=plan.link_libs, extra_args=gui_backend_args(plan.runtime_features, target))
         for dll in plan.dlls:
             shutil.copy2(dll, output_path.parent / dll.name)
         return BuildResult(ir_file, output_path, compiler)
@@ -292,7 +293,7 @@ def build_native_exe(
     features = runtime_features_for_program(checked.program, checked.uses)
     runtime_c.write_text(_native_runtime_source(features), encoding="utf-8")
     link_libs = [lib.library for lib in checked.c_libs.values()] + builtin_link_libs(checked.uses, target, features)
-    run_native_compiler(compiler, ir_file, output_path, target=target, extra_sources=[runtime_c], link_libs=link_libs)
+    run_native_compiler(compiler, ir_file, output_path, target=target, extra_sources=[runtime_c], link_libs=link_libs, extra_args=gui_backend_args(features, target))
     if not keep_ir and ir_path is None:
         ir_file.unlink(missing_ok=True)
         runtime_c.unlink(missing_ok=True)
@@ -316,6 +317,25 @@ def compile_main_to_native_ir_with_modules(source_path: Path, ir_path: Path, pla
     ir_path.parent.mkdir(parents=True, exist_ok=True)
     ir_path.write_text(generate_native_llvm_ir(checked, main_init_calls=init_calls, main_free_calls=free_calls), encoding="utf-8")
     return ir_path
+
+
+def gui_backend_args(features: set[str] | None, target: str | None = None) -> list[str]:
+    """SYS.GUI 的 POSIX 后端探测：宿主机装有 GTK3 开发文件（pkg-config 可查到
+    gtk+-3.0）时注入 -DSA_ENABLE_GUI_GTK 和编译/链接 flags，让 runtime 编出真窗口；
+    否则静默跳过，落回"返回失败 + LAST_ERROR"分支。交叉编译时宿主 pkg-config
+    的 flags 对目标平台无意义，同样跳过。"""
+    if not features or "gui" not in features or sys.platform == "win32":
+        return []
+    if normalize_target(target) != host_target():
+        return []
+    try:
+        cflags = subprocess.run(["pkg-config", "--cflags", "gtk+-3.0"], text=True, capture_output=True)
+        libs = subprocess.run(["pkg-config", "--libs", "gtk+-3.0"], text=True, capture_output=True)
+    except OSError:
+        return []
+    if cflags.returncode != 0 or libs.returncode != 0:
+        return []
+    return ["-DSA_ENABLE_GUI_GTK", *cflags.stdout.split(), *libs.stdout.split()]
 
 
 def builtin_link_libs(uses: dict[str, str], target: str | None = None, features: set[str] | None = None) -> list[str]:
@@ -375,18 +395,20 @@ def run_native_compiler(
     extra_sources: list[Path] | None = None,
     libs: list[Path] | None = None,
     link_libs: list[str] | None = None,
+    extra_args: list[str] | None = None,
 ) -> None:
     exe_path.parent.mkdir(parents=True, exist_ok=True)
     sources = [str(ir_path), *(str(p) for p in extra_sources or [])]
     lib_args = [str(path) for path in libs or []]
     link_lib_args = _link_lib_args(link_libs or [], compiler)
     rpath_args = rpath_flags(libs or [], normalize_target(target))
+    passthrough = extra_args or []
     if compiler == "zig":
         target_args = ["-target", normalize_target(target)] if target else []
-        command = ["zig", "cc", *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *rpath_args, *link_lib_args, "-o", str(exe_path)]
+        command = ["zig", "cc", *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path)]
     else:
         target_args = ["--target", normalize_target(target)] if target else []
-        command = [compiler, *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *rpath_args, *link_lib_args, "-o", str(exe_path)]
+        command = [compiler, *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path)]
     proc = subprocess.run(command, text=True, capture_output=True)
     if proc.returncode != 0:
         output = (proc.stdout + proc.stderr).strip()
@@ -402,6 +424,7 @@ def run_c_compiler(
     libs: list[Path] | None = None,
     link_libs: list[str] | None = None,
     target: str | None = None,
+    extra_args: list[str] | None = None,
 ) -> None:
     exe_path.parent.mkdir(parents=True, exist_ok=True)
     c_args = [str(path) for path in c_paths]
@@ -409,14 +432,15 @@ def run_c_compiler(
     link_lib_args = _link_lib_args(link_libs or [], compiler)
     include_args = [f"-I{include_dir}"] if include_dir is not None else []
     rpath_args = rpath_flags(libs or [], normalize_target(target))
+    passthrough = extra_args or []
     if compiler == "zig":
         target_args = ["-target", normalize_target(target)] if target else []
-        command = [compiler, "cc", *target_args, *c_args, *lib_args, "-O2", "-std=c11", *include_args, *rpath_args, *link_lib_args, "-o", str(exe_path)]
+        command = [compiler, "cc", *target_args, *c_args, *lib_args, "-O2", "-std=c11", *include_args, *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path)]
     elif compiler == "cl":
         cl_include = [f"/I{include_dir}"] if include_dir is not None else []
         command = [compiler, "/nologo", *cl_include, *c_args, *lib_args, *link_lib_args, f"/Fe:{exe_path}"]
     else:
-        command = [compiler, *c_args, *lib_args, "-O2", "-std=c11", *include_args, *rpath_args, *link_lib_args, "-o", str(exe_path), "-lm"]
+        command = [compiler, *c_args, *lib_args, "-O2", "-std=c11", *include_args, *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path), "-lm"]
 
     proc = subprocess.run(command, text=True, capture_output=True)
     if proc.returncode != 0:

@@ -69,6 +69,23 @@ def test_gui_button_arity_checked() -> None:
     )
 
 
+# --- GTK 后端探测 ---
+
+def test_gui_backend_args_empty_without_gui_feature() -> None:
+    from sonalgebraic.driver.compiler import gui_backend_args
+
+    assert gui_backend_args(None) == []
+    assert gui_backend_args({"net", "file"}) == []
+
+
+def test_gui_backend_args_empty_on_windows_host() -> None:
+    # Windows 走 Win32 后端，GTK flags 只在 POSIX 宿主上探测
+    from sonalgebraic.driver.compiler import gui_backend_args
+
+    if sys.platform == "win32":
+        assert gui_backend_args({"gui"}) == []
+
+
 # --- 端到端（仅 Windows；用 FFI PostMessage 自己点自己的按钮，验证事件循环闭环） ---
 
 _SELFTEST_SOURCE = """10 USE SYS.GUI AS G

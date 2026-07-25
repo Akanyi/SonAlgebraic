@@ -27,6 +27,7 @@ class ModuleBuildPlan:
     link_libs: list[str] = field(default_factory=list)
     headers: list[Path] = field(default_factory=list)
     modules: dict[str, ModuleUnit] = field(default_factory=dict)
+    runtime_features: set[str] = field(default_factory=set)
 
 
 def compile_project(source_path: Path, out_dir: Path, target: str | None = None, spkgs: list[Path] | None = None) -> ModuleBuildPlan:
@@ -78,6 +79,7 @@ def compile_project(source_path: Path, out_dir: Path, target: str | None = None,
         ),
         headers=[runtime_h, *(Path(unit.h_path) for unit in module_units.values())],
         modules=module_units,
+        runtime_features=runtime_features,
     )
 
 

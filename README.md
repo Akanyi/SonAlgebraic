@@ -511,7 +511,7 @@ python -m pytest -m ffi
 - `SYS.BINARY`：BUFFER 创建/切片/复制、HEX、大小端 U16/U32/U64、校验和
 - `SYS.LIST`：可变长动态列表，数值 LIST 与字符串 STR_LIST 两种句柄 kind，PUSH/POP/GET/SET/INSERT/REMOVE/JOIN
 - `SYS.MAP`：STRING key 关联容器，数值 MAP 与字符串 STR_MAP 两种句柄 kind，SET/GET/HAS/REMOVE/KEYS，KEYS 产出 STR_LIST 与 SYS.LIST 打通
-- `SYS.GUI`：Windows 原生窗口 GUI（WINDOW/BUTTON/LABEL/TEXTBOX），轮询式 `WAIT_EVENT` 事件循环，control id 分发，无需回调
+- `SYS.GUI`：原生窗口 GUI（WINDOW/BUTTON/LABEL/TEXTBOX），轮询式 `WAIT_EVENT` 事件循环，control id 分发，无需回调；Windows 用 Win32，Linux/macOS 有 GTK3 开发文件时自动启用 GTK 后端
 - `SYS.NET`：HTTP/HTTPS、DNS、TCP client/server、TLS client stream、UDP、字符串与 BUFFER 收发
 - `SYS.FILE`：文件句柄读写/定位/关闭、文本便捷读写、存在性、目录、删除、当前目录和绝对路径
 - `SYS.DESKTOP`：Windows 消息框、系统打开路径/URL、Unicode 文本剪贴板
@@ -542,3 +542,4 @@ python -m pytest -m ffi
 - BUFFER 返回值必须直接赋给 `HANDLE AS BUFFER` 变量（或从同类型 SUB 直接 RETURN），不能匿名嵌套进参数/F-string；否则无法显式 CLOSE。
 - POSIX TLS/HTTPS 需要 OpenSSL 开发文件和 `libssl` / `libcrypto`；Windows 使用系统 Schannel，不要求外部 TLS SDK。
 - POSIX 网络 runtime 当前只支持 HTTP，HTTPS 仍需接入 TLS 库；`SYS.DESKTOP` 的非 Windows 实现当前返回失败并提供 `LAST_ERROR()`，不会拼 shell 命令执行用户输入。
+- `SYS.GUI` 在 Linux/macOS 依赖 GTK3 开发文件（`pkg-config` + `gtk+-3.0`，如 `libgtk-3-dev`）；未安装时编译仍成功，但 GUI 函数运行时返回失败并提供 `LAST_ERROR()`。交叉编译目标不启用 GTK 后端。

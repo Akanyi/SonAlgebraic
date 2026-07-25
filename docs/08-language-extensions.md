@@ -521,7 +521,7 @@ SA 没有函数指针，经典的"回调注册"式 GUI 表达不了。`SYS.GUI` 
 
 说明：
 
-- 仅 Windows 有真实实现（user32/gdi32，Unicode，控件用系统默认 GUI 字体）；其他平台所有函数返回失败并提供 `LAST_ERROR()`。
+- Windows 用 user32/gdi32 原生实现（Unicode，控件用系统默认 GUI 字体）。Linux/macOS 用 GTK3：宿主机装有 GTK3 开发文件（`pkg-config` 能查到 `gtk+-3.0`，如 Debian/Ubuntu 的 `libgtk-3-dev`）时编译期自动启用；没装则所有函数返回失败并提供 `LAST_ERROR()`，与 POSIX TLS 需要 OpenSSL 开发文件的策略一致。交叉编译时不启用 GTK 后端。
 - `WINDOW`/`WIDGET` 是两个不同的 HANDLE kind，把"把窗口句柄传给 SET_TEXT"这类错误留在编译期。
 - WIDGET 随窗口销毁，无需显式关闭；窗口点 X 或 `CLOSE` 后句柄自动失效。
 - 事件循环建议以 `WAIT_EVENT() = 0`（全部窗口关闭）作为退出条件。
