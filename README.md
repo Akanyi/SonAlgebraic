@@ -79,6 +79,7 @@ python -m sonalgebraic run examples/allexample.sa
 - `.spkg` 多模块源码包，支持 hash 校验和 zip 路径安全解包。
 - C FFI：`USEC`、`USELIB`、`DECLARE C`、不透明指针和 typed pointer。
 - 多错误诊断：`check/c/build/run` 都会先预检，输出源码下划线。
+- VSCode 语法高亮扩展：见 [editors/vscode/](./editors/vscode/)。
 - 原生网络栈：HTTP/HTTPS、DNS、TCP client/server、TLS client stream、UDP 和二进制 BUFFER 数据包；C/native 后端共用同一 runtime。
 - Windows 原生系统交互：WinHTTP、Schannel、UTF-8 文件路径、消息框、系统打开和 Unicode 文本剪贴板。
 

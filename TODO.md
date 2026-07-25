@@ -43,6 +43,7 @@
 - [ ] 增加 `sonc init`，生成最小项目结构。
 - [x] 将 C 编译错误尽量映射回 SA 源码行号。
 - [x] 为 `check/c/build/run` 增加多错误诊断预检和源码下划线显示。
+- [x] VSCode 语法高亮扩展（`editors/vscode/`，tmLanguage）。
 - [ ] 增加正式项目配置文件，例如 `sonalgebraic.toml`。
 - [x] 增加 Python 分发配置，声明 `jinja2`、`pydantic` 等依赖（`pyproject.toml`，含 `dev` 组的 pytest）。
 
