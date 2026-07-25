@@ -21,6 +21,7 @@
 - [网络 SYS.NET](#网络-sysnet)
 - [文件 SYS.FILE](#文件-sysfile)
 - [桌面 SYS.DESKTOP](#桌面-sysdesktop)
+- [窗口 GUI SYS.GUI](#窗口-gui-sysgui)
 - [语法糖 SYS.LINT](#语法糖-syslint)
 
 ## 条件分支 ELSE / ELSE IF
@@ -477,6 +478,53 @@ Windows 路径在 runtime 内从 SA UTF-8 转成 UTF-16；POSIX 直接使用 UTF
 | `LAST_ERROR()` | `STRING` | 最近一次桌面操作错误 |
 
 非 Windows 平台当前明确返回失败；runtime 不会通过 `system()` 拼接用户输入执行 shell 命令。
+
+## 窗口 GUI SYS.GUI
+
+SA 没有函数指针，经典的"回调注册"式 GUI 表达不了。`SYS.GUI` 走复古轮询路线：控件创建时带数字 control id，`WAIT_EVENT()` 阻塞取事件返回被点击的 id，SA 侧用 `WHILE`/`GOTO` + `IF` 分发——这同时也是 Win32 `WM_COMMAND` 的原生模式。
+
+```basic
+10 USE SYS.GUI AS G
+20 DIM win AS HANDLE AS WINDOW AS VAR
+30 DIM box AS HANDLE AS WIDGET AS VAR
+40 DIM w AS HANDLE AS WIDGET AS VAR
+50 DIM ev AS NUM AS LONG AS VAR
+60 DIM ok AS BOOL AS VAR
+70 SUB main AS PUBLIC AS VOID
+80 win = G.WINDOW("Demo", 300, 120)
+90 box = G.TEXTBOX(win, 10, 10, 200, 24)
+100 w = G.BUTTON(win, 1, "OK", 10, 44, 60, 26)
+110 ::loop
+120 ev = G.WAIT_EVENT()
+130 IF ev = 1 THEN
+140 PRINT G.GET_TEXT(box)
+150 ok = G.CLOSE(win)
+160 END IF
+170 IF ev > 0 THEN
+180 GOTO ::loop
+190 END IF
+200 .ENDSUB
+210 CALL main
+220 END
+```
+
+| 函数 | 返回 | 说明 |
+|---|---|---|
+| `WINDOW(title, width, height)` | `HANDLE AS WINDOW` | 创建并显示窗口（固定大小，客户区尺寸） |
+| `BUTTON(win, id, text, x, y, w, h)` | `HANDLE AS WIDGET` | 按钮，id 取 1..65535，点击时作为事件返回 |
+| `LABEL(win, text, x, y, w, h)` | `HANDLE AS WIDGET` | 静态文本 |
+| `TEXTBOX(win, x, y, w, h)` | `HANDLE AS WIDGET` | 单行输入框 |
+| `SET_TEXT(widget, text)` / `GET_TEXT(widget)` | `BOOL` / `STRING` | 读写控件文本（UTF-8） |
+| `WAIT_EVENT()` | `LONG` | 阻塞直到事件：>0 为被点击按钮的 id，0 表示所有窗口已关闭 |
+| `CLOSE(win)` | `BOOL` | 关闭窗口（点 X 等价） |
+| `LAST_ERROR()` | `STRING` | 最近一次 GUI 操作错误 |
+
+说明：
+
+- 仅 Windows 有真实实现（user32/gdi32，Unicode，控件用系统默认 GUI 字体）；其他平台所有函数返回失败并提供 `LAST_ERROR()`。
+- `WINDOW`/`WIDGET` 是两个不同的 HANDLE kind，把"把窗口句柄传给 SET_TEXT"这类错误留在编译期。
+- WIDGET 随窗口销毁，无需显式关闭；窗口点 X 或 `CLOSE` 后句柄自动失效。
+- 事件循环建议以 `WAIT_EVENT() = 0`（全部窗口关闭）作为退出条件。
 
 ## 语法糖 SYS.LINT
 

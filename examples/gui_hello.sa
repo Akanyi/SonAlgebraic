@@ -1,0 +1,31 @@
+10 USE SYS.GUI AS G
+20 DIM win AS HANDLE AS WINDOW AS VAR
+30 DIM name_box AS HANDLE AS WIDGET AS VAR
+40 DIM greeting AS HANDLE AS WIDGET AS VAR
+50 DIM w AS HANDLE AS WIDGET AS VAR
+60 DIM ev AS NUM AS LONG AS VAR
+70 DIM ok AS BOOL AS VAR
+80 DIM who AS STRING AS VAR
+90 SUB main AS PUBLIC AS VOID
+100 win = G.WINDOW("SonAlgebraic GUI", 360, 160)
+110 w = G.LABEL(win, "Name:", 16, 18, 60, 20)
+120 name_box = G.TEXTBOX(win, 80, 16, 180, 24)
+130 w = G.BUTTON(win, 1, "Greet", 270, 14, 70, 26)
+140 greeting = G.LABEL(win, "Type your name and click Greet.", 16, 60, 320, 20)
+150 w = G.BUTTON(win, 2, "Quit", 270, 110, 70, 26)
+160 ::loop
+170 ev = G.WAIT_EVENT()
+180 IF ev = 1 THEN
+190 who = G.GET_TEXT(name_box)
+200 ok = G.SET_TEXT(greeting, F"Hello, {who}!")
+210 END IF
+220 IF ev = 2 THEN
+230 ok = G.CLOSE(win)
+240 END IF
+250 IF ev > 0 THEN
+260 GOTO ::loop
+270 END IF
+280 PRINT "window closed, bye"
+290 .ENDSUB
+300 CALL main
+310 END

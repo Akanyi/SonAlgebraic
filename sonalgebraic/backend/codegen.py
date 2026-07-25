@@ -737,6 +737,9 @@ class CGen:
         map_call = self.map_function_call(expr)
         if map_call is not None:
             return map_call
+        gui_call = self.gui_function_call(expr)
+        if gui_call is not None:
+            return gui_call
         c_func = self.resolve_c_func(expr.name)
         if c_func is not None:
             prelude, args, cleanup = self.c_call_args_with_prelude(c_func, expr.args)
@@ -1075,6 +1078,34 @@ class CGen:
         heap = {
             "GET_STR": "sa_strmap_get",
             "LAST_ERROR": "sa_map_last_error_copy",
+        }
+        if member in heap:
+            temp = self.next_temp()
+            self.add_prelude(f"char* {temp} = {heap[member]}({', '.join(args)});")
+            self.add_cleanup(f"free({temp});")
+            return temp
+        return None
+
+    def gui_function_call(self, expr: ast.CallExpr) -> str | None:
+        split = split_module_member(expr.name)
+        if split is None or self.checked.uses.get(split[0]) != "SYS.GUI":
+            return None
+        member = split[1].upper()
+        args = ["0" if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
+        direct = {
+            "WINDOW": "sa_gui_window",
+            "BUTTON": "sa_gui_button",
+            "LABEL": "sa_gui_label",
+            "TEXTBOX": "sa_gui_textbox",
+            "SET_TEXT": "sa_gui_set_text",
+            "WAIT_EVENT": "sa_gui_wait_event",
+            "CLOSE": "sa_gui_close",
+        }
+        if member in direct:
+            return f"{direct[member]}({', '.join(args)})"
+        heap = {
+            "GET_TEXT": "sa_gui_get_text",
+            "LAST_ERROR": "sa_gui_last_error_copy",
         }
         if member in heap:
             temp = self.next_temp()
@@ -1614,6 +1645,7 @@ class CGen:
             "binary": "#define SA_ENABLE_BINARY",
             "list": "#define SA_ENABLE_LIST",
             "map": "#define SA_ENABLE_MAP",
+            "gui": "#define SA_ENABLE_GUI",
         }
         return [macros[feature] for feature in sorted(runtime_features_for_program(self.checked.program, self.checked.uses)) if feature in macros]
 

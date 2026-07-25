@@ -30,10 +30,12 @@ LIST_HANDLE = ast.TypeSpec("HANDLE", "LIST")
 STR_LIST_HANDLE = ast.TypeSpec("HANDLE", "STR_LIST")
 MAP_HANDLE = ast.TypeSpec("HANDLE", "MAP")
 STR_MAP_HANDLE = ast.TypeSpec("HANDLE", "STR_MAP")
+GUI_WINDOW_HANDLE = ast.TypeSpec("HANDLE", "WINDOW")
+GUI_WIDGET_HANDLE = ast.TypeSpec("HANDLE", "WIDGET")
 # NULL 字面量的占位类型，可赋给任意指针/CPTR
 NULLT = ast.TypeSpec("NULLT")
 
-BUILTIN_MODULES = {"SYS.MATH", "SYS.IO", "SYS.STRING", "SYS.NET", "SYS.FILE", "SYS.DESKTOP", "SYS.BINARY", "SYS.LIST", "SYS.MAP", "SYS.LINT"}
+BUILTIN_MODULES = {"SYS.MATH", "SYS.IO", "SYS.STRING", "SYS.NET", "SYS.FILE", "SYS.DESKTOP", "SYS.BINARY", "SYS.LIST", "SYS.MAP", "SYS.GUI", "SYS.LINT"}
 RUNTIME_FEATURE_MODULES = {
     "SYS.NET": "net",
     "SYS.FILE": "file",
@@ -41,6 +43,7 @@ RUNTIME_FEATURE_MODULES = {
     "SYS.BINARY": "binary",
     "SYS.LIST": "list",
     "SYS.MAP": "map",
+    "SYS.GUI": "gui",
 }
 
 
@@ -241,6 +244,9 @@ def type_of(
         map_fn = resolve_map_function(expr.name, uses)
         if map_fn is not None:
             return map_fn[1]
+        gui_fn = resolve_gui_function(expr.name, uses)
+        if gui_fn is not None:
+            return gui_fn[1]
         c_func = resolve_c_func(expr.name, c_funcs)
         if c_func is not None:
             return c_func.return_type
@@ -621,3 +627,29 @@ def resolve_map_function(name: str, uses: dict[str, str]) -> tuple[list[ast.Type
     if uses.get(alias) != "SYS.MAP":
         return None
     return MAP_FUNCTIONS.get(member.upper())
+
+
+# SYS.GUI 窗口模块：轮询式事件（SA 没有函数指针，不做回调注册）。
+# BUTTON 创建时带用户自定义 control id，WAIT_EVENT 阻塞返回被点击的 id，
+# 0 表示所有窗口已关闭。仅 Windows 实现，POSIX 全部失败并给 LAST_ERROR。
+GUI_FUNCTIONS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
+    "WINDOW": ([STRING, LONG, LONG], GUI_WINDOW_HANDLE),
+    "BUTTON": ([GUI_WINDOW_HANDLE, LONG, STRING, LONG, LONG, LONG, LONG], GUI_WIDGET_HANDLE),
+    "LABEL": ([GUI_WINDOW_HANDLE, STRING, LONG, LONG, LONG, LONG], GUI_WIDGET_HANDLE),
+    "TEXTBOX": ([GUI_WINDOW_HANDLE, LONG, LONG, LONG, LONG], GUI_WIDGET_HANDLE),
+    "SET_TEXT": ([GUI_WIDGET_HANDLE, STRING], BOOL),
+    "GET_TEXT": ([GUI_WIDGET_HANDLE], STRING),
+    "WAIT_EVENT": ([], LONG),
+    "CLOSE": ([GUI_WINDOW_HANDLE], BOOL),
+    "LAST_ERROR": ([], STRING),
+}
+
+
+def resolve_gui_function(name: str, uses: dict[str, str]) -> tuple[list[ast.TypeSpec], ast.TypeSpec] | None:
+    split = split_module_member(name)
+    if split is None:
+        return None
+    alias, member = split
+    if uses.get(alias) != "SYS.GUI":
+        return None
+    return GUI_FUNCTIONS.get(member.upper())

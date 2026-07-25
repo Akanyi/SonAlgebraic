@@ -201,6 +201,8 @@ def _builtin_link_libs(uses: dict[str, str], target: str | None = None, features
         libs.extend(["ssl", "crypto"])
     if "windows" in target_name and "SYS.DESKTOP" in modules:
         libs.extend(["user32", "shell32"])
+    if "windows" in target_name and "SYS.GUI" in modules:
+        libs.extend(["user32", "gdi32"])
     return libs
 
 
@@ -213,6 +215,7 @@ def _runtime_feature_prefix(features: set[str]) -> str:
         "binary": "SA_ENABLE_BINARY",
         "list": "SA_ENABLE_LIST",
         "map": "SA_ENABLE_MAP",
+        "gui": "SA_ENABLE_GUI",
     }
     lines = [f"#define {macros[feature]}" for feature in sorted(features) if feature in macros]
     return "" if not lines else "\n".join(lines) + "\n"

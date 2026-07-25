@@ -142,7 +142,9 @@ enum {
     SA_HANDLE_LIST = 6,
     SA_HANDLE_STR_LIST = 7,
     SA_HANDLE_MAP = 8,
-    SA_HANDLE_STR_MAP = 9
+    SA_HANDLE_STR_MAP = 9,
+    SA_HANDLE_GUI_WINDOW = 10,
+    SA_HANDLE_GUI_WIDGET = 11
 };
 
 static SaHandle sa_handle_make(unsigned int kind, uint32_t generation, size_t index) {
@@ -3479,6 +3481,295 @@ static char* sa_desktop_clipboard_get(void) {
 #else
     sa_desktop_set_error("clipboard is not available on this platform");
     return sa_strdup("");
+#endif
+}
+#endif
+
+#ifdef SA_ENABLE_GUI
+/* 轮询式窗口 GUI：SA 没有函数指针，所以不走回调注册，而是 Win32 原生的
+   control id 路线——按钮点击进事件队列，WAIT_EVENT 阻塞取 id，SA 侧用
+   WHILE + IF 分发。窗口/控件句柄沿用槽位 + generation 机制。 */
+static char sa_gui_last_error[512] = "";
+static void sa_gui_clear_error(void) { sa_gui_last_error[0] = '\0'; }
+static void sa_gui_set_error(const char* message) { snprintf(sa_gui_last_error, sizeof(sa_gui_last_error), "%s", message ? message : "gui error"); }
+static char* sa_gui_last_error_copy(void) { return sa_strdup(sa_gui_last_error); }
+
+#ifdef _WIN32
+#define SA_GUI_WINDOW_COUNT 16
+#define SA_GUI_WIDGET_COUNT 128
+#define SA_GUI_EVENT_QUEUE 64
+
+typedef struct {
+    HWND hwnd;
+    uint32_t generation;
+} SaGuiWindowSlot;
+
+typedef struct {
+    HWND hwnd;
+    uint32_t generation;
+} SaGuiWidgetSlot;
+
+static SaGuiWindowSlot sa_gui_windows[SA_GUI_WINDOW_COUNT];
+static SaGuiWidgetSlot sa_gui_widgets[SA_GUI_WIDGET_COUNT];
+static long long sa_gui_events[SA_GUI_EVENT_QUEUE];
+static int sa_gui_event_head = 0;
+static int sa_gui_event_count = 0;
+static int sa_gui_live_windows = 0;
+static int sa_gui_class_registered = 0;
+
+static void sa_gui_push_event(long long id) {
+    if (sa_gui_event_count >= SA_GUI_EVENT_QUEUE) return;
+    sa_gui_events[(sa_gui_event_head + sa_gui_event_count) % SA_GUI_EVENT_QUEUE] = id;
+    sa_gui_event_count++;
+}
+
+static long long sa_gui_pop_event(void) {
+    long long id = sa_gui_events[sa_gui_event_head];
+    sa_gui_event_head = (sa_gui_event_head + 1) % SA_GUI_EVENT_QUEUE;
+    sa_gui_event_count--;
+    return id;
+}
+
+static LRESULT CALLBACK sa_gui_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    switch (msg) {
+    case WM_COMMAND:
+        /* 只把按钮点击当事件；EDIT 的 EN_* 通知忽略，文本用 GET_TEXT 拉取 */
+        if (HIWORD(wparam) == BN_CLICKED && LOWORD(wparam) != 0) {
+            sa_gui_push_event((long long)LOWORD(wparam));
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        /* 点 X 关闭也走这里：清掉窗口槽位和随之销毁的子控件槽位，
+           否则句柄仍判定为 live，后续 SET_TEXT 会打到已销毁的 HWND 上 */
+        for (size_t i = 0; i < SA_GUI_WINDOW_COUNT; i++) {
+            if (sa_gui_windows[i].hwnd == hwnd) {
+                sa_gui_windows[i].hwnd = NULL;
+                sa_gui_windows[i].generation++;
+            }
+        }
+        for (size_t i = 0; i < SA_GUI_WIDGET_COUNT; i++) {
+            if (sa_gui_widgets[i].hwnd && !IsWindow(sa_gui_widgets[i].hwnd)) {
+                sa_gui_widgets[i].hwnd = NULL;
+                sa_gui_widgets[i].generation++;
+            }
+        }
+        if (sa_gui_live_windows > 0 && --sa_gui_live_windows == 0) {
+            sa_gui_push_event(0);
+        }
+        return 0;
+    default:
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+}
+
+static void sa_gui_apply_font(HWND hwnd) {
+    /* 不发 WM_SETFONT 的话控件用远古 System 粗体字，观感直接回到 Win3.1 */
+    SendMessageW(hwnd, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+}
+
+static int sa_gui_ensure_class(void) {
+    if (sa_gui_class_registered) return 1;
+    WNDCLASSW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = sa_gui_wndproc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"SonAlgebraicWindow";
+    if (!RegisterClassW(&wc)) { sa_gui_set_error("RegisterClassW failed"); return 0; }
+    sa_gui_class_registered = 1;
+    return 1;
+}
+
+static HWND sa_gui_window_hwnd(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_GUI_WINDOW, SA_GUI_WINDOW_COUNT, &index, &generation)) return NULL;
+    SaGuiWindowSlot* slot = &sa_gui_windows[index];
+    return slot->hwnd && slot->generation == generation ? slot->hwnd : NULL;
+}
+
+static HWND sa_gui_widget_hwnd(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_GUI_WIDGET, SA_GUI_WIDGET_COUNT, &index, &generation)) return NULL;
+    SaGuiWidgetSlot* slot = &sa_gui_widgets[index];
+    return slot->hwnd && slot->generation == generation ? slot->hwnd : NULL;
+}
+#endif
+
+static SaHandle sa_gui_window(const char* title, long long width, long long height) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    if (!sa_gui_ensure_class()) return 0;
+    wchar_t* title_w = sa_win_widen(title);
+    if (!title_w) { sa_gui_set_error("invalid UTF-8 window title"); return 0; }
+    for (size_t i = 0; i < SA_GUI_WINDOW_COUNT; i++) {
+        SaGuiWindowSlot* slot = &sa_gui_windows[i];
+        if (slot->hwnd) continue;
+        RECT frame = {0, 0, (LONG)width, (LONG)height};
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE);
+        HWND hwnd = CreateWindowW(L"SonAlgebraicWindow", title_w,
+            WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX),
+            CW_USEDEFAULT, CW_USEDEFAULT, frame.right - frame.left, frame.bottom - frame.top,
+            NULL, NULL, GetModuleHandleW(NULL), NULL);
+        free(title_w);
+        if (!hwnd) { sa_gui_set_error("CreateWindowW failed"); return 0; }
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->hwnd = hwnd;
+        sa_gui_live_windows++;
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+        return sa_handle_make(SA_HANDLE_GUI_WINDOW, slot->generation, i);
+    }
+    free(title_w);
+    sa_gui_set_error("too many live windows");
+    return 0;
+#else
+    (void)title; (void)width; (void)height;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
+
+#ifdef _WIN32
+static SaHandle sa_gui_create_widget(SaHandle window, const wchar_t* wclass, DWORD style, long long control_id, const char* text, long long x, long long y, long long width, long long height) {
+    HWND parent = sa_gui_window_hwnd(window);
+    if (!parent) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
+    wchar_t* text_w = sa_win_widen(text);
+    if (!text_w) { sa_gui_set_error("invalid UTF-8 widget text"); return 0; }
+    for (size_t i = 0; i < SA_GUI_WIDGET_COUNT; i++) {
+        SaGuiWidgetSlot* slot = &sa_gui_widgets[i];
+        if (slot->hwnd) continue;
+        HWND hwnd = CreateWindowW(wclass, text_w, WS_CHILD | WS_VISIBLE | style,
+            (int)x, (int)y, (int)width, (int)height,
+            parent, (HMENU)(INT_PTR)control_id, GetModuleHandleW(NULL), NULL);
+        free(text_w);
+        if (!hwnd) { sa_gui_set_error("CreateWindowW failed for widget"); return 0; }
+        sa_gui_apply_font(hwnd);
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->hwnd = hwnd;
+        return sa_handle_make(SA_HANDLE_GUI_WIDGET, slot->generation, i);
+    }
+    sa_gui_set_error("too many live widgets");
+    free(text_w);
+    return 0;
+}
+#endif
+
+static SaHandle sa_gui_button(SaHandle window, long long control_id, const char* text, long long x, long long y, long long width, long long height) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    if (control_id <= 0 || control_id > 65535) { sa_gui_set_error("BUTTON control id must be in 1..65535"); return 0; }
+    return sa_gui_create_widget(window, L"BUTTON", BS_PUSHBUTTON, control_id, text, x, y, width, height);
+#else
+    (void)window; (void)control_id; (void)text; (void)x; (void)y; (void)width; (void)height;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
+
+static SaHandle sa_gui_label(SaHandle window, const char* text, long long x, long long y, long long width, long long height) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    return sa_gui_create_widget(window, L"STATIC", 0, 0, text, x, y, width, height);
+#else
+    (void)window; (void)text; (void)x; (void)y; (void)width; (void)height;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
+
+static SaHandle sa_gui_textbox(SaHandle window, long long x, long long y, long long width, long long height) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    return sa_gui_create_widget(window, L"EDIT", WS_BORDER | ES_AUTOHSCROLL, 0, "", x, y, width, height);
+#else
+    (void)window; (void)x; (void)y; (void)width; (void)height;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
+
+static int sa_gui_set_text(SaHandle widget, const char* text) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    HWND hwnd = sa_gui_widget_hwnd(widget);
+    if (!hwnd) { sa_gui_set_error("invalid or closed WIDGET handle"); return 0; }
+    wchar_t* text_w = sa_win_widen(text);
+    if (!text_w) { sa_gui_set_error("invalid UTF-8 text"); return 0; }
+    int ok = SetWindowTextW(hwnd, text_w);
+    free(text_w);
+    if (!ok) { sa_gui_set_error("SetWindowTextW failed"); return 0; }
+    return 1;
+#else
+    (void)widget; (void)text;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
+
+static char* sa_gui_get_text(SaHandle widget) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    HWND hwnd = sa_gui_widget_hwnd(widget);
+    if (!hwnd) { sa_gui_set_error("invalid or closed WIDGET handle"); return sa_strdup(""); }
+    int length = GetWindowTextLengthW(hwnd);
+    if (length <= 0) return sa_strdup("");
+    wchar_t* text_w = (wchar_t*)malloc(((size_t)length + 1) * sizeof(wchar_t));
+    if (!text_w) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    GetWindowTextW(hwnd, text_w, length + 1);
+    char* result = sa_win_narrow(text_w);
+    free(text_w);
+    if (!result) { sa_gui_set_error("widget text conversion failed"); return sa_strdup(""); }
+    return result;
+#else
+    (void)widget;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return sa_strdup("");
+#endif
+}
+
+static long long sa_gui_wait_event(void) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    MSG msg;
+    for (;;) {
+        if (sa_gui_event_count > 0) return sa_gui_pop_event();
+        if (sa_gui_live_windows == 0) return 0;
+        BOOL result = GetMessageW(&msg, NULL, 0, 0);
+        if (result <= 0) return 0;
+        /* 让 TEXTBOX 里 Tab 键在控件间移动焦点 */
+        HWND active = GetActiveWindow();
+        if (active && IsDialogMessageW(active, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+#else
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
+
+static int sa_gui_close(SaHandle window) {
+    sa_gui_clear_error();
+#ifdef _WIN32
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(window, SA_HANDLE_GUI_WINDOW, SA_GUI_WINDOW_COUNT, &index, &generation)) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
+    SaGuiWindowSlot* slot = &sa_gui_windows[index];
+    if (!slot->hwnd || slot->generation != generation) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
+    DestroyWindow(slot->hwnd);
+    slot->hwnd = NULL;
+    slot->generation++;
+    return 1;
+#else
+    (void)window;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
 #endif
 }
 #endif

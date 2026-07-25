@@ -251,6 +251,7 @@ examples/broken.sa:40:10 error: 变量未声明: missing
 - `symbol.sa`：`SYMBOL` 公式树捕获和打印。
 - `lists.sa`：`SYS.LIST` 数值/字符串动态列表。
 - `maps.sa`：`SYS.MAP` 关联容器和 KEYS 遍历。
+- `gui_hello.sa`：`SYS.GUI` 窗口、按钮、输入框和事件循环。
 - `ptr_basic.sa`、`ptr_arith.sa`、`ptr_cast.sa`：typed pointer、取址、解引用和 CAST。
 - `ffi_hello.sa`：C FFI 的 `USEC` / `DECLARE C`。
 - `use_math.sa`、`use_io.sa`：内置系统模块导入。
@@ -510,6 +511,7 @@ python -m pytest -m ffi
 - `SYS.BINARY`：BUFFER 创建/切片/复制、HEX、大小端 U16/U32/U64、校验和
 - `SYS.LIST`：可变长动态列表，数值 LIST 与字符串 STR_LIST 两种句柄 kind，PUSH/POP/GET/SET/INSERT/REMOVE/JOIN
 - `SYS.MAP`：STRING key 关联容器，数值 MAP 与字符串 STR_MAP 两种句柄 kind，SET/GET/HAS/REMOVE/KEYS，KEYS 产出 STR_LIST 与 SYS.LIST 打通
+- `SYS.GUI`：Windows 原生窗口 GUI（WINDOW/BUTTON/LABEL/TEXTBOX），轮询式 `WAIT_EVENT` 事件循环，control id 分发，无需回调
 - `SYS.NET`：HTTP/HTTPS、DNS、TCP client/server、TLS client stream、UDP、字符串与 BUFFER 收发
 - `SYS.FILE`：文件句柄读写/定位/关闭、文本便捷读写、存在性、目录、删除、当前目录和绝对路径
 - `SYS.DESKTOP`：Windows 消息框、系统打开路径/URL、Unicode 文本剪贴板

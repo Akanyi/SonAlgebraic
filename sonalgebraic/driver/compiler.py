@@ -331,6 +331,8 @@ def builtin_link_libs(uses: dict[str, str], target: str | None = None, features:
         libs.extend(["ssl", "crypto"])
     if "windows" in target_name and "SYS.DESKTOP" in modules:
         libs.extend(["user32", "shell32"])
+    if "windows" in target_name and "SYS.GUI" in modules:
+        libs.extend(["user32", "gdi32"])
     return libs
 
 
@@ -339,7 +341,7 @@ def _native_runtime_source(runtime_features: set[str] | None = None) -> str:
     # 拼成一个自包含的 .c。native IR 只 declare 用到的符号，链接时解析到这里。
     from ..backend.c_runtime import RUNTIME_HEADER, RUNTIME_SOURCE
 
-    macros = {"net": "SA_ENABLE_NET", "tls": "SA_ENABLE_TLS", "file": "SA_ENABLE_FILE", "desktop": "SA_ENABLE_DESKTOP", "binary": "SA_ENABLE_BINARY", "list": "SA_ENABLE_LIST", "map": "SA_ENABLE_MAP"}
+    macros = {"net": "SA_ENABLE_NET", "tls": "SA_ENABLE_TLS", "file": "SA_ENABLE_FILE", "desktop": "SA_ENABLE_DESKTOP", "binary": "SA_ENABLE_BINARY", "list": "SA_ENABLE_LIST", "map": "SA_ENABLE_MAP", "gui": "SA_ENABLE_GUI"}
     features = runtime_features or set()
     lines = [f"#define {macros[feature]}" for feature in sorted(features) if feature in macros]
     prefix = "" if not lines else "\n".join(lines) + "\n"

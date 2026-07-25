@@ -1639,7 +1639,10 @@ class NativeLLVMGen:
         list_call = self.list_function_call(expr)
         if list_call is not None:
             return list_call
-        return self.map_function_call(expr)
+        map_call = self.map_function_call(expr)
+        if map_call is not None:
+            return map_call
+        return self.gui_function_call(expr)
 
     def symbol_algebra_call(self, expr: ast.CallExpr) -> LLVMValue | None:
         name = expr.name.upper()
@@ -2272,6 +2275,65 @@ class NativeLLVMGen:
             return LLVMValue("ptr", temp, ast.TypeSpec("STRING"))
         return None
 
+    def gui_function_call(self, expr: ast.CallExpr) -> LLVMValue | None:
+        split = split_module_member(expr.name)
+        if split is None or self.checked.uses.get(split[0]) != "SYS.GUI":
+            return None
+        member = split[1].upper()
+        args = [LLVMValue("i64", "0", ast.TypeSpec("HANDLE")) if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
+        if member == "WINDOW":
+            self.use_runtime("sa_gui_window")
+            width = self.cast_to_i64(args[1])
+            height = self.cast_to_i64(args[2])
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @sa_gui_window(ptr {args[0].value}, i64 {width.value}, i64 {height.value})")
+            return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", "WINDOW"))
+        if member == "BUTTON":
+            self.use_runtime("sa_gui_button")
+            values = [self.cast_to_i64(args[i]).value for i in (1, 3, 4, 5, 6)]
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @sa_gui_button(i64 {args[0].value}, i64 {values[0]}, ptr {args[2].value}, i64 {values[1]}, i64 {values[2]}, i64 {values[3]}, i64 {values[4]})")
+            return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", "WIDGET"))
+        if member == "LABEL":
+            self.use_runtime("sa_gui_label")
+            values = [self.cast_to_i64(args[i]).value for i in (2, 3, 4, 5)]
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @sa_gui_label(i64 {args[0].value}, ptr {args[1].value}, i64 {values[0]}, i64 {values[1]}, i64 {values[2]}, i64 {values[3]})")
+            return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", "WIDGET"))
+        if member == "TEXTBOX":
+            self.use_runtime("sa_gui_textbox")
+            values = [self.cast_to_i64(args[i]).value for i in (1, 2, 3, 4)]
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @sa_gui_textbox(i64 {args[0].value}, i64 {values[0]}, i64 {values[1]}, i64 {values[2]}, i64 {values[3]})")
+            return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", "WIDGET"))
+        if member == "SET_TEXT":
+            self.use_runtime("sa_gui_set_text")
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @sa_gui_set_text(i64 {args[0].value}, ptr {args[1].value})")
+            return self.i32_status(raw)
+        if member == "WAIT_EVENT":
+            self.use_runtime("sa_gui_wait_event")
+            temp = self.next_temp()
+            self.emit(f"  {temp} = call i64 @sa_gui_wait_event()")
+            return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
+        if member == "CLOSE":
+            self.use_runtime("sa_gui_close")
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call i32 @sa_gui_close(i64 {args[0].value})")
+            return self.i32_status(raw)
+        if member in {"GET_TEXT", "LAST_ERROR"}:
+            fn = "sa_gui_get_text" if member == "GET_TEXT" else "sa_gui_last_error_copy"
+            self.use_runtime(fn)
+            temp = self.next_temp()
+            if member == "GET_TEXT":
+                self.emit(f"  {temp} = call ptr @{fn}(i64 {args[0].value})")
+            else:
+                self.emit(f"  {temp} = call ptr @{fn}()")
+            self.use_runtime("free")
+            self.add_temp_cleanup(f"  call void @free(ptr {temp})")
+            return LLVMValue("ptr", temp, ast.TypeSpec("STRING"))
+        return None
+
     def coerce_str_arg(self, value: LLVMValue) -> str:
         # SLICE 的 start/count 是 i64，其余字符串参数是 ptr。这里按已求值的类型直接取值，
         # 数值参数确保是 i64（SLICE 第 2、3 参数）。
@@ -2734,6 +2796,16 @@ RUNTIME_SIGNATURES: dict[str, str] = {
     "sa_strmap_clear": "declare i32 @sa_strmap_clear(i64)",
     "sa_strmap_close": "declare i32 @sa_strmap_close(i64)",
     "sa_map_last_error_copy": "declare ptr @sa_map_last_error_copy()",
+    # GUI
+    "sa_gui_window": "declare i64 @sa_gui_window(ptr, i64, i64)",
+    "sa_gui_button": "declare i64 @sa_gui_button(i64, i64, ptr, i64, i64, i64, i64)",
+    "sa_gui_label": "declare i64 @sa_gui_label(i64, ptr, i64, i64, i64, i64)",
+    "sa_gui_textbox": "declare i64 @sa_gui_textbox(i64, i64, i64, i64, i64)",
+    "sa_gui_set_text": "declare i32 @sa_gui_set_text(i64, ptr)",
+    "sa_gui_get_text": "declare ptr @sa_gui_get_text(i64)",
+    "sa_gui_wait_event": "declare i64 @sa_gui_wait_event()",
+    "sa_gui_close": "declare i32 @sa_gui_close(i64)",
+    "sa_gui_last_error_copy": "declare ptr @sa_gui_last_error_copy()",
     "sa_binary_close": "declare i32 @sa_binary_close(i64)",
     "sa_binary_length": "declare i64 @sa_binary_length(i64)",
     "sa_binary_slice": "declare i64 @sa_binary_slice(i64, i64, i64)",
