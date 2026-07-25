@@ -41,7 +41,7 @@
 - [x] 增加 `sonc run <source>`，编译并执行程序。
 - [x] 增加行号重排工具，例如 `sonc fmt app.sa --renumber 10`。
 - [ ] 增加 `sonc init`，生成最小项目结构。
-- [ ] 将 C 编译错误尽量映射回 SA 源码行号。
+- [x] 将 C 编译错误尽量映射回 SA 源码行号。
 - [x] 为 `check/c/build/run` 增加多错误诊断预检和源码下划线显示。
 - [ ] 增加正式项目配置文件，例如 `sonalgebraic.toml`。
 - [x] 增加 Python 分发配置，声明 `jinja2`、`pydantic` 等依赖（`pyproject.toml`，含 `dev` 组的 pytest）。

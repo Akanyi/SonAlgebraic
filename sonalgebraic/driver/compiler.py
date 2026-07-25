@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
@@ -419,7 +420,64 @@ def run_c_compiler(
     if proc.returncode != 0:
         output = (proc.stdout + proc.stderr).strip()
         output = _with_tls_dependency_hint(output, link_libs or [], target)
+        output = _with_sa_line_hints(output, c_paths)
         raise SonCompileError(f"C 编译失败:\n{output}")
+
+
+# gcc/clang: `path.c:123:5: error ...`；MSVC cl: `path.c(123): error C2065 ...`
+# 文件部分允许 Windows 盘符前缀（C:\...），否则盘符冒号会截断匹配
+_C_ERROR_LOCATION_RE = re.compile(r"^\s*(?P<file>(?:[A-Za-z]:)?[^:(\n]+\.c)(?::(?P<line>\d+)|\((?P<cl_line>\d+)\))")
+_SA_COMMENT_RE = re.compile(r"/\* SA (?P<sa_line>\d+): (?P<source>.*?) \*/")
+
+
+def _sa_line_index(c_text: str) -> list[tuple[int, str] | None]:
+    """每个 C 行号（1-based 下标）到「向上最近的 SA 源码注释」的映射。"""
+    index: list[tuple[int, str] | None] = [None]
+    current: tuple[int, str] | None = None
+    for line in c_text.splitlines():
+        match = _SA_COMMENT_RE.search(line)
+        if match is not None:
+            current = (int(match.group("sa_line")), match.group("source"))
+        index.append(current)
+    return index
+
+
+def map_c_errors_to_sa_lines(output: str, c_paths: list[Path]) -> list[str]:
+    """从 C 编译器输出提取错误位置，映射回 SA 源码行。生成的 C 在每条语句处
+    内联了 `/* SA nnn: ... */` 注释，向上找最近一条就是错误对应的 SA 语句。"""
+    indexes: dict[str, list[tuple[int, str] | None]] = {}
+    for path in c_paths:
+        try:
+            indexes[path.name.lower()] = _sa_line_index(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    hints: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for line in output.splitlines():
+        match = _C_ERROR_LOCATION_RE.match(line)
+        if match is None:
+            continue
+        file_name = Path(match.group("file")).name.lower()
+        index = indexes.get(file_name)
+        if index is None:
+            continue
+        c_line = int(match.group("line") or match.group("cl_line"))
+        if c_line >= len(index) or index[c_line] is None:
+            continue
+        sa_line, sa_source = index[c_line]
+        key = (file_name, sa_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        hints.append(f"  {match.group('file')}:{c_line} -> SA {sa_line}: {sa_source}")
+    return hints
+
+
+def _with_sa_line_hints(output: str, c_paths: list[Path]) -> str:
+    hints = map_c_errors_to_sa_lines(output, c_paths)
+    if not hints:
+        return output
+    return output + "\n\n可能对应的 SA 源码位置:\n" + "\n".join(hints)
 
 
 def _with_tls_dependency_hint(output: str, link_libs: list[str], target: str | None) -> str:
