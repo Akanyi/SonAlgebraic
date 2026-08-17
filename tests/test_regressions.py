@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import REPO_ROOT, expect_error, requires_c_compiler
+from conftest import REPO_ROOT, build_temp, expect_error, requires_c_compiler
 from sonalgebraic.analysis.diagnostics import Diagnostic, render_diagnostics
 from sonalgebraic.backend import c_runtime
 from sonalgebraic.core.errors import SonCompileError
@@ -492,28 +492,33 @@ _DIFFERENTIAL_PROGRAMS = {
 @requires_c_compiler
 @pytest.mark.e2e
 @pytest.mark.parametrize("name", sorted(_DIFFERENTIAL_PROGRAMS))
-def test_c_and_native_backends_agree(name: str, tmp_path: Path) -> None:
+def test_c_and_native_backends_agree(name: str) -> None:
     """两个后端跑同一份源码必须给出同样的输出。
 
     AND/OR 短路、FLOAT 截断这类偏差属于「两边各自都能跑、结果不同」，
     只对单个后端断言期望值的测试结构性地发现不了。
+
+    产物落在 build/native-tests 而不是 tmp_path：这条也编 native 产物，和
+    test_native_backend.py 里那批走同一条工具链，构建位置的约定不该两样。
     """
     from sonalgebraic.driver.compiler import find_native_compiler
 
     if find_native_compiler() is None:
         pytest.skip("未找到 clang 或 zig，无法编译 native 后端产物")
 
-    source = tmp_path / f"{name}.sa"
-    source.write_text(_DIFFERENTIAL_PROGRAMS[name], encoding="utf-8")
+    with build_temp(f"sonalgebraic-diff-{name}-") as temp:
+        work = Path(temp)
+        source = work / f"{name}.sa"
+        source.write_text(_DIFFERENTIAL_PROGRAMS[name], encoding="utf-8")
 
-    outputs = {}
-    for backend in ("c", "native"):
-        exe = tmp_path / f"{name}_{backend}.exe"
-        build = _sonc("build", str(source), "-o", str(exe), "--backend", backend)
-        assert build.returncode == 0, f"{backend} 后端构建失败: {build.stderr}"
-        run = subprocess.run([str(exe)], capture_output=True, text=True)
-        assert run.returncode == 0, f"{backend} 后端运行失败: {run.stderr}"
-        outputs[backend] = run.stdout
+        outputs = {}
+        for backend in ("c", "native"):
+            exe = work / f"{name}_{backend}.exe"
+            build = _sonc("build", str(source), "-o", str(exe), "--backend", backend)
+            assert build.returncode == 0, f"{backend} 后端构建失败: {build.stderr}"
+            run = subprocess.run([str(exe)], capture_output=True, text=True)
+            assert run.returncode == 0, f"{backend} 后端运行失败: {run.stderr}"
+            outputs[backend] = run.stdout
 
     assert outputs["c"] == outputs["native"], (
         f"两个后端输出不一致\nC:\n{outputs['c']}\nnative:\n{outputs['native']}"

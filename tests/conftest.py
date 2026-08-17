@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import sys
 
 import pytest
@@ -38,6 +39,18 @@ requires_gcc = pytest.mark.skipif(
 requires_native_compiler = pytest.mark.skipif(
     not HAS_NATIVE_COMPILER, reason="未找到 clang 或 zig（native 后端需要 LLVM IR 编译工具）"
 )
+
+
+def build_temp(prefix: str, subdir: str = "native-tests") -> TemporaryDirectory[str]:
+    """要真构建 exe 的测试用这个，而不是 pytest 的 tmp_path。
+
+    Windows 上安全软件容易拦截系统 TEMP 里刚落地的 exe，构建或运行会偶发失败，
+    而且失败点跟被测行为无关。产物统一放到项目 build/ 下，和日常构建目录一致，
+    减少这类误杀噪声。
+    """
+    root = REPO_ROOT / "build" / subdir
+    root.mkdir(parents=True, exist_ok=True)
+    return TemporaryDirectory(prefix=prefix, dir=root)
 
 
 def compile_c(source: str) -> str:

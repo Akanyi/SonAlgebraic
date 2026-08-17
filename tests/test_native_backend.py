@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import subprocess
 
-from conftest import requires_native_compiler
+from conftest import build_temp, requires_native_compiler
 from sonalgebraic.backend.native import generate_native_llvm_ir
 from sonalgebraic.driver.compiler import build_exe, compile_to_native_ir, compile_main_to_native_ir_with_modules
 from sonalgebraic.frontend.parser import parse_program
@@ -22,12 +21,10 @@ _HAS_CLANG_LLD = shutil.which("clang") is not None and shutil.which("lld-link") 
 requires_clang_lld = pytest.mark.skipif(not _HAS_CLANG_LLD, reason="leak 验证需要 clang + lld")
 
 
-def native_temp(prefix: str) -> TemporaryDirectory[str]:
-    # Windows 上安全软件容易拦截系统 TEMP 里刚生成的 exe；native e2e 统一放到
-    # 项目 build/native-tests 下，和日常构建目录保持一致，减少误杀噪声。
-    root = Path("build") / "native-tests"
-    root.mkdir(parents=True, exist_ok=True)
-    return TemporaryDirectory(prefix=prefix, dir=root)
+# 这套约定提到 conftest 了，别的模块也要用；这里留个别名，调用点不用动。
+# 顺带修掉一个隐患：原来用的是相对路径 Path("build")，从别的目录跑 pytest
+# 会在那个目录下另建一个 build/。conftest 里改成了基于 REPO_ROOT。
+native_temp = build_temp
 
 
 def compile_native_ir(source: str) -> str:
