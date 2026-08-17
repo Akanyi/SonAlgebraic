@@ -18,6 +18,7 @@ from conftest import REPO_ROOT, expect_error, requires_c_compiler
 from sonalgebraic.analysis.diagnostics import Diagnostic, render_diagnostics
 from sonalgebraic.backend import c_runtime
 from sonalgebraic.core.errors import SonCompileError
+from sonalgebraic.driver.compiler import build_exe, compile_to_c
 from sonalgebraic.driver.formatter import renumber_source
 from sonalgebraic.packaging.spkg import _safe_member_path, pack_spkg
 from sonalgebraic.packaging.toolchain import link_library_args
@@ -375,6 +376,51 @@ def test_run_passes_arguments_after_double_dash() -> None:
     result = _sonc("run", str(REPO_ROOT / "examples" / "hello.sa"), "--backend", "c", "--", "extra")
     assert result.returncode == 0
     assert "Hello World!" in result.stdout
+
+
+_TWO_INPUTS_SOURCE = """10 USE SYS.IO AS CONSOLE
+20 SUB main AS PUBLIC AS VOID
+30 DIM name AS STRING AS VAR
+40 DIM city AS STRING AS VAR
+50 DIM age AS NUM AS LONG AS VAR
+60 CONSOLE.INPUT "name: ", name
+70 CONSOLE.INPUT "city: ", city
+80 CONSOLE.INPUT "age: ", age
+90 PRINT F"{name} {city} {age}"
+100 .ENDSUB
+110 CALL main
+120 END
+"""
+
+
+def test_repeated_input_gets_distinct_buffers(tmp_path: Path) -> None:
+    """同一个块里读两次输入，以前生成两个同名的 char[4096]，C 编译器直接拒绝。
+
+    缓冲区名曾经硬编码成 sa_input_buf，所以任何「先问名字再问年龄」的程序都编不过。
+    native 后端用 alloca 天然唯一，只有 C 后端踩这个坑。
+    """
+    source = tmp_path / "two_inputs.sa"
+    source.write_text(_TWO_INPUTS_SOURCE, encoding="utf-8")
+    generated = tmp_path / "two_inputs.c"
+    compile_to_c(source, generated)
+
+    buffers = re.findall(r"char (\w+)\[4096\];", generated.read_text(encoding="utf-8"))
+    assert len(buffers) == 3, f"三条 INPUT 应各自声明缓冲区，实际 {buffers}"
+    assert len(set(buffers)) == 3, f"缓冲区重名: {buffers}"
+
+
+@requires_c_compiler
+@pytest.mark.e2e
+def test_repeated_input_compiles_and_runs(tmp_path: Path) -> None:
+    """光比对生成的 C 不够硬——真正的判据是 C 编译器收不收。"""
+    source = tmp_path / "two_inputs.sa"
+    source.write_text(_TWO_INPUTS_SOURCE, encoding="utf-8")
+    exe = tmp_path / ("two_inputs.exe" if sys.platform == "win32" else "two_inputs")
+    build_exe(source, exe, keep_c=False)
+
+    proc = subprocess.run([str(exe)], input="LANS\nHangzhou\n30\n", text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "LANS Hangzhou 30" in proc.stdout
 
 
 # --------------------------------------------------------------------------

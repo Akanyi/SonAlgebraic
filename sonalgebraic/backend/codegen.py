@@ -566,13 +566,17 @@ class CGen:
         target = self.symbols[stmt.target.lower()]
         name = self.c_value(stmt.target)
         prelude, prompt, cleanup = self.expr_with_prelude(stmt.prompt)
+        # 缓冲区名走 next_temp：固定叫 sa_input_buf 的话，同一个块里读两次输入就是
+        # 两个同名的 char[4096]，C 编译器直接报 redeclaration。native 后端用 alloca
+        # 天然唯一，只有这条路径会踩。
+        buffer = f"{self.next_temp()}_input"
         lines = [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude)]
-        lines.extend([f"{pad}printf(\"%s\", {prompt});", f"{pad}char sa_input_buf[4096];", f"{pad}sa_read_line(sa_input_buf, sizeof(sa_input_buf));"])
+        lines.extend([f"{pad}printf(\"%s\", {prompt});", f"{pad}char {buffer}[4096];", f"{pad}sa_read_line({buffer}, sizeof({buffer}));"])
         if is_string(target.type_spec):
-            lines.append(f"{pad}sa_set_string(&{name}, sa_input_buf);")
+            lines.append(f"{pad}sa_set_string(&{name}, {buffer});")
         elif is_numeric(target.type_spec):
             cast = "(long long)" if target.type_spec.subtype == "LONG" else ""
-            lines.append(f"{pad}{name} = {cast}sa_number(sa_input_buf);")
+            lines.append(f"{pad}{name} = {cast}sa_number({buffer});")
         else:
             raise SonCompileError("IO.INPUT 当前只支持 STRING 和 NUM", stmt.line_no)
         lines.extend(f"{pad}{line}" for line in cleanup)
