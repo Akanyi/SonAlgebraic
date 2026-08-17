@@ -7,13 +7,14 @@ SonAlgebraic 是一个小语言编译器。完整文档见 [docs/](./docs/)，�
 生成的 C 会在对应位置内联 SA 源码注释，例如：
 
 ```c
-/* SA 120: PRINT F"Counter is now: {counter}" */
-sa_print_string(sa_tmp_1_result);
+/* SA 40: PRINT message */
+sa_print_string(sa_message);
 ```
 
 ## 目录
 
 - [快速开始](#快速开始)
+- [安装 SADK](#安装-sadk)
 - [特性概览](#特性概览)
 - [CLI 命令](#cli-命令)
   - [检查源码](#检查源码)
@@ -24,6 +25,7 @@ sa_print_string(sa_tmp_1_result);
   - [打包 .slib](#打包-slib)
   - [打包 .spkg](#打包-spkg)
   - [交叉编译](#交叉编译)
+  - [检查工具链](#检查工具链)
 - [诊断系统](#诊断系统)
 - [示例程序](#示例程序)
 - [模块系统](#模块系统)
@@ -57,6 +59,26 @@ python -m sonalgebraic c examples/hello.sa -o build/hello.c
 ```powershell
 python -m sonalgebraic run examples/allexample.sa
 ```
+
+## 安装 SADK
+
+Windows 上可以装 SADK 安装包，目标机器不需要 Python 环境。构建：
+
+```powershell
+python installer/build_installer.py
+```
+
+产物是 `build/installer/SADK-Setup-<版本>.exe`，约 17 MB，包含冻结后的 `sonc.exe`、文档、示例和 VSCode 语法高亮扩展。向导里可以选：加入 PATH、关联 `.sa` 文件和右键菜单、把扩展装进 VSCode 用户扩展目录。
+
+`sonc build` / `run` 需要一个 C 编译器，所以向导还提供「下载并安装 Zig C 工具链」（约 92 MB，官方源 + SHA-256 校验）。进入任务页时会先扫一遍 PATH：本机已经有 gcc / clang / zig 就默认不勾，没有才自动勾上。装进 `SADK\toolchain\` 的 zig 不写系统环境变量也能被 `sonc` 找到。
+
+装完确认一下：
+
+```powershell
+sonc doctor
+```
+
+构建细节和设计取舍见 [installer/README.md](./installer/README.md)。
 
 ## 特性概览
 
@@ -102,7 +124,7 @@ python -m sonalgebraic check app.sa --pkg build/mathlib.spkg
 `check` 会尽量一次输出多个错误，并标出对应源码位置：
 
 ```text
-examples/broken.sa:40:10 error: 变量未声明: missing
+examples/broken.sa:4:10 error: [SA 40] 变量未声明: missing
 40 PRINT missing
          ^^^^^^^
 ```
@@ -115,7 +137,11 @@ examples/broken.sa:40:10 error: 变量未声明: missing
 python -m sonalgebraic run examples/hello.sa
 ```
 
-`run` 会编译到临时目录后执行生成的程序，并返回程序退出码。
+`run` 会编译到临时目录后执行生成的程序，并返回程序退出码。`--` 之后的参数会原样转发给被编译的程序：
+
+```powershell
+python -m sonalgebraic run app.sa --backend c -- --verbose input.txt
+```
 
 ### 重排行号
 
@@ -128,6 +154,8 @@ python -m sonalgebraic fmt app.sa --renumber 10
 ```powershell
 python -m sonalgebraic fmt app.sa -o build/app.formatted.sa --renumber 20
 ```
+
+`USE SYS.LINT AS NONE_NUMBER` 的无行号源码也可以直接 `fmt`，会按 `--renumber` 的步长补齐行号，把草稿固化成带行号的正式源码。
 
 ### 编译可执行文件
 
@@ -161,6 +189,8 @@ python -m sonalgebraic c examples/use_user_module.sa -o build/use_user_module_pr
 ```powershell
 python -m sonalgebraic c app.sa -o build/app_project --pkg build/mathlib.spkg
 ```
+
+生成的 C 只带程序实际够得着的那部分运行时。判定分两级：`SYS.NET` / `SYS.FILE` / `SYS.LIST` / `SYS.MAP` / `SYS.BINARY` / `SYS.DESKTOP` / `SYS.GUI` 这些整块取舍；剩下的公共部分（字符串、异常、SYMBOL 代数、控制台 IO）按符号依赖闭包逐函数取。所以 `PRINT "hi"` 不会背上 300 行的 SYMBOL 求导代码，30 个示例平均下来生成的 C 少了 88%。
 
 ### 只生成 LLVM IR
 
@@ -210,6 +240,14 @@ python -m sonalgebraic slib examples/statslib.sa -o build/statslib_linux.slib --
 python -m sonalgebraic build app.sa -o build/app_linux --target x86_64-linux-gnu
 ```
 
+### 检查工具链
+
+```powershell
+sonc doctor
+```
+
+`doctor` 打印 SADK 安装目录、自带工具链目录，以及 `zig` / `gcc` / `clang` / `tcc` / `cl` 各自解析到哪个路径。一个都没有时会说明 `check` / `c` / `fmt` 仍可用、`build` / `run` 会失败，并按当前是安装包还是源码运行给出对应的补救方式。
+
 ## 诊断系统
 
 SonAlgebraic 的 CLI 会在 `check`、`c`、`build`、`run` 前先执行诊断预检。发现错误时会停止后续编译动作，并尽量一次输出多条错误。
@@ -217,15 +255,15 @@ SonAlgebraic 的 CLI 会在 `check`、`c`、`build`、`run` 前先执行诊断�
 示例：
 
 ```text
-examples/broken.sa:20:4 error: F-string 缺少右花括号
+examples/broken.sa:2:4 error: [SA 20] F-string 缺少右花括号
 20 PRINT F"broken {x"
    ^^^^^^^^^^^^^^^^^^
 
-examples/broken.sa:30:4 error: 无法解析的语句: ELSE
+examples/broken.sa:3:4 error: [SA 30] 无法解析的语句: ELSE
 30 ELSE
    ^^^^
 
-examples/broken.sa:40:10 error: 变量未声明: missing
+examples/broken.sa:4:10 error: [SA 40] 变量未声明: missing
 40 PRINT missing
          ^^^^^^^
 ```
@@ -236,13 +274,16 @@ examples/broken.sa:40:10 error: 变量未声明: missing
 - 语义检查会 best-effort 逐语句收集错误，例如多个未声明变量、多个赋值类型不兼容。
 - 下划线列号是启发式推断，常见变量名和无法解析语句能较准确定位。
 - 遇到结构性大错误时仍可能只能输出部分错误，比如缺失 `.ENDSUB` 或模块本身无法解析。
+- 依赖模块内的错误会指向那个模块自己的文件和行，不会被安到主文件的同号行上。
+- 诊断文案统一按 UTF-8 输出，管道、重定向和 CI 日志里都不会变成本地代码页乱码。
+- `file:行:列` 里的行是**物理行号**，编辑器 ctrl+click、problem matcher 直接可用；SA 逻辑行号（10/20/30…）放在消息开头的 `[SA n]` 里，两者都在，不用二选一。
 - 如果 C 编译阶段仍然报错（通常意味着 codegen bug 或 FFI 声明与实际不符），报错末尾会利用生成 C 里的 `/* SA nnn: ... */` 注释，把 C 错误位置映射回可能对应的 SA 源码行。
 
 ## 示例程序
 
 仓库内置示例位于 `examples/`：
 
-- `hello.sa`：基础变量、F-string、循环和输出。
+- `hello.sa`：最小可运行程序，变量声明与输出。
 - `functions.sa`：非 `VOID SUB`、参数和 `AS REF`。
 - `entity.sa`：基础 `ENTITY` 字段访问。
 - `entity_strings.sa`：嵌套 `ENTITY` 字符串字段深拷贝和运行时验证。
@@ -331,10 +372,16 @@ python -m sonalgebraic run examples/allexample.sa
 当前 `.spkg` 已实现的安全校验：
 
 - 解包时拒绝绝对路径、`..`、冒号和反斜杠绕过，避免 zip 路径穿越。
+- 解包时拒绝 Windows 保留设备名（`CON` / `NUL` / `COM1` 等，含带扩展名的 `NUL.sa`），避免写到设备而不是磁盘。
 - 解包后校验 `manifest.json` 中 `hashes` 声明的 `sha256`。
+- 反查每个 `modules[*].source`：实际参与编译的源文件必须被 `hashes` 覆盖，否则报错。省掉条目或把 `hashes` 留空都不能绕过校验。
 - 如果 hash 文件缺失、hash 格式不支持或内容被篡改，会直接报编译错误。
 
+`USELIB` 的值会进入 C 编译器命令行，而它可以来自第三方包的源码，所以只接受纯库名（字母数字和 `_ . + -`）和不以 `-` 开头的库文件路径。像 `USELIB "-fplugin=./evil.so"` 这种会被当成编译器选项、在构建期加载任意插件的写法直接报错。
+
 当前 `.spkg` 仍以源码包为主；规范里描述的多 target 二进制 artifact、依赖递归 bundle 和版本冲突处理还在 TODO 中。
+
+> `.slib` 目前**没有**完整性校验：语义检查用的导出签名来自包内 `.sa` 源码的重新解析，而实际链接的是包里的 `.a` / `.dll`，两者不一致时不会被发现。引用来源不明的 `.slib` 前请自行确认。
 
 ## FFI
 
@@ -412,8 +459,20 @@ python -m pytest -m ffi
 - `test_cli.py`：`check` / `run` / `fmt` 退出码与诊断输出。
 - `test_e2e.py`（`e2e` 标记）：`hello.sa`、`entity_strings.sa` 真正编译运行。
 - `test_ffi_reverse.py`（`ffi` 标记）：C 程序 `#include` 头并链接调用 SA 编译出的 DLL，验证反向 FFI。
+- `test_regressions.py`：审计发现的缺陷回归，含两条结构性防护——
+  - runtime 头文件与实现的一致性：codegen 会发射的每个 `sa_*` 都必须在 `RUNTIME_HEADER` 里有声明，防止模块模式下退化成隐式声明；
+  - C / native 双后端差分：同一份 `.sa` 用两个后端各跑一遍比对 stdout，专门抓「两边都能跑但结果不同」的偏差（`e2e` 标记）。
+- `test_ondemand_runtime.py`：运行时按需注入。守两头——**别多塞**（`PRINT "hi"` 不能带上 SYMBOL 求导代码）和**别少塞**（每个示例都真过一遍 C 编译器）。注入不足会直接编译失败而不是静默出错，所以后者是这里最硬的防线。另有两条不依赖编译器的自检：片段拼回去必须逐行等于原 `RUNTIME_IMPL`，以及没有任何片段引用无处定义的符号。
 
 缺少对应 C 工具链时，`e2e` / `ffi` 测试会自动 skip 而不是失败。
+
+安装包另有一套 super smoke，从 exe 装起，把整套 SDK 过一遍再卸干净：
+
+```powershell
+python installer/smoke.py --with-zig --integration
+```
+
+它测的是「用户双击安装包之后拿到的东西」——冻结产物有没有漏模块、安装布局对不对、只靠自带 zig 能不能编译、卸载后 PATH 有没有精确还原。这几类问题从源码测试里看不出来，所以它没有接进 pytest。详见 [installer/README.md](./installer/README.md)。
 
 ## 运行时语义补充
 
@@ -534,7 +593,10 @@ python -m pytest -m ffi
 - `.spkg` 当前版本为源码包，二进制产物、依赖递归 bundle、版本冲突处理后续再补强。
 - FFI 当前支持 C 函数调用、`CPTR` 不透明指针和 `PTR TO <类型>` 类型指针；C struct 字段访问、回调、字符串所有权转换等需要后续扩展。
 - 非本机 `--target` 需要 `zig`。
-- `SYMBOL` 超越函数直接建树的表层语法还没接入；幂求导内部会生成 `LOG(...)` 节点。
+- `SYMBOL` 超越函数直接建树的表层语法还没接入；幂求导内部会生成 `LOG(...)` 节点。`DERIV` 已覆盖 `EVAL` / `SIMPLIFY` 支持的全部六个函数（LOG/EXP/SIN/COS/TAN/SQRT）。
+- native 后端暂不支持 `NUM AS FLOAT`，会报明确错误。不把它映射成 `double` 是因为 `ENTITY` 里的 FLOAT 字段会从 4 字节变 8 字节，与 C 后端编出来的模块 struct 布局对不上。这类程序请用 `AS DOUBLE` 或 C 后端。
+- 局部声明是块作用域：`IF` / `FOR` / `WHILE` / `CATCH` 块内的 `DIM` 在块外不可见（与生成 C 的 `{ }` 一致），兄弟分支可以声明同名变量，但不允许遮蔽外层已有的同名局部。
+- 数组常量下标越界在编译期报错；变量下标越界仍是运行期未定义行为，不做边界检查。
 - `ENTITY` 内 `SYMBOL` 字段暂不做深层 clone/free 托管，避免浅拷贝导致双释放；后续需要给 SYMBOL runtime 增加 clone 能力。
 - MSVC 支持仍需要完整验证；`GOSUB` 本身已不再依赖 GCC/Clang 的 label-address 扩展。
 - `HANDLE` 是可复制的资源 token，不会自动关闭；FILE、BUFFER、LIST、STR_LIST、MAP、STR_MAP、NET_STREAM、TCP_LISTENER、UDP_SOCKET 都必须调用对应 CLOSE。runtime 会让已关闭句柄的旧副本失效，并在进程退出时兜底清理。

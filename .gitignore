@@ -5,7 +5,10 @@ __pycache__/
 .pytest_cache/
 .omo/
 .codegraph/
-.claude/settings.local.json
+.claude/
+
+# 示例跑出来的产物：examples/file_io.sa 会往当前目录写这个文件
+sa-note.txt
 
 # Python 打包产物
 dist/

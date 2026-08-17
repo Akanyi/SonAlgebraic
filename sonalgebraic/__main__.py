@@ -10,6 +10,7 @@ from . import __version__
 from .driver.compiler import build_exe, build_slib, check_source_diagnostics, compile_to_c, compile_to_native_ir
 from .analysis.diagnostics import diagnostics_to_json, render_diagnostics
 from .core.errors import SonCompileError
+from .core.sdk_env import activate_bundled_toolchain, toolchain_report
 from .driver.formatter import renumber_file
 from .packaging.spkg import pack_spkg
 from .packaging.toolchain import normalize_target
@@ -50,6 +51,7 @@ def ensure_no_diagnostics(source: Path, spkgs: list[Path]) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_streams()
+    activate_bundled_toolchain()
 
     # `sonc run app.sa -- a b` 里 `--` 之后的东西转发给被编译的程序。
     # 这里手工切分而不是用 argparse.REMAINDER：后者会从第一个位置参数起吞掉一切，
@@ -125,9 +127,14 @@ def main(argv: list[str] | None = None) -> int:
     slib_cmd.add_argument("--dynamic", action="store_true", help="附带目标平台的动态库（DLL/SO/dylib）")
     slib_cmd.add_argument("--target", help=target_help)
 
+    sub.add_parser("doctor", help="检查 SADK 安装和 C 工具链是否就绪")
+
     args = parser.parse_args(raw_args)
 
     try:
+        if args.command == "doctor":
+            print(toolchain_report())
+            return 0
         if args.command == "c":
             output = args.output or args.source.with_suffix(".c")
             spkgs = [Path(p) for p in args.pkg] if args.pkg else []

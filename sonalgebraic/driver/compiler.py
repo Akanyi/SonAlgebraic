@@ -15,6 +15,7 @@ from ..backend.native import generate_native_llvm_ir
 from ..analysis.diagnostics import Diagnostic
 from ..core.errors import SonCompileError, module_cycle_error
 from ..core.lines import PHYSICAL_LINE_ATTR
+from ..core.sdk_env import toolchain_install_hint
 from ..analysis.exports import collect_exports
 from ..core.module_model import ModuleExports
 from ..packaging.module_compiler import compile_project, rewrite_runtime_for_native
@@ -422,11 +423,11 @@ def missing_compiler_error(target: str | None, native: bool = False) -> SonCompi
     if target_name != host_target():
         return SonCompileError(
             f"交叉编译到 {target_name} 需要 zig（zig cc）：本机的 gcc/clang/cl 只能生成 {host_target()} 的代码。"
-            "请安装 zig（https://ziglang.org/download/）并确保 zig 在 PATH 中，或去掉 --target 编译本机目标。"
+            f"{toolchain_install_hint()}或去掉 --target 编译本机目标。"
         )
     if native:
-        return SonCompileError("native 后端需要 clang 或 zig cc 来编译 LLVM IR")
-    return SonCompileError("未找到 C 编译器，请安装 gcc、clang、tcc、zig 或 Visual Studio cl")
+        return SonCompileError(f"native 后端需要 clang 或 zig cc 来编译 LLVM IR。{toolchain_install_hint()}")
+    return SonCompileError(f"未找到 C 编译器，请安装 gcc、clang、tcc、zig 或 Visual Studio cl。{toolchain_install_hint()}")
 
 
 def find_c_compiler(target: str | None = None) -> str | None:

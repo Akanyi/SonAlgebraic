@@ -3,3 +3,10 @@
 *.sa text
 *.py text
 *.md text
+
+# 安装包构建资源
+# .cmd 钉死 CRLF：cmd.exe 对纯 LF 的批处理在多行结构上会有解析怪癖
+*.cmd text eol=crlf
+# .isl 是外部来源的 UTF-8 BOM 文件，Inno 按字节读，一律不做行尾转换
+*.isl -text
+*.ico binary
