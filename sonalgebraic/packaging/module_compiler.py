@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
+import shutil
 
 from ..backend.codegen import CGen
 from ..backend.c_runtime import RUNTIME_HEADER, RUNTIME_SOURCE
+from ..backend.runtime_slicer import runtime_impl_for, runtime_symbols_in
 from ..core.errors import SonCompileError, module_cycle_error
 from ..analysis.exports import collect_exports
 from ..analysis.typesys import BUILTIN_MODULES, runtime_features_for_program
 from ..backend.headergen import generate_header
 from ..core.module_model import ModuleExports, ModuleUnit
-from ..core.names import module_path_to_slib, module_path_to_source, module_symbol_prefix
+from ..core.names import module_c_name, module_path_to_slib, module_path_to_source, module_symbol_prefix
 from ..frontend.parser import parse_program
 from ..analysis.semantics import check_program
-from .spkg import extract_spkg, spkg_module_source
+from .spkg import extract_spkg, spkg_extract_dir, spkg_module_source
 from .toolchain import normalize_target
 
 
@@ -64,7 +67,10 @@ def compile_project(source_path: Path, out_dir: Path, target: str | None = None,
     runtime_features.update(feature for unit in module_units.values() for feature in unit.runtime_features)
     runtime_prefix = _runtime_feature_prefix(runtime_features)
     runtime_h.write_text(runtime_prefix + RUNTIME_HEADER.strip() + "\n", encoding="utf-8")
-    runtime_c.write_text(runtime_prefix + '#include "sa_runtime.h"\n\n' + RUNTIME_SOURCE.strip() + "\n", encoding="utf-8")
+    runtime_c.write_text(
+        runtime_prefix + '#include "sa_runtime.h"\n\n' + _runtime_impl([main_body], module_units, runtime_features) + "\n",
+        encoding="utf-8",
+    )
 
     return ModuleBuildPlan(
         main_c=main_c,
@@ -83,11 +89,59 @@ def compile_project(source_path: Path, out_dir: Path, target: str | None = None,
     )
 
 
+def _runtime_impl(root_texts: list[str], module_units: dict[str, ModuleUnit], features: set[str]) -> str:
+    """模块模式下 sa_runtime.c 的实现部分。
+
+    根符号取全项目并集——主程序加每个模块的 .c。少扫一个 TU，链接期就会
+    冒出 undefined reference。
+
+    模块来自预编译的 .a / .dll 时（.slib 二进制包）没有 c_path，它内部调了哪些
+    sa_* 我们看不到，只能退回全量。少注入会链接失败，多注入只是白搭点体积，
+    这里必须往保守一侧倒。
+    """
+    if any(not unit.c_path for unit in module_units.values()):
+        return RUNTIME_SOURCE.strip()
+
+    roots: set[str] = set()
+    for text in root_texts:
+        roots |= runtime_symbols_in(text)
+    for unit in module_units.values():
+        roots |= runtime_symbols_in(Path(unit.c_path).read_text(encoding="utf-8"))
+    # RUNTIME_SOURCE 就是 RUNTIME_IMPL 去掉 static，这里对切片做同样处理：
+    # 模块模式下 runtime 是独立 TU，符号必须能跨 TU 链接。
+    return runtime_impl_for(roots, features).replace("static ", "").strip()
+
+
+def rewrite_runtime_for_native(plan: ModuleBuildPlan, ir_text: str) -> None:
+    """native + 用户模块时按 IR 重算 runtime 切片。
+
+    这条路径下主程序是 .ll 而不是 main.c，两个后端对 runtime 的调用面并不完全
+    重合。仍按 main.c 的符号裁剪就会漏掉只有 IR 用到的函数，链接期才炸。
+    """
+    if plan.runtime_c is None:
+        return
+    plan.runtime_c.write_text(
+        _runtime_feature_prefix(plan.runtime_features)
+        + '#include "sa_runtime.h"\n\n'
+        + _runtime_impl([ir_text], plan.modules, plan.runtime_features)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _extract_spkgs(spkgs: list[Path], out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     dirs: list[Path] = []
+    seen: set[str] = set()
     for path in spkgs:
-        extract_dir = out_dir / path.stem
+        resolved = str(path.resolve()).lower()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        extract_dir = spkg_extract_dir(out_dir, path)
+        # 增量构建里旧版本包的残留文件会被当成合法模块源继续参与编译，先清干净。
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
         extract_spkg(path, extract_dir)
         dirs.append(extract_dir)
     return dirs
@@ -116,41 +170,37 @@ def compile_module(
         spkg_dirs = spkg_dirs or []
         source_path = module_path_to_source(source_root, module)
         dep_source_root = source_path.parent
+        package_scope: str | None = None
         if not source_path.exists():
             slib_path = module_path_to_slib(source_root, module)
             if slib_path.exists():
                 from .slib import load_slib
 
-                return load_slib(slib_path, out_dir, module_units, target)
+                return load_slib(slib_path, out_dir, module_units, target, expected_module=module)
 
-            for spkg_dir in spkg_dirs:
-                manifest_path = spkg_dir / "manifest.json"
-                if not manifest_path.exists():
-                    continue
-                import json
-
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                spkg_source = spkg_module_source(manifest, module, spkg_dir)
-                if spkg_source is not None and spkg_source.exists():
-                    source_path = spkg_source
-                    dep_source_root = source_path.parent
-                    break
+            spkg_source, package_scope = _find_in_spkgs(module, spkg_dirs)
+            if spkg_source is not None:
+                source_path = spkg_source
+                dep_source_root = source_path.parent
 
             if not source_path.exists():
                 raise SonCompileError(f"找不到模块源文件、.slib 或 .spkg: {module}")
+
+        _reject_module_name_collision(module, module_units)
 
         program = parse_program(source_path.read_text(encoding="utf-8-sig"))
         dependency_exports: dict[str, ModuleExports] = {}
         for use in program.uses:
             if use.module in BUILTIN_MODULES:
                 continue
-            dep = compile_module(use.module, use.alias, dep_source_root, out_dir, module_units, target, dynamic, spkg_dirs, module_stack)
+            dep_module = _qualify_in_package(use.module, package_scope, spkg_dirs)
+            dep = compile_module(dep_module, use.alias, dep_source_root, out_dir, module_units, target, dynamic, spkg_dirs, module_stack)
             dependency_exports[use.alias.lower()] = dep.exports
 
         checked = check_program(program, external_modules=dependency_exports, require_main=False)
         exports = collect_exports(module, program)
         header_path = out_dir / exports.header_name
-        c_path = out_dir / f"sa_user_{module.replace('.', '_').lower()}.c"
+        c_path = out_dir / f"sa_user_{module_c_name(module)}.c"
 
         header_path.write_text(generate_header(exports, dynamic=dynamic), encoding="utf-8")
         body = CGen(
@@ -177,6 +227,55 @@ def compile_module(
         return unit
     finally:
         module_stack.pop()
+
+
+def _spkg_manifests(spkg_dirs: list[Path]) -> list[tuple[Path, dict]]:
+    result: list[tuple[Path, dict]] = []
+    for spkg_dir in spkg_dirs:
+        manifest_path = spkg_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        result.append((spkg_dir, json.loads(manifest_path.read_text(encoding="utf-8"))))
+    return result
+
+
+def _find_in_spkgs(module: str, spkg_dirs: list[Path]) -> tuple[Path | None, str | None]:
+    """在已解包的 .spkg 里找模块源码，同时返回它所属的包名。
+
+    包名要带出来：包内模块之间互相 USE 时写的是短名，得靠它拼回 `PKG.MOD`。
+    """
+    for spkg_dir, manifest in _spkg_manifests(spkg_dirs):
+        spkg_source = spkg_module_source(manifest, module, spkg_dir)
+        if spkg_source is not None and spkg_source.exists():
+            return spkg_source, (manifest.get("module_to_package") or {}).get(module)
+    return None, None
+
+
+def _qualify_in_package(module: str, package_scope: str | None, spkg_dirs: list[Path]) -> str:
+    """包内模块的 `USE UTIL` 应该指向同包的 `PKG.UTIL`。
+
+    不补包名的话，解析会先在解包后的 src 目录里按文件名撞到 util.sa，于是同一份
+    源码被编译成 UTIL 和 PKG.UTIL 两个独立模块：状态两份、类型互不兼容。
+    """
+    if not package_scope:
+        return module
+    qualified = f"{package_scope.upper()}.{module}"
+    for _, manifest in _spkg_manifests(spkg_dirs):
+        if qualified in (manifest.get("module_to_package") or {}):
+            return qualified
+    return module
+
+
+def _reject_module_name_collision(module: str, module_units: dict[str, ModuleUnit]) -> None:
+    """A.B 和 A_B 归一化后都是 a_b：C 文件、头文件、符号前缀会互相覆盖。"""
+    c_name = module_c_name(module)
+    key = module.lower()
+    for other in module_units.values():
+        if other.module.lower() != key and module_c_name(other.module) == c_name:
+            raise SonCompileError(
+                f"模块名 {module} 与 {other.module} 归一化后都是 `{c_name}`，"
+                "生成的 C 文件和符号前缀会互相覆盖；请改掉其中一个模块名"
+            )
 
 
 def _dedupe_link_libs(libs: list[str]) -> list[str]:

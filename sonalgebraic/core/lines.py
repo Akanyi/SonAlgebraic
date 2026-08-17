@@ -10,6 +10,20 @@ _LINE_RE = re.compile(r"^\s*(\d+)(?:\s+(.*))?$")
 _LINT_USE_RE = re.compile(r"^USE\s+SYS\.LINT\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
 LINT_OPTIONS = frozenset({"NONE_NUMBER"})
 
+# SonCompileError.line_no 在编译器其余部分一律是 SA 逻辑行号。但行号本身出问题时
+# （缺号、非法、不递增）SA 行号要么不存在、要么不可信，只有物理行号是确定的。
+# 挂上这个属性把两种语义区分开：渲染器看到它就直接按物理下标取行，不会再拿这个数字
+# 去匹配源码里 `nnn ...` 的开头数字——在按 10 递增编号的文件里那种匹配几乎必然
+# 命中一个完全正确的行，把用户指到别处。
+PHYSICAL_LINE_ATTR = "physical_line_no"
+
+
+def physical_line_error(message: str, physical_no: int) -> SonCompileError:
+    """构造一个 line_no 语义为「文件物理行号」的编译错误。"""
+    error = SonCompileError(message, physical_no)
+    setattr(error, PHYSICAL_LINE_ATTR, physical_no)
+    return error
+
 
 def strip_trailing_comment(text: str) -> str:
     """剥离行尾 REM 注释，返回语句部分（已 rstrip）。
@@ -80,7 +94,7 @@ def detect_lint_options(source: str) -> set[str]:
         option = match.group(1).upper()
         if option not in LINT_OPTIONS:
             known = ", ".join(sorted(LINT_OPTIONS))
-            raise SonCompileError(f"未知 SYS.LINT 选项: {option}；当前支持: {known}", physical_no)
+            raise physical_line_error(f"未知 SYS.LINT 选项: {option}；当前支持: {known}", physical_no)
         options.add(option)
     return options
 
@@ -120,7 +134,7 @@ def read_numbered_lines(source: str) -> list[SourceLine]:
 
         match = _LINE_RE.match(raw)
         if not match:
-            raise SonCompileError(
+            raise physical_line_error(
                 "每一行都必须以递增的正整数行号开头，后面跟一个空格；"
                 "若要省略行号，请先写 `USE SYS.LINT AS NONE_NUMBER`",
                 physical_no,
@@ -128,9 +142,10 @@ def read_numbered_lines(source: str) -> list[SourceLine]:
 
         line_no = int(match.group(1))
         if line_no <= 0:
-            raise SonCompileError("行号必须是正整数", physical_no)
+            raise physical_line_error("行号必须是正整数", physical_no)
         if line_no <= previous_no:
-            raise SonCompileError("行号必须严格递增", line_no)
+            # 重复行号时按 SA 行号去找只会命中前一个（合法的）同号行，所以这里也按物理行报
+            raise physical_line_error(f"行号必须严格递增（{previous_no} 之后出现了 {line_no}）", physical_no)
 
         previous_no = line_no
         body = strip_trailing_comment((match.group(2) or "").strip())

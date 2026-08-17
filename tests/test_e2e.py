@@ -19,13 +19,17 @@ def _exe_path(temp_dir: Path, stem: str) -> Path:
 
 
 def test_e2e_hello_runs() -> None:
+    """仓库里的入门示例能真编真跑。
+
+    断言绑的是 examples/hello.sa 的实际输出，所以改那个示例时这里要一起改——
+    这是有意的：入门示例的输出变了，就该有人确认一遍是不是想要的。
+    """
     with TemporaryDirectory(prefix="sonalgebraic-test-") as temp:
         exe = _exe_path(Path(temp), "hello")
         build_exe(Path("examples/hello.sa"), exe, keep_c=False)
         proc = subprocess.run([str(exe)], text=True, capture_output=True)
         assert proc.returncode == 0
-        assert "Hello from SonAlgebraic!" in proc.stdout
-        assert "Loop finished." in proc.stdout
+        assert proc.stdout.strip() == "Hello World!"
 
 
 def test_e2e_entity_strings_run_with_deep_copy() -> None:

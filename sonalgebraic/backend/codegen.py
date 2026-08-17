@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..core import ast
-from .c_runtime import RUNTIME
+from .c_runtime import RUNTIME_PRELUDE
+from .runtime_slicer import runtime_impl_for, runtime_symbols_in
 from ..core.errors import SonCompileError
 from ..core.names import c_ident as make_c_ident, entity_c_name, module_header_name, module_symbol_prefix, split_module_member
 from ..analysis.semantics import CheckedProgram, Symbol
@@ -57,23 +58,29 @@ class CGen:
         return self.checked.c_funcs
 
     def generate(self) -> str:
-        chunks = self.generate_preamble()
-        chunks.extend(["", self.generate_entities(), "", self.generate_globals(), "", self.generate_prototypes(), ""])
+        # 先生成用户代码，再据此决定注入哪些运行时片段。顺序不能反：
+        # preamble 要知道 body 用到了哪些 sa_* 才能算依赖闭包。
+        body = ["", self.generate_entities(), "", self.generate_globals(), "", self.generate_prototypes(), ""]
         for sub in self.checked.program.subs:
-            chunks.append(self.generate_sub(sub))
-            chunks.append("")
+            body.append(self.generate_sub(sub))
+            body.append("")
         if self.module_name and not self.include_main:
-            chunks.append(self.generate_module_init())
-            chunks.append("")
-            chunks.append(self.generate_module_free())
+            body.append(self.generate_module_init())
+            body.append("")
+            body.append(self.generate_module_free())
         if self.include_main:
-            chunks.append(self.generate_c_main())
+            body.append(self.generate_c_main())
+        chunks = self.generate_preamble("\n".join(body))
+        chunks.extend(body)
         return "\n".join(chunks).rstrip() + "\n"
 
-    def generate_preamble(self) -> list[str]:
+    def generate_preamble(self, body: str = "") -> list[str]:
         if self.include_runtime:
             prefix = self.runtime_feature_prefix()
-            lines = [(prefix + RUNTIME.strip()).rstrip()]
+            runtime = RUNTIME_PRELUDE.strip() + "\n\n" + runtime_impl_for(
+                runtime_symbols_in(body), self.runtime_features()
+            )
+            lines = [(prefix + runtime).rstrip()]
         else:
             lines = []
             lines.extend(self.runtime_feature_defines())
@@ -1636,6 +1643,9 @@ class CGen:
     def uses_net(self) -> bool:
         return "SYS.NET" in self.checked.uses.values()
 
+    def runtime_features(self) -> set[str]:
+        return runtime_features_for_program(self.checked.program, self.checked.uses)
+
     def runtime_feature_defines(self) -> list[str]:
         macros = {
             "net": "#define SA_ENABLE_NET",
@@ -1647,7 +1657,7 @@ class CGen:
             "map": "#define SA_ENABLE_MAP",
             "gui": "#define SA_ENABLE_GUI",
         }
-        return [macros[feature] for feature in sorted(runtime_features_for_program(self.checked.program, self.checked.uses)) if feature in macros]
+        return [macros[feature] for feature in sorted(self.runtime_features()) if feature in macros]
 
     def runtime_feature_prefix(self) -> str:
         defines = self.runtime_feature_defines()

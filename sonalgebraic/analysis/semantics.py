@@ -7,7 +7,7 @@ from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
 from ..core.lines import LINT_OPTIONS
-from .typesys import BUILTIN_MODULES, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, type_of
+from .typesys import BUILTIN_MODULES, describe_type, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
 
 
 @dataclass(frozen=True)
@@ -269,6 +269,7 @@ def collect_symbols(
         key = decl.name.lower()
         if key in symbols:
             raise SonCompileError(f"重复声明变量: {decl.name}", decl.line_no)
+        reject_use_alias_conflict(decl.name, uses, decl.line_no, decl.type_spec)
         reject_unsupported_type(decl.type_spec, decl.line_no, entities=entities, uses=uses, external_modules=external_modules, allow_entity=True)
         symbols[key] = Symbol(decl.name, decl.type_spec, decl.mutable)
         if decl.expr is not None:
@@ -297,6 +298,7 @@ def collect_subs(
             if key_param in seen_params:
                 raise SonCompileError(f"重复参数: {param.name}", param.line_no)
             seen_params.add(key_param)
+            reject_use_alias_conflict(param.name, uses, param.line_no)
             reject_unsupported_type(param.type_spec, param.line_no, allow_entity=True, uses=uses, external_modules=external_modules)
         subs[key] = sub
     return subs
@@ -362,18 +364,46 @@ def reject_end_in_sub(body: list[ast.Stmt]) -> None:
             reject_end_in_sub(stmt.body)
 
 
-def has_required_return_path(body: list[ast.Stmt]) -> bool:
+def collect_jump_targets(body: list[ast.Stmt]) -> set[str]:
+    """收集 SUB 内被 GOTO / GOSUB 引用到的标签名（小写）。"""
+    targets: set[str] = set()
+    for stmt in body:
+        if isinstance(stmt, ast.Goto | ast.Gosub):
+            targets.add(stmt.label.lower())
+        elif isinstance(stmt, ast.If):
+            targets |= collect_jump_targets(stmt.body)
+            for branch in stmt.elifs:
+                targets |= collect_jump_targets(branch.body)
+            targets |= collect_jump_targets(stmt.else_body)
+        elif isinstance(stmt, ast.ForLoop | ast.WhileLoop):
+            targets |= collect_jump_targets(stmt.body)
+        elif isinstance(stmt, ast.TryCatch):
+            for branch in stmt.catches:
+                targets |= collect_jump_targets(branch.body)
+    return targets
+
+
+def has_required_return_path(body: list[ast.Stmt], jump_targets: set[str] | None = None) -> bool:
+    if jump_targets is None:
+        jump_targets = collect_jump_targets(body)
     for stmt in reversed(body):
-        if isinstance(stmt, ast.NoOp | ast.Label):
+        if isinstance(stmt, ast.NoOp):
+            continue
+        # 被跳转引用的标签是控制流汇合点：GOTO 到这里就会从函数尾部落空，
+        # 所以不能像注释/空行那样当作透明跳过，否则 `GOTO ::done / RETURN 1 / ::done`
+        # 会被误判成「已返回」，生成没有 return 语句的非 void C 函数。
+        if isinstance(stmt, ast.Label):
+            if stmt.name.lower() in jump_targets:
+                return False
             continue
         if isinstance(stmt, ast.Return):
             return True
         # 带 ELSE 的 IF：当 then、所有 ELSE IF、ELSE 分支都保证返回时，整条 IF 必定返回
         if isinstance(stmt, ast.If) and stmt.else_body:
             if (
-                has_required_return_path(stmt.body)
-                and all(has_required_return_path(branch.body) for branch in stmt.elifs)
-                and has_required_return_path(stmt.else_body)
+                has_required_return_path(stmt.body, jump_targets)
+                and all(has_required_return_path(branch.body, jump_targets) for branch in stmt.elifs)
+                and has_required_return_path(stmt.else_body, jump_targets)
             ):
                 return True
             return False
@@ -406,6 +436,15 @@ def check_return(
         for inner in stmt.body:
             check_return(inner, return_type, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         return
+    if isinstance(stmt, ast.TryCatch):
+        # CATCH 体里的 RETURN 同样要按 SUB 的返回类型校验，
+        # 别名符号按 check_stmt 的口径注入，保证 `RETURN e` 能解析到 ERROR 类型。
+        for branch in stmt.catches:
+            branch_symbols = symbols.copy()
+            branch_symbols[branch.alias.lower()] = Symbol(branch.alias, ast.TypeSpec("ERROR"), False)
+            for inner in branch.body:
+                check_return(inner, return_type, branch_symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        return
     if not isinstance(stmt, ast.Return):
         return
     if return_type.name == "VOID" and stmt.expr is not None:
@@ -434,6 +473,7 @@ def check_stmt(
         key = stmt.name.lower()
         if key in symbols:
             raise SonCompileError(f"重复声明变量: {stmt.name}", stmt.line_no)
+        reject_use_alias_conflict(stmt.name, uses, stmt.line_no)
         reject_unsupported_type(stmt.type_spec, stmt.line_no, entities=entities, uses=uses, external_modules=external_modules, allow_entity=True)
         symbols[key] = Symbol(stmt.name, stmt.type_spec, stmt.mutable)
         if stmt.expr is not None:
@@ -507,14 +547,20 @@ def check_stmt(
             raise SonCompileError("THROW 只能抛出 ERROR 变量", stmt.line_no)
     elif isinstance(stmt, ast.If):
         check_expr(stmt.condition, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        # 每个分支一份子作用域：codegen 把块内 DIM 发射在 C 的 `{ }` 里，
+        # 语义侧必须同样隔离，否则块内声明块外可见（生成的 C 编译不过），
+        # 而 THEN/ELSE 各自声明同名变量又会被误判成重复声明。
+        then_scope = symbols.copy()
         for inner in stmt.body:
-            check_stmt(inner, symbols, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
+            check_stmt(inner, then_scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
         for branch in stmt.elifs:
             check_expr(branch.condition, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+            branch_scope = symbols.copy()
             for inner in branch.body:
-                check_stmt(inner, symbols, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
+                check_stmt(inner, branch_scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
+        else_scope = symbols.copy()
         for inner in stmt.else_body:
-            check_stmt(inner, symbols, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
+            check_stmt(inner, else_scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
     elif isinstance(stmt, ast.ForLoop):
         loop_var = require_symbol(stmt.var, symbols, stmt.line_no)
         if not loop_var.mutable:
@@ -529,12 +575,14 @@ def check_stmt(
             check_expr(stmt.step, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
             if not is_numeric(type_of(stmt.step, symbols, subs, entities, uses, external_modules, c_funcs)):
                 raise SonCompileError("FOR 的步长必须是数值", stmt.line_no)
+        loop_scope = symbols.copy()
         for inner in stmt.body:
-            check_stmt(inner, symbols, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
+            check_stmt(inner, loop_scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
     elif isinstance(stmt, ast.WhileLoop):
         check_expr(stmt.condition, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        while_scope = symbols.copy()
         for inner in stmt.body:
-            check_stmt(inner, symbols, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
+            check_stmt(inner, while_scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
     elif isinstance(stmt, ast.Goto):
         if labels and stmt.label.lower() not in labels:
             raise SonCompileError(f"未知标签: {stmt.label}", stmt.line_no)
@@ -564,10 +612,20 @@ def check_expr(
         resolve_symbol_path(expr.name, symbols, entities, expr.line_no)
     elif isinstance(expr, ast.Unary):
         check_expr(expr.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        operand = type_of(expr.expr, symbols, subs, entities, uses, external_modules, c_funcs)
         if expr.op == "BNOT":
-            operand = type_of(expr.expr, symbols, subs, entities, uses, external_modules, c_funcs)
             if not is_numeric(operand) and not is_bool(operand):
                 raise SonCompileError("BNOT 只能用于整数", expr.line_no)
+        elif expr.op in {"-", "+"}:
+            # 以前这里对 - / + 完全不看类型，`-"abc"` 会原样译成 C 的 -(char*)，
+            # 用户拿到的是 C 编译器的报错而不是 SA 诊断。
+            if not (is_numeric(operand) or is_bool(operand) or is_symbol(operand)):
+                raise SonCompileError(f"一元 {expr.op} 只能用于数值、BOOL 或 SYMBOL，实际是 {describe_type(operand)}", expr.line_no)
+        elif expr.op == "NOT":
+            # NOT 直译成 C 的 `!`，对 STRING 只判指针非空，跟 `IF s` 走的
+            # 「非空串」口径对不上（`IF NOT s` 恒为假）。静默给错答案不如直接拒绝。
+            if not (is_numeric(operand) or is_bool(operand) or is_ptr(operand) or is_cptr(operand) or is_handle(operand)):
+                raise SonCompileError(f"NOT 只能用于 BOOL、数值或指针/句柄，实际是 {describe_type(operand)}", expr.line_no)
     elif isinstance(expr, ast.Deref):
         check_expr(expr.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         ptr_type = type_of(expr.expr, symbols, subs, entities, uses, external_modules, c_funcs)
@@ -577,6 +635,7 @@ def check_expr(
         check_expr(expr.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         if not isinstance(expr.expr, ast.VarRef):
             raise SonCompileError("@ 只能用于变量", expr.line_no)
+        reject_address_of_constant(expr.expr.name, symbols, uses, external_modules, expr.line_no)
     elif isinstance(expr, ast.Cast):
         check_expr(expr.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         reject_unsupported_type(expr.type_spec, expr.line_no, allow_entity=True, entities=entities, uses=uses, external_modules=external_modules)
@@ -589,6 +648,13 @@ def check_expr(
         index_type = type_of(expr.index, symbols, subs, entities, uses, external_modules, c_funcs)
         if not is_numeric(index_type) and not is_bool(index_type):
             raise SonCompileError("数组下标必须是整数", expr.line_no)
+        # 常量下标在编译期就能判定越界，否则生成的是裸 sa_xs[5]，运行期静默踩内存
+        const_index = const_int_value(expr.index)
+        if const_index is not None and not (0 <= const_index < base_type.array_size):
+            raise SonCompileError(
+                f"数组下标越界: {const_index} 超出长度 {base_type.array_size} 的合法范围 0..{base_type.array_size - 1}",
+                expr.line_no,
+            )
     elif isinstance(expr, ast.Binary):
         check_expr(expr.left, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         check_expr(expr.right, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
@@ -640,7 +706,31 @@ def check_expr(
                 reject_unowned_buffer_calls(arg, uses)
                 require_assignable(param_type, arg_type, arg.line_no)
             return
-        elif expr.name.upper() not in {"NUMBER", "STRING"} and sub is None and c_func is None:
+        elif expr.name.upper() in {"NUMBER", "STRING"}:
+            # 这两个内置转换以前完全不校验：codegen 会无条件发 sa_number(arg)，
+            # 而 runtime 签名是 sa_number(const char*)，传数值等于把整数当地址解引用。
+            builtin = expr.name.upper()
+            if len(expr.args) != 1:
+                raise SonCompileError(f"{builtin}() 需要 1 个参数，实际给了 {len(expr.args)} 个", expr.line_no)
+            arg = expr.args[0]
+            check_expr(arg, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+            arg_type = type_of(arg, symbols, subs, entities, uses, external_modules, c_funcs)
+            if builtin == "NUMBER":
+                if not is_string(arg_type):
+                    raise SonCompileError("NUMBER() 的参数必须是 STRING", arg.line_no)
+            elif not (
+                is_string(arg_type)
+                or is_numeric(arg_type)
+                or is_bool(arg_type)
+                or is_error(arg_type)
+                or is_symbol(arg_type)
+                or is_handle(arg_type)
+                or is_ptr(arg_type)
+                or is_cptr(arg_type)
+            ):
+                raise SonCompileError(f"STRING() 不支持这个类型的参数: {arg_type.name}", arg.line_no)
+            return
+        elif sub is None and c_func is None:
             raise SonCompileError(f"未知内置函数或 SUB: {expr.name}", expr.line_no)
         target = sub if sub is not None else c_func
         if target is not None:
@@ -649,6 +739,63 @@ def check_expr(
             check_call_args(expr.name, expr.args, target, symbols, subs, entities, uses, external_modules, expr.line_no, c_headers, c_libs, c_funcs)
         for arg in expr.args:
             check_expr(arg, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+
+
+def reject_address_of_constant(
+    name: str,
+    symbols: dict[str, Symbol],
+    uses: dict[str, str],
+    external_modules: dict[str, ModuleExports],
+    line_no: int,
+) -> None:
+    """枚举成员和模块常量没有存储位置，不能取址。
+
+    codegen 把它们发射成整数/浮点字面量（`&0` 不是合法 C），而 AddressOf 分支
+    是拿点名的根名直接查符号表取址，根名压根不存在，用户看到的是 Python KeyError。
+    """
+    if resolve_builtin_const(name, uses) is not None or resolve_external_const(name, uses, external_modules) is not None:
+        raise SonCompileError(f"不能对模块常量取地址: {name}；请先赋给变量再取址", line_no)
+    # 枚举成员是唯一以完整点名注入符号表的东西（见 inject_enum_symbols），
+    # 实体字段路径只有根名在表里，所以这条判定不会误伤 `@obj.field`。
+    if "." in name and name.lower() in symbols:
+        raise SonCompileError(f"不能对枚举成员取地址: {name}；请先赋给变量再取址", line_no)
+
+
+def reject_use_alias_conflict(name: str, uses: dict[str, str], line_no: int, type_spec: ast.TypeSpec | None = None) -> None:
+    """变量/参数名撞上 USE 别名，且该变量能写成 `名字.成员` 时报错。
+
+    VarRef 的解析顺序是「先模块常量、后符号表」，重名时 `m.e` 会被静默解析成
+    SYS.MATH 的 E 而不是实体字段，程序照常编译却算错结果。调整解析优先级会牵动
+    codegen 和外部模块，在声明处把重名封死是代价最小的封口方式。
+
+    只有 ENTITY 才有字段访问语法，也只有它会和 `别名.成员` 撞车；STRING、NUM 这些
+    标量重名不产生歧义（`DIM s AS STRING` + `USE SYS.STRING AS S` 是合法且常见的写法）。
+    """
+    module = uses.get(name.lower())
+    # SYS.LINT 的「别名」其实是 lint 选项名，不参与 alias.member 解析，不算冲突
+    if module is None or module == "SYS.LINT":
+        return
+    if type_spec is not None and type_spec.name != "ENTITY":
+        return
+    raise SonCompileError(f"变量名与 USE 别名冲突: {name}（该别名已绑定 {module}）", line_no)
+
+
+def const_int_value(expr: ast.Expr) -> int | None:
+    """能在编译期定值的整数字面量（含十六进制、下划线分隔和一元正负号），否则返回 None。"""
+    if isinstance(expr, ast.Unary) and expr.op in {"-", "+"}:
+        inner = const_int_value(expr.expr)
+        if inner is None:
+            return None
+        return -inner if expr.op == "-" else inner
+    if not isinstance(expr, ast.NumberLiteral):
+        return None
+    text = expr.value.replace("_", "")
+    try:
+        if text.lower().startswith(("0x", "-0x")):
+            return int(text, 16)
+        return int(text)
+    except ValueError:
+        return None
 
 
 def require_symbol(name: str, symbols: dict[str, Symbol], line_no: int) -> Symbol:
@@ -760,10 +907,21 @@ def check_call_args(
         check_expr(arg, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         arg_type = type_of(arg, symbols, subs, entities, uses, external_modules, c_funcs)
         reject_unowned_buffer_calls(arg, uses)
-        if param.by_ref and not isinstance(arg, ast.VarRef):
-            raise SonCompileError(f"REF 参数 {param.name} 必须传入变量", arg.line_no)
-        if param.by_ref and isinstance(arg, ast.VarRef) and not resolve_symbol_path(arg.name, symbols, entities, arg.line_no).mutable:
-            raise SonCompileError(f"REF 参数 {param.name} 不能传入 CONST", arg.line_no)
+        if param.by_ref:
+            if not isinstance(arg, ast.VarRef):
+                raise SonCompileError(f"REF 参数 {param.name} 必须传入变量", arg.line_no)
+            if not resolve_symbol_path(arg.name, symbols, entities, arg.line_no).mutable:
+                raise SonCompileError(f"REF 参数 {param.name} 不能传入 CONST", arg.line_no)
+            # REF 实参是直接 &(var) 取址，形参和实参共用同一块内存，没有值传递那层
+            # C 隐式转换兜底：放行 LONG->DOUBLE 会让被调方按 double 读写一块本是
+            # long long 的位模式，BOOL(int) 传给 LONG REF 更是越界写。必须完全同型。
+            if not same_type_spec(param.type_spec, arg_type):
+                raise SonCompileError(
+                    f"REF 参数 {param.name} 需要 {describe_type(param.type_spec)} 变量，"
+                    f"实际传入 {describe_type(arg_type)}；REF 不做隐式转换，请先赋给同类型的中间变量",
+                    arg.line_no,
+                )
+            continue
         require_assignable(param.type_spec, arg_type, arg.line_no)
 
 

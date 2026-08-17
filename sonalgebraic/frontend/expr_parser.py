@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..core import ast
 from ..core.errors import SonCompileError
-from .expr_lexer import Token, tokenize_expr
+from .expr_lexer import Token, find_interp_end, tokenize_expr
 
 
 _PRECEDENCE = {
@@ -32,6 +32,15 @@ _PRECEDENCE = {
 # 一元前缀绑定到幂同级，保证 -x ** 2 按 -(x ** 2) 解析。
 _UNARY_PREC = 10
 _PREFIX_PREC = 11
+
+# 逻辑 NOT 的操作数按比较级解析，`NOT a = b` 读作 NOT (a = b)——经典 BASIC 与
+# Python 都是这个约定。BNOT 是位运算，仍然走 _UNARY_PREC。
+_NOT_PREC = _PRECEDENCE["="]
+
+_CAST_TYPE_KEYWORDS = {
+    "PTR", "TO", "AS", "NUM", "LONG", "DOUBLE", "FLOAT",
+    "STRING", "SYMBOL", "ERROR", "CPTR", "ENTITY", "HANDLE", "BOOL", "VOID",
+}
 
 
 def parse_expr(text: str, line_no: int) -> ast.Expr:
@@ -80,7 +89,9 @@ class ExprParser:
             return self.parse_fstring(token.value)
         if token.kind == "IDENT":
             word = token.value.upper()
-            if word in {"NOT", "BNOT", "+", "-"}:
+            if word == "NOT":
+                return ast.Unary(self.line_no, word, self.parse(_NOT_PREC))
+            if word in {"BNOT", "+", "-"}:
                 return ast.Unary(self.line_no, word, self.parse(_UNARY_PREC))
             if word == "NULL":
                 return ast.NullLiteral(self.line_no)
@@ -114,15 +125,20 @@ class ExprParser:
         type_tokens: list[str] = []
         while True:
             token = self.tokens[self.i]
-            if token.kind == "EOF":
+            if token.kind != "IDENT":
                 break
-            if token.kind == "IDENT":
-                upper = token.value.upper()
-                if upper in {"PTR", "TO", "AS", "NUM", "LONG", "DOUBLE", "FLOAT", "STRING", "SYMBOL", "ERROR", "CPTR", "ENTITY", "BOOL"}:
-                    type_tokens.append(upper)
-                    self.i += 1
-                    continue
-            break
+            # ENTITY/HANDLE 后面跟的是用户自定义名字，不可能出现在关键字白名单里。
+            # 只能靠「前两个 token 已经是 ENTITY AS / HANDLE AS」来确认该无条件收下它，
+            # 收完类型也就结束了（ENTITY 名字后面不会再接类型修饰）。
+            if len(type_tokens) >= 2 and type_tokens[-1] == "AS" and type_tokens[-2] in {"ENTITY", "HANDLE"}:
+                type_tokens.append(token.value)
+                self.i += 1
+                break
+            upper = token.value.upper()
+            if upper not in _CAST_TYPE_KEYWORDS:
+                break
+            type_tokens.append(upper)
+            self.i += 1
         if not type_tokens:
             raise SonCompileError("CAST 后面必须跟类型", self.line_no)
         return _parse_type_parts(type_tokens, self.line_no)
@@ -154,9 +170,7 @@ class ExprParser:
                 i += 2
                 continue
             if ch == "{":
-                end = value.find("}", i + 1)
-                if end == -1:
-                    raise SonCompileError("F-string 缺少右花括号", self.line_no)
+                end = find_interp_end(value, i, self.line_no)
                 if buf:
                     parts.append("".join(buf))
                     buf.clear()

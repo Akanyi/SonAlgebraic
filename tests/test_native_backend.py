@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 import subprocess
 
 from conftest import requires_native_compiler
-from sonalgebraic.backend.native.llvmir import generate_native_llvm_ir
+from sonalgebraic.backend.native import generate_native_llvm_ir
 from sonalgebraic.driver.compiler import build_exe, compile_to_native_ir, compile_main_to_native_ir_with_modules
 from sonalgebraic.frontend.parser import parse_program
 from sonalgebraic.analysis.semantics import check_program
@@ -86,24 +86,47 @@ def test_native_ir_generates_minimal_program() -> None:
     assert "call i32 (ptr, ...) @printf(ptr @.sa_fmt_i64" in ir
 
 
-def test_native_ir_handles_hello_control_flow() -> None:
-    ir = compile_to_native_ir(Path("examples/hello.sa"), Path("build/test_hello_native.ll"))
-    text = ir.read_text(encoding="utf-8")
-    assert "br label %sa_label_loop_start" in text
-    assert "sa_label_loop_end:" in text
-    assert "Counter is now:" in text
-    ir.unlink(missing_ok=True)
+# GOTO 标签循环。以前这条测试直接拿 examples/hello.sa 当素材，结果那个入门示例
+# 被简化成七行之后，测的东西（br / label 的生成）就跟着一起没了。控制流是这里要
+# 守的能力，素材得自己带，不能指望入门示例恰好含有循环。
+_GOTO_LOOP_SOURCE = """10 DIM counter AS NUM AS LONG AS VAR
+20 SUB main AS PUBLIC AS VOID
+30 counter = 1
+40 ::loop_start
+50 IF counter > 5 THEN
+60 GOTO ::loop_end
+70 END IF
+80 PRINT F"Counter is now: {counter}"
+90 counter = counter + 1
+100 GOTO ::loop_start
+110 ::loop_end
+120 PRINT "Loop finished."
+130 .ENDSUB
+140 CALL main
+150 END
+"""
+
+
+def test_native_ir_handles_goto_control_flow() -> None:
+    with native_temp("sonalgebraic-native-goto-") as temp:
+        src = Path(temp) / "goto_loop.sa"
+        src.write_text(_GOTO_LOOP_SOURCE, encoding="utf-8")
+        ir = compile_to_native_ir(src, Path(temp) / "goto_loop.ll")
+        text = ir.read_text(encoding="utf-8")
+        assert "br label %sa_label_loop_start" in text
+        assert "sa_label_loop_end:" in text
+        assert "Counter is now:" in text
 
 
 @requires_native_compiler
 def test_native_backend_hello_runs() -> None:
+    """native 后端也能真编真跑仓库入门示例，断言与 C 后端的 e2e 保持对称。"""
     with native_temp("sonalgebraic-native-test-") as temp:
         exe = Path(temp) / "hello_native.exe"
         build_exe(Path("examples/hello.sa"), exe, keep_c=False, backend="native")
         proc = subprocess.run([str(exe)], text=True, capture_output=True)
         assert proc.returncode == 0
-        assert "Hello from SonAlgebraic!" in proc.stdout
-        assert "Loop finished." in proc.stdout
+        assert proc.stdout.strip() == "Hello World!"
 
 
 _LOOPS_SOURCE = """10 DIM i AS NUM AS LONG AS VAR

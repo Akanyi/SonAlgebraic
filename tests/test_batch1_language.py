@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import compile_c, expect_error
+from conftest import compile_c, compile_user_c, expect_error
 from sonalgebraic.frontend.parser import parse_program
 from sonalgebraic.analysis.semantics import check_program
 from sonalgebraic.analysis.typesys import classify_number_literal, is_bool, is_null
@@ -106,12 +106,9 @@ def test_else_if_chain_generates_nested_c() -> None:
         "60 ELSE IF x > 0 THEN\n70 PRINT \"small\"\n"
         "80 ELSE\n90 PRINT \"neg\"\n100 END IF"
     )
-    c = compile_c(source)
-    # 展开成嵌套 if-else。runtime 全文嵌在生成的 C 里，自身也含 else 块，
-    # 扣掉 runtime 的计数只数用户代码段，避免 runtime 演进把这个测试搞脆。
-    from sonalgebraic.backend.c_runtime import RUNTIME
-
-    assert c.count("else {") - RUNTIME.count("else {") == 2
+    # 展开成嵌套 if-else。只数用户代码段——runtime 自身也含 else 块，
+    # 而它现在是按需注入的切片，扣一个固定计数已经不成立了。
+    assert compile_user_c(source).count("else {") == 2
 
 
 def test_dot_endif_is_accepted() -> None:

@@ -12,7 +12,7 @@ import pytest
 
 from conftest import compile_c, requires_c_compiler, requires_native_compiler
 from sonalgebraic.analysis.semantics import check_program
-from sonalgebraic.backend.native.llvmir import generate_native_llvm_ir
+from sonalgebraic.backend.native import generate_native_llvm_ir
 from sonalgebraic.driver.compiler import build_exe
 from sonalgebraic.frontend.parser import parse_program
 from sonalgebraic.packaging.module_compiler import compile_project

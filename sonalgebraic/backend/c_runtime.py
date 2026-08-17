@@ -1,7 +1,15 @@
-RUNTIME = r'''
+# 单文件模式（RUNTIME）和分离编译模式（RUNTIME_HEADER + RUNTIME_SOURCE）共用这段前导：
+# 平台头、跳转宏、公共类型。以前头文件里抄了第二份，两份手工同步的结果就是 signal.h、
+# NI_MAXHOST 兜底、gtk 头漂移丢失，POSIX 上的模块化构建直接编不过。共用一份就不会再漂。
+RUNTIME_PRELUDE = r'''
 #ifndef _WIN32
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
+#endif
+/* 32 位 POSIX 上 off_t 默认还是 32 位，fseeko/ftello 会在 2GB 处翻车；
+ * 这个宏必须在任何系统头之前定义才生效。 */
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
 #endif
 #endif
 #include <stdio.h>
@@ -52,6 +60,7 @@ RUNTIME = r'''
 #include <signal.h>
 #ifdef SA_ENABLE_NET
 #include <fcntl.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
@@ -132,7 +141,10 @@ typedef struct {
 typedef struct {
     SaJmpBuf env;
 } SaTryFrame;
+'''
 
+
+RUNTIME_IMPL = r'''
 static SaTryFrame sa_try_stack[64];
 static int sa_try_top = 0;
 static SaError sa_current_error = {0, "ERR_NONE", NULL, 0, NULL};
@@ -1023,7 +1035,9 @@ static char* sa_str_slice(const char* value, long long start, long long count) {
     if (start < 0) start = 0;
     if (start > len) start = len;
     if (count < 0) count = 0;
-    if (start + count > len) count = len - start;
+    /* 写成减法而不是 start + count > len：start 已裁到 <= len，len - start 必然非负，
+       这样 count 取到 LLONG_MAX 也不会有有符号溢出 UB（sa_binary_range 同样写法）。 */
+    if (count > len - start) count = len - start;
     char* out = (char*)malloc((size_t)count + 1);
     if (!out) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
     memcpy(out, safe + start, (size_t)count);
@@ -1300,6 +1314,18 @@ static SaSymbol sa_symbol_deriv(SaSymbol s, const char* var) {
         }
         if (s->text && strcmp(s->text, "COS") == 0) {
             return sa_symbol_op('*', sa_symbol_const("-1"), sa_symbol_op('*', sa_symbol_func("SIN", sa_symbol_clone(s->left)), inner_deriv));
+        }
+        /* TAN 和 SQRT 以前落到下面的兜底分支，静默返回 0——eval/simplify 支持这两个
+           函数，求导却不支持，用户拿到的是看着合法但数学上错误的表达式。 */
+        if (s->text && strcmp(s->text, "TAN") == 0) {
+            /* u' / COS(u)^2 */
+            return sa_symbol_op('/', inner_deriv,
+                sa_symbol_op('^', sa_symbol_func("COS", sa_symbol_clone(s->left)), sa_symbol_const("2")));
+        }
+        if (s->text && strcmp(s->text, "SQRT") == 0) {
+            /* u' / (2 * SQRT(u)) */
+            return sa_symbol_op('/', inner_deriv,
+                sa_symbol_op('*', sa_symbol_const("2"), sa_symbol_func("SQRT", sa_symbol_clone(s->left))));
         }
         sa_symbol_free(inner_deriv);
         return sa_symbol_const("0");
@@ -1687,17 +1713,42 @@ static int sa_net_connect_pending(void) {
 }
 
 static int sa_net_wait_socket(SaSocket socket_value, int writable, long long timeout_ms) {
+    int timeout = sa_net_timeout_value(timeout_ms);
+#ifdef _WIN32
     fd_set set;
+    fd_set except_set;
     FD_ZERO(&set);
     FD_SET(socket_value, &set);
-    int timeout = sa_net_timeout_value(timeout_ms);
+    FD_ZERO(&except_set);
+    FD_SET(socket_value, &except_set);
     struct timeval value;
     value.tv_sec = timeout / 1000;
     value.tv_usec = (timeout % 1000) * 1000;
-#ifdef _WIN32
-    int result = select(0, writable ? NULL : &set, writable ? &set : NULL, NULL, &value);
+    /* Winsock 的非阻塞 connect 失败只会打到 exceptfds，永远不会进 writefds。
+       只等 writefds 的话，「连接被拒」这种秒回的失败也要干等满整个超时。 */
+    int result = select(0, writable ? NULL : &set, writable ? &set : NULL, writable ? &except_set : NULL, &value);
+    if (result > 0 && writable && FD_ISSET(socket_value, &except_set)) {
+        int socket_error = 0;
+        int socket_error_size = (int)sizeof(socket_error);
+        if (getsockopt(socket_value, SOL_SOCKET, SO_ERROR, (char*)&socket_error, &socket_error_size) == 0 && socket_error != 0) {
+            sa_net_last_code = socket_error;
+            snprintf(sa_net_last_error, sizeof(sa_net_last_error), "connect failed (%d)", socket_error);
+        } else {
+            sa_net_set_error("connect failed");
+        }
+        return 0;
+    }
 #else
-    int result = select(socket_value + 1, writable ? NULL : &set, writable ? &set : NULL, NULL, &value);
+    /* 用 poll 而不是 select：fd_set 是定长位图，fd >= FD_SETSIZE(通常 1024) 时
+       FD_SET 直接写越界，长跑的服务端很容易踩到。poll 没有这个上限。 */
+    struct pollfd pfd;
+    pfd.fd = socket_value;
+    pfd.events = (short)(writable ? POLLOUT : POLLIN);
+    pfd.revents = 0;
+    int result;
+    do {
+        result = poll(&pfd, 1, timeout);
+    } while (result < 0 && errno == EINTR);
 #endif
     if (result == 0) {
         sa_net_last_code = 0;
@@ -1705,7 +1756,7 @@ static int sa_net_wait_socket(SaSocket socket_value, int writable, long long tim
         return 0;
     }
     if (result < 0) {
-        sa_net_set_socket_error("select");
+        sa_net_set_socket_error("socket wait");
         return 0;
     }
     return 1;
@@ -1926,7 +1977,11 @@ static SaTlsState* sa_net_tls_handshake(SaSocket socket_value, const char* host)
     SCHANNEL_CRED credential;
     memset(&credential, 0, sizeof(credential));
     credential.dwVersion = SCHANNEL_CRED_VERSION;
-    credential.dwFlags = SCH_CRED_AUTO_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS | SCH_USE_STRONG_CRYPTO;
+    /* 默认不查吊销：被吊销的证书照样能握手成功。打开链式吊销检查（根证书除外，
+       根本来就是信任锚，查它没意义），同时把「拿不到吊销信息」和「吊销服务离线」
+       两种情况放行——否则内网/离线环境下所有 HTTPS 会直接全挂，那比不查还糟。 */
+    credential.dwFlags = SCH_CRED_AUTO_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS | SCH_USE_STRONG_CRYPTO
+        | SCH_CRED_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE;
     TimeStamp expiry;
     SECURITY_STATUS status = AcquireCredentialsHandleW(NULL, UNISP_NAME_W, SECPKG_CRED_OUTBOUND, NULL, &credential, NULL, NULL, &state->credentials, &expiry);
     if (status != SEC_E_OK) {
@@ -2708,6 +2763,16 @@ static char* sa_net_urlencode(const char* value) {
     return out;
 }
 
+/* HTTP 响应体硬上限。没有上限的话，一个失控或者恶意的服务端能一路把内存吃穿；
+   而且 Linux 有 overcommit，等不到 malloc 干净地返回 NULL 就已经被 OOM killer 杀了。
+   64MB 对「用 SA 拉个 API / 下个配置」的定位足够，超了明确报错远好过悄悄膨胀。 */
+#define SA_HTTP_MAX_RESPONSE ((size_t)64 * 1024 * 1024)
+
+/* 总超时预算 = 单次操作超时的倍数。单次 recv 有 SO_RCVTIMEO 兜着，但「慢滴」服务端
+   每次都赶在超时前吐一个字节，就能把整个请求无限期拖住。取 10 倍是折中：既不误伤
+   真的慢但在推进的大响应，又保证有个上界（默认 30s 超时对应 5 分钟总预算）。 */
+#define SA_HTTP_TOTAL_TIMEOUT_FACTOR 10
+
 static int sa_net_append(char** data, size_t* len, size_t* cap, const char* chunk, size_t chunk_len) {
     if (chunk_len > SIZE_MAX - *len - 1) return 0;
     if (*len + chunk_len + 1 > *cap) {
@@ -2732,20 +2797,37 @@ static int sa_net_append(char** data, size_t* len, size_t* cap, const char* chun
     return 1;
 }
 
+/* 大小写不敏感的前缀比较；needle 必须已经是小写。HTTP 头的大小写不作数，
+   而 strcasecmp/_strnicmp 两个平台名字不一样，自己写一份省掉平台分支。 */
+static int sa_net_ci_prefix(const char* text, const char* lower_needle) {
+    size_t i = 0;
+    while (lower_needle[i] && text[i]) {
+        char a = text[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != lower_needle[i]) return 0;
+        i++;
+    }
+    return lower_needle[i] == '\0';
+}
+
+static const char* sa_net_headers_find(const char* headers, const char* lower_name) {
+    if (!headers) return NULL;
+    for (const char* p = headers; *p; p++) {
+        if (sa_net_ci_prefix(p, lower_name)) return p + strlen(lower_name);
+    }
+    return NULL;
+}
+
 static int sa_net_headers_have_content_type(const char* headers) {
-    if (!headers) return 0;
-    const char* p = headers;
-    const char needle[] = "content-type:";
-    while (*p) {
-        size_t i = 0;
-        while (needle[i] && p[i]) {
-            char a = p[i];
-            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-            if (a != needle[i]) break;
-            i++;
-        }
-        if (!needle[i]) return 1;
-        p++;
+    return sa_net_headers_find(headers, "content-type:") != NULL;
+}
+
+static int sa_net_headers_have_chunked(const char* headers) {
+    const char* value = sa_net_headers_find(headers, "transfer-encoding:");
+    if (!value) return 0;
+    /* 只扫这一行的取值，别把后面别的头算进来 */
+    for (const char* p = value; *p && *p != '\r' && *p != '\n'; p++) {
+        if (sa_net_ci_prefix(p, "chunked")) return 1;
     }
     return 0;
 }
@@ -2860,9 +2942,17 @@ static char* sa_net_http_fetch(const char* method, const char* url, const char* 
             sa_net_set_error_code("WinHttpReadData", GetLastError());
             return sa_strdup("");
         }
+        if (read && (size_t)read > SA_HTTP_MAX_RESPONSE - response_len) {
+            free(buffer);
+            free(response);
+            WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session);
+            sa_net_set_error("HTTP response exceeds the 64 MB limit");
+            return sa_strdup("");
+        }
         if (read && !sa_net_append(&response, &response_len, &response_cap, buffer, (size_t)read)) {
             free(buffer);
             WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session);
+            if (!sa_net_last_error[0]) sa_net_set_error("HTTP response buffer allocation failed");
             return sa_strdup("");
         }
         free(buffer);
@@ -2952,7 +3042,26 @@ static char* sa_net_http_fetch(const char* method, const char* url, const char* 
     size_t response_len = 0;
     size_t response_cap = 0;
     char buffer[4096];
+    /* 单调时钟本来更合适，但 clock_gettime 在老 glibc 上要额外链 -lrt，
+       而 gettimeofday 在 <sys/time.h> 里、任何 libc 都直接可用；这里只是算个
+       超时上界，墙钟被调整最多让超时变宽松，方向上是安全的。 */
+    struct timeval http_start;
+    gettimeofday(&http_start, NULL);
+    long long http_budget_ms = (long long)sa_net_timeout_value(timeout_ms) * SA_HTTP_TOTAL_TIMEOUT_FACTOR;
     for (;;) {
+        struct timeval http_now;
+        gettimeofday(&http_now, NULL);
+        long long elapsed_ms = (long long)(http_now.tv_sec - http_start.tv_sec) * 1000
+            + (long long)(http_now.tv_usec - http_start.tv_usec) / 1000;
+        if (elapsed_ms > http_budget_ms) {
+            free(response);
+#ifdef SA_ENABLE_TLS
+            sa_net_tls_free_state(tls_state);
+#endif
+            sa_net_close_socket(sock);
+            sa_net_set_error("HTTP total timeout exceeded");
+            return sa_strdup("");
+        }
         int got;
 #ifdef SA_ENABLE_TLS
         if (secure) got = sa_net_tls_recv_bytes(&transport, (unsigned char*)buffer, sizeof(buffer));
@@ -2967,6 +3076,15 @@ static char* sa_net_http_fetch(const char* method, const char* url, const char* 
 #endif
             sa_net_close_socket(sock);
             if (!sa_net_last_error[0]) sa_net_set_socket_error("HTTP receive");
+            return sa_strdup("");
+        }
+        if ((size_t)got > SA_HTTP_MAX_RESPONSE - response_len) {
+            free(response);
+#ifdef SA_ENABLE_TLS
+            sa_net_tls_free_state(tls_state);
+#endif
+            sa_net_close_socket(sock);
+            sa_net_set_error("HTTP response exceeds the 64 MB limit");
             return sa_strdup("");
         }
         if (!sa_net_append(&response, &response_len, &response_cap, buffer, (size_t)got)) {
@@ -3005,6 +3123,15 @@ static char* sa_net_http_fetch(const char* method, const char* url, const char* 
     if (!sa_net_last_headers) { free(response); fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
     memcpy(sa_net_last_headers, response, header_len);
     sa_net_last_headers[header_len] = '\0';
+    /* 这个后端发的是 HTTP/1.0，合规服务端不该回 chunked；但真遇上不合规的，
+       原样返回的正文里会夹着长度前缀和 CRLF，是一份看着像数据的脏数据。
+       解不了就明说，别让调用方拿着脏正文继续算。 */
+    if (sa_net_headers_have_chunked(sa_net_last_headers)) {
+        free(response);
+        sa_net_set_error("chunked transfer encoding is not supported by this HTTP backend");
+        if (status_out) *status_out = 0;
+        return sa_strdup("");
+    }
     size_t response_body_len = response_len >= header_len ? response_len - header_len : 0;
     char* response_body = (char*)malloc(response_body_len + 1);
     if (!response_body) {
@@ -3068,6 +3195,12 @@ static long long sa_net_http_request_status_timeout(const char* method, const ch
 typedef struct {
     FILE* stream;
     uint32_t generation;
+    /* C 标准对同一个流的读写切换有硬要求：写转读之间要有 flush 或定位，读转写之间
+       要有定位。以前是靠每次写都 fflush 混过去（行级写慢一个数量级），而且读转写那
+       个方向压根没处理——读完再写会直接失败。用这两个标记按需补上，写路径就不用每次
+       都落盘了。 */
+    int pending_write;
+    int pending_read;
 } SaFileSlot;
 
 static SaFileSlot sa_file_slots[SA_FILE_SLOT_COUNT];
@@ -3109,16 +3242,8 @@ static FILE* sa_file_fopen(const char* path, const char* mode) {
 #endif
 }
 
-static const char* sa_file_mode(const char* mode) {
-    const char* value = mode ? mode : "";
-    if (_stricmp(value, "READ") == 0) return "rb";
-    if (_stricmp(value, "WRITE") == 0) return "wb";
-    if (_stricmp(value, "APPEND") == 0) return "ab";
-    if (_stricmp(value, "UPDATE") == 0) return "r+b";
-    if (_stricmp(value, "CREATE") == 0) return "w+b";
-    return NULL;
-}
-
+/* 预处理是顺序展开的，这个垫片必须排在第一个 _stricmp 使用点之前，
+   否则 POSIX 上 sa_file_mode 里的调用会变成未声明符号。 */
 #ifndef _WIN32
 static int sa_stricmp_ascii(const char* left, const char* right) {
     while (*left && *right) {
@@ -3132,6 +3257,16 @@ static int sa_stricmp_ascii(const char* left, const char* right) {
 }
 #define _stricmp sa_stricmp_ascii
 #endif
+
+static const char* sa_file_mode(const char* mode) {
+    const char* value = mode ? mode : "";
+    if (_stricmp(value, "READ") == 0) return "rb";
+    if (_stricmp(value, "WRITE") == 0) return "wb";
+    if (_stricmp(value, "APPEND") == 0) return "ab";
+    if (_stricmp(value, "UPDATE") == 0) return "r+b";
+    if (_stricmp(value, "CREATE") == 0) return "w+b";
+    return NULL;
+}
 
 static SaFileSlot* sa_file_slot(SaHandle handle) {
     size_t index = 0;
@@ -3161,6 +3296,8 @@ static SaHandle sa_file_open(const char* path, const char* mode) {
         if (!sa_file_slots[i].stream) {
             if (++sa_file_slots[i].generation == 0) sa_file_slots[i].generation = 1;
             sa_file_slots[i].stream = stream;
+            sa_file_slots[i].pending_write = 0;
+            sa_file_slots[i].pending_read = 0;
             if (!sa_file_cleanup_registered) {
                 atexit(sa_file_close_all);
                 sa_file_cleanup_registered = 1;
@@ -3181,6 +3318,10 @@ static char* sa_file_read(SaHandle handle, long long count) {
         sa_file_set_error("invalid read size");
         return sa_strdup("");
     }
+    if (slot->pending_write) {
+        if (fflush(slot->stream) != 0) { sa_file_set_errno("flush"); return sa_strdup(""); }
+        slot->pending_write = 0;
+    }
     char* data = (char*)malloc((size_t)count + 1);
     if (!data) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
     size_t got = fread(data, 1, (size_t)count, slot->stream);
@@ -3196,6 +3337,7 @@ static char* sa_file_read(SaHandle handle, long long count) {
         return sa_strdup("");
     }
     data[got] = '\0';
+    slot->pending_read = 1;
     return data;
 }
 
@@ -3203,10 +3345,21 @@ static long long sa_file_write(SaHandle handle, const char* text) {
     sa_file_clear_error();
     SaFileSlot* slot = sa_file_slot(handle);
     if (!slot) { sa_file_set_error("invalid or closed FILE handle"); return -1; }
+    if (slot->pending_read) {
+        /* 读转写只能靠定位来分隔（fflush 在标准里只管写转读这个方向）。
+           原地 seek 0 就够：既满足标准，又不动文件位置。 */
+#ifdef _WIN32
+        if (_fseeki64(slot->stream, 0, SEEK_CUR) != 0) { sa_file_set_errno("write"); return -1; }
+#else
+        if (fseeko(slot->stream, 0, SEEK_CUR) != 0) { sa_file_set_errno("write"); return -1; }
+#endif
+        slot->pending_read = 0;
+    }
     const char* safe = text ? text : "";
     size_t len = strlen(safe);
     size_t written = fwrite(safe, 1, len, slot->stream);
-    if (written != len || fflush(slot->stream) != 0) { sa_file_set_errno("write"); return -1; }
+    if (written != len) { sa_file_set_errno("write"); return -1; }
+    slot->pending_write = 1;
     return (long long)written;
 }
 
@@ -3223,8 +3376,13 @@ static int sa_file_seek(SaHandle handle, long long offset, const char* origin) {
 #ifdef _WIN32
     if (_fseeki64(slot->stream, offset, whence) != 0) { sa_file_set_errno("seek"); return 0; }
 #else
-    if (fseek(slot->stream, (long)offset, whence) != 0) { sa_file_set_errno("seek"); return 0; }
+    /* fseek 只吃 long，32 位目标上 2GB 以外的偏移会被截断成别的位置；
+       fseeko 用 off_t，配合前导里的 _FILE_OFFSET_BITS=64 才是真 64 位。 */
+    if (fseeko(slot->stream, (off_t)offset, whence) != 0) { sa_file_set_errno("seek"); return 0; }
 #endif
+    /* 定位本身就把读写方向切换的标准要求满足了，两个待处理标记一起清掉 */
+    slot->pending_write = 0;
+    slot->pending_read = 0;
     return 1;
 }
 
@@ -3235,7 +3393,7 @@ static long long sa_file_tell(SaHandle handle) {
 #ifdef _WIN32
     __int64 position = _ftelli64(slot->stream);
 #else
-    long position = ftell(slot->stream);
+    off_t position = ftello(slot->stream);
 #endif
     if (position < 0) { sa_file_set_errno("tell"); return -1; }
     return (long long)position;
@@ -3509,7 +3667,14 @@ static int sa_gui_event_count = 0;
 static int sa_gui_live_windows = 0;
 
 static void sa_gui_push_event(long long id) {
-    if (sa_gui_event_count >= SA_GUI_EVENT_QUEUE) return;
+    if (sa_gui_event_count >= SA_GUI_EVENT_QUEUE) {
+        /* 队列满了丢最旧的那条：GUI 交互里「最近点了什么」远比「很久以前点了什么」
+           重要，而且窗口关闭事件（id 0）永远是最后压进来的，丢旧才不会把退出信号丢掉。
+           同时记一条 LAST_ERROR，让丢弃至少可被程序发现，而不是彻底静默。 */
+        sa_gui_event_head = (sa_gui_event_head + 1) % SA_GUI_EVENT_QUEUE;
+        sa_gui_event_count--;
+        sa_gui_set_error("gui event queue overflow, oldest event dropped");
+    }
     sa_gui_events[(sa_gui_event_head + sa_gui_event_count) % SA_GUI_EVENT_QUEUE] = id;
     sa_gui_event_count++;
 }
@@ -3558,7 +3723,10 @@ static LRESULT CALLBACK sa_gui_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
             }
         }
         for (size_t i = 0; i < SA_GUI_WIDGET_COUNT; i++) {
-            if (sa_gui_widgets[i].hwnd && !IsWindow(sa_gui_widgets[i].hwnd)) {
+            /* 判归属而不是判存活：父窗口收到 WM_DESTROY 时子窗口还没被销毁，
+               IsWindow 一律为真，槽位根本清不掉，句柄会一直悬挂。IsChild 在这个
+               时点才是可靠的。顺带保留 !IsWindow 兜住已经单独销毁掉的控件。 */
+            if (sa_gui_widgets[i].hwnd && (IsChild(hwnd, sa_gui_widgets[i].hwnd) || !IsWindow(sa_gui_widgets[i].hwnd))) {
                 sa_gui_widgets[i].hwnd = NULL;
                 sa_gui_widgets[i].generation++;
             }
@@ -3974,124 +4142,10 @@ static void sa_setup_console(void) {
 '''
 
 
-RUNTIME_HEADER = r'''
+RUNTIME_HEADER = '''
 #ifndef SONALGEBRAIC_SA_RUNTIME_H
 #define SONALGEBRAIC_SA_RUNTIME_H
-
-#ifndef _WIN32
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200112L
-#endif
-#endif
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <string.h>
-#include <stdint.h>
-#include <errno.h>
-#include <limits.h>
-#include <sys/stat.h>
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifdef SA_ENABLE_NET
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
-#include <windows.h>
-#ifdef SA_ENABLE_TLS
-#ifndef SECURITY_WIN32
-#define SECURITY_WIN32
-#endif
-#include <security.h>
-#include <schannel.h>
-#endif
-#ifdef SA_ENABLE_DESKTOP
-#include <shellapi.h>
-#endif
-#ifdef SA_ENABLE_NET
-#include <winhttp.h>
-#endif
-#if defined(SA_ENABLE_NET) && defined(_MSC_VER)
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "ws2_32.lib")
-#endif
-#if defined(SA_ENABLE_TLS) && defined(_MSC_VER)
-#pragma comment(lib, "secur32.lib")
-#endif
-#if defined(SA_ENABLE_DESKTOP) && defined(_MSC_VER)
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "shell32.lib")
-#endif
-#else
-#include <unistd.h>
-#ifdef SA_ENABLE_NET
-#include <fcntl.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#ifdef SA_ENABLE_TLS
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509v3.h>
-#endif
-#endif
-#endif
-
-/* 见 RUNTIME 中的说明：分离编译的模块也必须用同一套跳转宏，否则跨翻译单元的
- * SaTryFrame 布局不一致。 */
-#if defined(__MINGW32__) && (defined(__GNUC__) || defined(__clang__))
-typedef void* SaJmpBuf[5];
-#define SA_SETJMP(buf) __builtin_setjmp(buf)
-#define SA_LONGJMP(buf) __builtin_longjmp((buf), 1)
-#else
-#include <setjmp.h>
-typedef jmp_buf SaJmpBuf;
-#define SA_SETJMP(buf) setjmp(buf)
-#define SA_LONGJMP(buf) longjmp((buf), 1)
-#endif
-
-typedef struct {
-    char* data;
-    size_t len;
-    size_t cap;
-} SaStringBuilder;
-
-typedef enum {
-    SA_SYM_CONST,
-    SA_SYM_VAR,
-    SA_SYM_OP,
-    SA_SYM_FUNC
-} SaSymbolKind;
-
-typedef struct SaSymbolNode {
-    SaSymbolKind kind;
-    char* text;
-    char op;
-    struct SaSymbolNode* left;
-    struct SaSymbolNode* right;
-} SaSymbolNode;
-
-typedef SaSymbolNode* SaSymbol;
-
-typedef uint64_t SaHandle;
-
-typedef struct {
-    int err_code;
-    const char* type;
-    char* message;
-    int line_number;
-    const char* sub_name;
-} SaError;
-
-typedef struct {
-    SaJmpBuf env;
-} SaTryFrame;
-
+''' + RUNTIME_PRELUDE + r'''
 extern SaTryFrame sa_try_stack[64];
 extern int sa_try_top;
 extern SaError sa_current_error;
@@ -4212,6 +4266,56 @@ int sa_desktop_open(const char* target);
 int sa_desktop_clipboard_set(const char* text);
 char* sa_desktop_clipboard_get(void);
 char* sa_desktop_last_error_copy(void);
+SaHandle sa_list_new(void);
+int sa_list_push(SaHandle handle, double value);
+double sa_list_pop(SaHandle handle);
+double sa_list_get(SaHandle handle, long long index);
+int sa_list_set(SaHandle handle, long long index, double value);
+int sa_list_insert(SaHandle handle, long long index, double value);
+int sa_list_remove(SaHandle handle, long long index);
+long long sa_list_length(SaHandle handle);
+int sa_list_clear(SaHandle handle);
+int sa_list_close(SaHandle handle);
+char* sa_list_last_error_copy(void);
+SaHandle sa_strlist_new(void);
+int sa_strlist_push(SaHandle handle, const char* value);
+char* sa_strlist_pop(SaHandle handle);
+char* sa_strlist_get(SaHandle handle, long long index);
+int sa_strlist_set(SaHandle handle, long long index, const char* value);
+int sa_strlist_insert(SaHandle handle, long long index, const char* value);
+int sa_strlist_remove(SaHandle handle, long long index);
+long long sa_strlist_length(SaHandle handle);
+int sa_strlist_clear(SaHandle handle);
+int sa_strlist_close(SaHandle handle);
+char* sa_strlist_join(SaHandle handle, const char* separator);
+SaHandle sa_map_new(void);
+int sa_map_set(SaHandle handle, const char* key, double value);
+double sa_map_get(SaHandle handle, const char* key);
+int sa_map_has(SaHandle handle, const char* key);
+int sa_map_remove(SaHandle handle, const char* key);
+long long sa_map_length(SaHandle handle);
+SaHandle sa_map_keys(SaHandle handle);
+int sa_map_clear(SaHandle handle);
+int sa_map_close(SaHandle handle);
+char* sa_map_last_error_copy(void);
+SaHandle sa_strmap_new(void);
+int sa_strmap_set(SaHandle handle, const char* key, const char* value);
+char* sa_strmap_get(SaHandle handle, const char* key);
+int sa_strmap_has(SaHandle handle, const char* key);
+int sa_strmap_remove(SaHandle handle, const char* key);
+long long sa_strmap_length(SaHandle handle);
+SaHandle sa_strmap_keys(SaHandle handle);
+int sa_strmap_clear(SaHandle handle);
+int sa_strmap_close(SaHandle handle);
+SaHandle sa_gui_window(const char* title, long long width, long long height);
+SaHandle sa_gui_button(SaHandle window, long long control_id, const char* text, long long x, long long y, long long width, long long height);
+SaHandle sa_gui_label(SaHandle window, const char* text, long long x, long long y, long long width, long long height);
+SaHandle sa_gui_textbox(SaHandle window, long long x, long long y, long long width, long long height);
+int sa_gui_set_text(SaHandle widget, const char* text);
+char* sa_gui_get_text(SaHandle widget);
+long long sa_gui_wait_event(void);
+int sa_gui_close(SaHandle window);
+char* sa_gui_last_error_copy(void);
 void sa_print_string(const char* value);
 void sa_print_long(long long value);
 void sa_print_double(double value);
@@ -4223,5 +4327,8 @@ void sa_setup_console(void);
 '''
 
 
-RUNTIME_SOURCE = RUNTIME.replace("static ", "")
-RUNTIME_SOURCE = RUNTIME_SOURCE[RUNTIME_SOURCE.index("SaTryFrame sa_try_stack") :]
+RUNTIME = RUNTIME_PRELUDE + RUNTIME_IMPL
+
+# 分离编译时前导由 sa_runtime.h 提供，这里只要实现部分；去掉 static 让符号可跨翻译单元链接。
+# 切的是 RUNTIME_IMPL 而不是按文本找位置，前导和实现的边界由 Python 字符串本身保证。
+RUNTIME_SOURCE = RUNTIME_IMPL.replace("static ", "")

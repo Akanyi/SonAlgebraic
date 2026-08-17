@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 
@@ -144,11 +145,36 @@ def find_archiver() -> str | None:
     return None
 
 
+LIBRARY_FILE_SUFFIXES = {".a", ".so", ".dylib", ".lib", ".dll"}
+
+# 库名允许字母数字和 _ . + -，但不能以 - 打头（stdc++ / c++abi 这类要放行 +）
+_SAFE_LIB_NAME = re.compile(r"^[A-Za-z0-9_.+][A-Za-z0-9_.+-]*$")
+
+
+def validate_link_library(lib: str) -> str:
+    """校验一个 USELIB 值，返回原值；不合法则报编译错误。
+
+    USELIB 的值会原样进入 C 编译器命令行，而它来自模块源码——第三方 .slib/.spkg
+    里也能写。以 '-' 开头的值会被当成编译器选项解析，`USELIB "-fplugin=evil.so"`
+    足以让 GCC 在构建期加载任意插件，也就是 sonc build 一跑就中招。
+    """
+    if not lib or not lib.strip():
+        raise SonCompileError("USELIB 的值不能为空")
+    if lib.startswith("-"):
+        raise SonCompileError(f"USELIB 的值不能以 '-' 开头（会被 C 编译器当成选项）: {lib}")
+    if Path(lib).suffix in LIBRARY_FILE_SUFFIXES or Path(lib).exists():
+        return lib
+    if not _SAFE_LIB_NAME.match(lib):
+        raise SonCompileError(f"USELIB 的库名只允许字母、数字和 _ . + - 组合: {lib}")
+    return lib
+
+
 def link_library_args(link_libs: list[str]) -> list[str]:
     args: list[str] = []
     for lib in link_libs:
+        validate_link_library(lib)
         path = Path(lib)
-        if path.exists() or path.suffix in {".a", ".so", ".dylib", ".lib", ".dll"}:
+        if path.exists() or path.suffix in LIBRARY_FILE_SUFFIXES:
             args.append(str(path))
         else:
             args.append(f"-l{lib}")

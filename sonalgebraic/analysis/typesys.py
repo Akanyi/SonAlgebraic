@@ -140,6 +140,32 @@ def same_handle_kind(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
     return is_handle(left) and is_handle(right) and (left.subtype or "").lower() == (right.subtype or "").lower()
 
 
+def same_type_spec(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
+    """两个类型是否逐层完全一致：NUM 连子类型、PTR 连内层、数组连长度一起比。
+
+    给 REF 传参这类「共用同一块内存」的场景用；普通赋值仍走 require_assignable 的宽松规则。
+    """
+    if left.name != right.name or left.array_size != right.array_size:
+        return False
+    if (left.subtype or "").lower() != (right.subtype or "").lower():
+        return False
+    if (left.inner is None) != (right.inner is None):
+        return False
+    return left.inner is None or same_type_spec(left.inner, right.inner)
+
+
+def describe_type(type_spec: ast.TypeSpec) -> str:
+    """把 TypeSpec 还原成接近源码写法的形式，让诊断信息能直接照抄改。"""
+    text = type_spec.name
+    if type_spec.inner is not None:
+        text = f"{text} TO {describe_type(type_spec.inner)}"
+    elif type_spec.subtype:
+        text = f"{text} AS {type_spec.subtype}"
+    if type_spec.array_size is not None:
+        text = f"{text}[{type_spec.array_size}]"
+    return text
+
+
 def type_of(
     expr: ast.Expr,
     symbols: dict[str, Symbol],

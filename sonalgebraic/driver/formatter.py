@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from ..core.errors import SonCompileError
+from ..core.lines import apply_lint_source, detect_lint_options
 
 
 _NUMBERED_LINE_RE = re.compile(r"^\s*(\d+)(?:[ \t](.*))?$")
@@ -14,6 +15,11 @@ def renumber_source(source: str, step: int = 10, start: int | None = None) -> st
     next_no = start if start is not None else step
     if next_no <= 0:
         raise SonCompileError("起始行号必须是正整数")
+
+    # NONE_NUMBER 源码本来就没有手写行号，而「把无行号草稿固化成带行号的正式源码」
+    # 恰恰是 fmt 最该干的活，所以走编译链路同一套补号逻辑，而不是报「必须以行号开头」。
+    if "NONE_NUMBER" in detect_lint_options(source):
+        return apply_lint_source(source, step=step, start=next_no)
 
     out: list[str] = []
     for physical_no, raw in enumerate(source.splitlines(), 1):

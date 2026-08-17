@@ -11,17 +11,19 @@ from tempfile import TemporaryDirectory
 from zipfile import ZipFile
 
 from ..backend.codegen import generate_c
-from ..backend.native.llvmir import generate_native_llvm_ir
-from ..analysis.diagnostics import Diagnostic, DiagnosticError
+from ..backend.native import generate_native_llvm_ir
+from ..analysis.diagnostics import Diagnostic
 from ..core.errors import SonCompileError, module_cycle_error
+from ..core.lines import PHYSICAL_LINE_ATTR
 from ..analysis.exports import collect_exports
 from ..core.module_model import ModuleExports
-from ..packaging.module_compiler import compile_project
+from ..packaging.module_compiler import compile_project, rewrite_runtime_for_native
 from ..core.names import module_path_to_slib, module_path_to_source, module_symbol_prefix
 from ..frontend.parser import parse_program
 from ..analysis.semantics import check_program, collect_program_diagnostics
 from ..analysis.typesys import BUILTIN_MODULES, runtime_features_for_program
 from ..packaging.slib import build_slib
+from ..packaging.toolchain import LIBRARY_FILE_SUFFIXES, validate_link_library
 from ..packaging.spkg import extract_spkg, spkg_module_source
 from ..packaging.toolchain import host_target, normalize_target
 
@@ -97,7 +99,12 @@ def _collect_source_text_diagnostics(source_path: Path, source: str, spkgs: list
             diagnostics.append(exc)
             if exc.line_no is None:
                 return diagnostics
-            recovered = comment_out_source_line(parse_source, exc.line_no)
+            # 行号本身出问题的错误带的是物理行号，按 SA 行号去找会命中开头某个同号的
+            # 合法行，把它注释掉既没消除故障行、下一轮还会报同一个错（实测重复输出）
+            if getattr(exc, PHYSICAL_LINE_ATTR, None) is not None:
+                recovered = blank_out_physical_line(parse_source, exc.line_no)
+            else:
+                recovered = comment_out_source_line(parse_source, exc.line_no)
             if recovered == parse_source:
                 return diagnostics
             parse_source = recovered
@@ -125,6 +132,19 @@ def _collect_source_text_diagnostics(source_path: Path, source: str, spkgs: list
             external_modules[use.alias.lower()] = exports
         diagnostics.extend(collect_program_diagnostics(program, external_modules=external_modules, require_main=True, max_errors=max_errors - len(diagnostics)))
         return diagnostics[:max_errors]
+
+
+def blank_out_physical_line(source: str, physical_no: int) -> str:
+    """把指定物理行清空。缺行号的行没法改成 `nnn REM ...`（没有可用且递增的号），
+    只能整行留白——read_numbered_lines 跳过空行，行数不变，后续物理行号也不会错位。"""
+    lines = source.splitlines(keepends=True)
+    if not 1 <= physical_no <= len(lines):
+        return source
+    raw = lines[physical_no - 1]
+    if not raw.strip():
+        return source
+    lines[physical_no - 1] = "\n" if raw.endswith("\n") else ""
+    return "".join(lines)
 
 
 def comment_out_source_line(source: str, line_no: int) -> str:
@@ -168,8 +188,11 @@ def check_module_for_source(
         raise module_cycle_error(visiting, module)
     visiting.append(module)
 
+    module_text: str | None = None
+    module_path: Path | None = None
     try:
-        source_text, dep_root = read_module_source_for_check(module, source_root, spkg_dirs)
+        source_text, dep_root, module_path = read_module_source_for_check(module, source_root, spkg_dirs)
+        module_text = source_text
         program = parse_program(source_text)
         external_modules: dict[str, ModuleExports] = {}
         for use in program.uses:
@@ -181,19 +204,26 @@ def check_module_for_source(
         exports = collect_exports(module, program)
         checked_modules[key] = exports
         return exports
+    except SonCompileError as exc:
+        # 已经带来源的（来自更深一层依赖）保持原样，只给本层的错误补上出处
+        if exc.origin_path is None and module_text is not None:
+            exc.origin_path = str(module_path) if module_path is not None else module
+            exc.origin_text = module_text
+        raise
     finally:
         visiting.pop()
 
 
-def read_module_source_for_check(module: str, source_root: Path, spkg_dirs: list[Path]) -> tuple[str, Path]:
+def read_module_source_for_check(module: str, source_root: Path, spkg_dirs: list[Path]) -> tuple[str, Path, Path]:
+    """返回 (源码, 依赖解析根目录, 源码所在路径)。第三项用于把诊断指回模块自己的文件。"""
     source_path = module_path_to_source(source_root, module)
     if source_path.exists():
-        return source_path.read_text(encoding="utf-8-sig"), source_path.parent
+        return source_path.read_text(encoding="utf-8-sig"), source_path.parent, source_path
 
     slib_path = module_path_to_slib(source_root, module)
     if slib_path.exists():
         source_text = read_slib_root_source_for_check(slib_path)
-        return source_text, source_root
+        return source_text, source_root, slib_path
 
     for spkg_dir in spkg_dirs:
         manifest_path = spkg_dir / "manifest.json"
@@ -202,7 +232,7 @@ def read_module_source_for_check(module: str, source_root: Path, spkg_dirs: list
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         spkg_source = spkg_module_source(manifest, module, spkg_dir)
         if spkg_source is not None and spkg_source.exists():
-            return spkg_source.read_text(encoding="utf-8-sig"), spkg_source.parent
+            return spkg_source.read_text(encoding="utf-8-sig"), spkg_source.parent, spkg_source
 
     raise SonCompileError(f"找不到模块源文件、.slib 或 .spkg: {module}")
 
@@ -235,10 +265,14 @@ def build_exe(
         plan = compile_project(source_path, out_dir, target, spkgs=spkgs)
         compiler = find_c_compiler(target)
         if compiler is None:
-            raise SonCompileError("未找到 C 编译器，请安装 gcc、clang、tcc、zig 或 Visual Studio cl")
+            raise missing_compiler_error(target)
         run_c_compiler(compiler, plan.c_files, output_path, include_dir=out_dir, libs=plan.libs, link_libs=plan.link_libs, target=target, extra_args=gui_backend_args(plan.runtime_features, target))
         for dll in plan.dlls:
             shutil.copy2(dll, output_path.parent / dll.name)
+        # 模块项目的「生成的 C」是整个 out_dir，不是一个文件；不跟着 keep_c 走的话
+        # --discard-c 在加了模块之后就静默失效了。dll 已经在上面拷出去了，可以整目录删。
+        if not keep_c and c_path is None:
+            shutil.rmtree(out_dir, ignore_errors=True)
         return BuildResult(plan.main_c, output_path, compiler)
 
     c_file = c_path or output_path.with_suffix(".c")
@@ -248,7 +282,7 @@ def build_exe(
     c_file.write_text(generate_c(checked), encoding="utf-8")
     compiler = find_c_compiler(target)
     if compiler is None:
-        raise SonCompileError("未找到 C 编译器，请安装 gcc、clang、tcc、zig 或 Visual Studio cl")
+        raise missing_compiler_error(target)
 
     features = runtime_features_for_program(checked.program, checked.uses)
     link_libs = [lib.library for lib in checked.c_libs.values()] + builtin_link_libs(checked.uses, target, features)
@@ -273,25 +307,30 @@ def build_native_exe(
         compile_main_to_native_ir_with_modules(source_path, ir_file, plan)
         compiler = find_native_compiler(target)
         if compiler is None:
-            raise SonCompileError("native 后端需要 clang 或 zig cc 来编译 LLVM IR")
+            raise missing_compiler_error(target, native=True)
+        # plan 里的 runtime 切片是按 main.c 裁的，而这条路径的主程序是 IR，按 IR 重算
+        rewrite_runtime_for_native(plan, ir_file.read_text(encoding="utf-8"))
         module_sources = [Path(unit.c_path) for unit in plan.modules.values() if unit.c_path]
         extra_sources = [*( [plan.runtime_c] if plan.runtime_c is not None else [] ), *module_sources]
         run_native_compiler(compiler, ir_file, output_path, target=target, extra_sources=extra_sources, libs=plan.libs, link_libs=plan.link_libs, extra_args=gui_backend_args(plan.runtime_features, target))
         for dll in plan.dlls:
             shutil.copy2(dll, output_path.parent / dll.name)
+        # 与 C 后端的模块分支同理：中间产物是整个 out_dir，--discard-c 得能删掉它
+        if not keep_ir and ir_path is None:
+            shutil.rmtree(out_dir, ignore_errors=True)
         return BuildResult(ir_file, output_path, compiler)
 
     ir_file = ir_path or output_path.with_suffix(".ll")
     compile_to_native_ir(source_path, ir_file, spkgs=spkgs)
     compiler = find_native_compiler(target)
     if compiler is None:
-        raise SonCompileError("native 后端需要 clang 或 zig cc 来编译 LLVM IR")
+        raise missing_compiler_error(target, native=True)
     # native 不在 IR 里重写算法，而是链接 C 运行时。把 runtime 源码写到 IR 旁，
     # 与 .ll 一起交给 clang/zig 编译链接（clang 按扩展名分别处理 .ll 与 .c）。
     checked = check_program(parse_program(source_path.read_text(encoding="utf-8-sig")))
     runtime_c = ir_file.with_name("sa_runtime.c")
     features = runtime_features_for_program(checked.program, checked.uses)
-    runtime_c.write_text(_native_runtime_source(features), encoding="utf-8")
+    runtime_c.write_text(_native_runtime_source(features, ir_file.read_text(encoding="utf-8")), encoding="utf-8")
     link_libs = [lib.library for lib in checked.c_libs.values()] + builtin_link_libs(checked.uses, target, features)
     run_native_compiler(compiler, ir_file, output_path, target=target, extra_sources=[runtime_c], link_libs=link_libs, extra_args=gui_backend_args(features, target))
     if not keep_ir and ir_path is None:
@@ -356,16 +395,38 @@ def builtin_link_libs(uses: dict[str, str], target: str | None = None, features:
     return libs
 
 
-def _native_runtime_source(runtime_features: set[str] | None = None) -> str:
-    # RUNTIME_HEADER 含类型定义与声明，RUNTIME_SOURCE 是去掉 static 的实现，
+def _native_runtime_source(runtime_features: set[str] | None = None, ir_text: str | None = None) -> str:
+    # RUNTIME_HEADER 含类型定义与声明，实现是去掉 static 的 RUNTIME_IMPL 切片，
     # 拼成一个自包含的 .c。native IR 只 declare 用到的符号，链接时解析到这里。
+    # 根符号直接扫 IR 文本：里面每个 @sa_xxx 引用都是实打实的调用点，
+    # 比从生成器内部传 used_runtime 出来更直接，也不会漏掉运行时自己的间接依赖。
     from ..backend.c_runtime import RUNTIME_HEADER, RUNTIME_SOURCE
+    from ..backend.runtime_slicer import runtime_impl_for, runtime_symbols_in
 
     macros = {"net": "SA_ENABLE_NET", "tls": "SA_ENABLE_TLS", "file": "SA_ENABLE_FILE", "desktop": "SA_ENABLE_DESKTOP", "binary": "SA_ENABLE_BINARY", "list": "SA_ENABLE_LIST", "map": "SA_ENABLE_MAP", "gui": "SA_ENABLE_GUI"}
     features = runtime_features or set()
     lines = [f"#define {macros[feature]}" for feature in sorted(features) if feature in macros]
     prefix = "" if not lines else "\n".join(lines) + "\n"
-    return prefix + RUNTIME_HEADER + "\n" + RUNTIME_SOURCE
+    if ir_text is None:
+        impl = RUNTIME_SOURCE
+    else:
+        impl = runtime_impl_for(runtime_symbols_in(ir_text), features).replace("static ", "")
+    return prefix + RUNTIME_HEADER + "\n" + impl
+
+
+def missing_compiler_error(target: str | None, native: bool = False) -> SonCompileError:
+    """find_c_compiler/find_native_compiler 在非本机目标上只接受 zig，本机的
+    gcc/clang 会被直接忽略。这时候再报通用的「请安装 gcc、clang……」等于把用户
+    指回他已经装好的东西——装完再跑还是同一个错，得说出真正的原因。"""
+    target_name = normalize_target(target)
+    if target_name != host_target():
+        return SonCompileError(
+            f"交叉编译到 {target_name} 需要 zig（zig cc）：本机的 gcc/clang/cl 只能生成 {host_target()} 的代码。"
+            "请安装 zig（https://ziglang.org/download/）并确保 zig 在 PATH 中，或去掉 --target 编译本机目标。"
+        )
+    if native:
+        return SonCompileError("native 后端需要 clang 或 zig cc 来编译 LLVM IR")
+    return SonCompileError("未找到 C 编译器，请安装 gcc、clang、tcc、zig 或 Visual Studio cl")
 
 
 def find_c_compiler(target: str | None = None) -> str | None:
@@ -403,12 +464,13 @@ def run_native_compiler(
     link_lib_args = _link_lib_args(link_libs or [], compiler)
     rpath_args = rpath_flags(libs or [], normalize_target(target))
     passthrough = extra_args or []
+    gc_compile, gc_link = gc_section_flags(compiler, normalize_target(target))
     if compiler == "zig":
         target_args = ["-target", normalize_target(target)] if target else []
-        command = ["zig", "cc", *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path)]
+        command = ["zig", "cc", *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *gc_compile, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path)]
     else:
         target_args = ["--target", normalize_target(target)] if target else []
-        command = [compiler, *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path)]
+        command = [compiler, *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *gc_compile, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path)]
     proc = subprocess.run(command, text=True, capture_output=True)
     if proc.returncode != 0:
         output = (proc.stdout + proc.stderr).strip()
@@ -433,14 +495,16 @@ def run_c_compiler(
     include_args = [f"-I{include_dir}"] if include_dir is not None else []
     rpath_args = rpath_flags(libs or [], normalize_target(target))
     passthrough = extra_args or []
+    gc_compile, gc_link = gc_section_flags(compiler, normalize_target(target))
     if compiler == "zig":
         target_args = ["-target", normalize_target(target)] if target else []
-        command = [compiler, "cc", *target_args, *c_args, *lib_args, "-O2", "-std=c11", *include_args, *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path)]
+        command = [compiler, "cc", *target_args, *c_args, *lib_args, "-O2", "-std=c11", *gc_compile, *include_args, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path)]
     elif compiler == "cl":
         cl_include = [f"/I{include_dir}"] if include_dir is not None else []
-        command = [compiler, "/nologo", *cl_include, *c_args, *lib_args, *link_lib_args, f"/Fe:{exe_path}"]
+        # /OPT:REF 是链接器选项，必须排在 /link 之后并收尾
+        command = [compiler, "/nologo", *gc_compile, *cl_include, *c_args, *lib_args, *link_lib_args, f"/Fe:{exe_path}", *gc_link]
     else:
-        command = [compiler, *c_args, *lib_args, "-O2", "-std=c11", *include_args, *rpath_args, *link_lib_args, *passthrough, "-o", str(exe_path), "-lm"]
+        command = [compiler, *c_args, *lib_args, "-O2", "-std=c11", *gc_compile, *include_args, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path), "-lm"]
 
     proc = subprocess.run(command, text=True, capture_output=True)
     if proc.returncode != 0:
@@ -523,13 +587,44 @@ def _with_tls_dependency_hint(output: str, link_libs: list[str], target: str | N
 def _link_lib_args(link_libs: list[str], compiler: str | None = None) -> list[str]:
     args: list[str] = []
     for lib in link_libs:
-        if Path(lib).exists() or Path(lib).suffix in {".a", ".so", ".dylib", ".lib", ".dll"}:
+        validate_link_library(lib)
+        if Path(lib).exists() or Path(lib).suffix in LIBRARY_FILE_SUFFIXES:
             args.append(str(Path(lib)))
         elif compiler == "cl":
             args.append(f"{lib}.lib")
         else:
             args.append(f"-l{lib}")
     return args
+
+
+def gc_section_flags(compiler: str, target: str) -> tuple[list[str], list[str]]:
+    """让链接器丢掉没用到的函数，返回 (编译 flags, 链接 flags)。
+
+    单文件模式的 runtime 全是 static 且和用户代码同一个 TU，-O2 自己就能丢掉
+    没用的；模块模式则不然——sa_runtime.c 是独立 TU 且符号去掉了 static，
+    编译器无法证明它们没被引用，整个 .o 会被拉进 exe。这里补上的正是那一刀，
+    对退回全量注入的场景（模块来自预编译 .slib）尤其重要。
+
+    Windows 上的 MinGW 例外。实测 use_user_module 这个模块工程：全量 runtime
+    不开 gc 是 113 KB，开了反而 115 KB——ld 确实丢了 95 个节区（--print-gc-sections
+    可见），但 PE 的节区对齐开销比裁掉的还多。既然实测是负收益就不给。
+    MSVC 那边 /OPT:REF 是 release 的常规做法，且这个分支没有优化标志、
+    /Gy 不会被隐含，所以照给。
+
+    平台判断一律走 normalize_target 而不是 sys.platform：交叉编译时宿主和目标
+    不是一回事，zig cc 打 macOS 目标要 -dead_strip，用宿主平台判会给错 flag。
+    """
+    if compiler == "tcc":
+        # tcc 两个 flag 都不认，给了直接报错
+        return [], []
+    if compiler == "cl":
+        return ["/Gy", "/Gw"], ["/link", "/OPT:REF,ICF"]
+    if "windows" in target:
+        return [], []
+    if "darwin" in target or "macos" in target:
+        # Apple 的 ld64 不认 --gc-sections
+        return ["-ffunction-sections", "-fdata-sections"], ["-Wl,-dead_strip"]
+    return ["-ffunction-sections", "-fdata-sections"], ["-Wl,--gc-sections"]
 
 
 def rpath_flags(libs: list[Path], target: str) -> list[str]:

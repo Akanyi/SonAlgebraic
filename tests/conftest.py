@@ -45,6 +45,18 @@ def compile_c(source: str) -> str:
     return generate_c(check_program(parse_program(source)))
 
 
+def compile_user_c(source: str) -> str:
+    """只生成用户代码段，不注入 runtime。
+
+    数生成 C 里某个模式出现几次的测试要用这个。runtime 自己也含 `else {`、
+    `while (` 之类，而它现在是按需注入的切片，"总数减去 RUNTIME 里的数量"
+    这种老办法已经不成立了。
+    """
+    from sonalgebraic.backend.codegen import CGen
+
+    return CGen(check_program(parse_program(source)), include_runtime=False).generate()
+
+
 def expect_error(source: str, needle: str) -> None:
     """断言源码会触发包含 needle 的 SonCompileError。"""
     with pytest.raises(SonCompileError) as excinfo:

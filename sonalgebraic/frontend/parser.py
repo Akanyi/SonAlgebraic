@@ -62,10 +62,13 @@ class Parser:
         body: list[ast.Stmt] = []
 
         while not self.at_end():
-            text = self.peek().text.strip()
-            if text.upper() == ".ENDSUB":
+            upper = self.peek().text.strip().upper()
+            if upper == ".ENDSUB":
                 self.i += 1
                 return ast.Subroutine(name, params, visibility, return_type, body, header.no)
+            # SUB 不能嵌套，撞见下一个 SUB 头说明本 SUB 忘了 .ENDSUB，报头部这行才是根因
+            if _starts_word(upper, "SUB"):
+                break
             body.append(self.parse_statement())
 
         raise SonCompileError("SUB 缺少 .ENDSUB", header.no)
@@ -196,15 +199,16 @@ class Parser:
                 if not catches:
                     raise SonCompileError("TRY 至少需要一个 CATCH", line.no)
                 return ast.TryCatch(line.no, call_name, args, traceback_var, catches)
+            if _is_block_terminator(upper) and not _starts_word(upper, "CATCH"):
+                break
             catch_match = re.match(r"^CATCH\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$", current_text, re.IGNORECASE)
             if not catch_match:
                 raise SonCompileError("TRY 内只能包含 CATCH 分支", current.no)
             self.i += 1
             body: list[ast.Stmt] = []
             while not self.at_end():
-                next_text = self.peek().text.strip()
-                next_upper = next_text.upper()
-                if next_upper == ".ENDTRY" or next_upper.startswith("CATCH "):
+                next_upper = self.peek().text.strip().upper()
+                if next_upper == ".ENDTRY" or _is_block_terminator(next_upper):
                     break
                 body.append(self.parse_statement())
             catches.append(ast.CatchBranch(catch_match.group(1).upper(), catch_match.group(2), body, current.no))
@@ -261,7 +265,7 @@ class Parser:
         body: list[ast.Stmt] = []
         while not self.at_end():
             upper = self.peek().text.strip().upper()
-            if upper in {"END IF", ".ENDIF", "ELSE"} or _starts_word(upper, "ELSE IF"):
+            if _is_block_terminator(upper):
                 return body
             body.append(self.parse_statement())
         raise SonCompileError("IF 缺少 END IF 或 .ENDIF", self.lines[-1].no if self.lines else 0)
@@ -282,10 +286,11 @@ class Parser:
 
         body: list[ast.Stmt] = []
         while not self.at_end():
-            if self.peek().text.strip().upper() == ".ENDFOR":
+            upper = self.peek().text.strip().upper()
+            if upper == ".ENDFOR":
                 self.i += 1
                 return ast.ForLoop(line.no, var, start, end, step, body)
-            if self.peek().text.strip().upper() == ".ENDSUB":
+            if _is_block_terminator(upper):
                 break
             body.append(self.parse_statement())
         raise SonCompileError("FOR 缺少 .ENDFOR", line.no)
@@ -298,10 +303,11 @@ class Parser:
 
         body: list[ast.Stmt] = []
         while not self.at_end():
-            if self.peek().text.strip().upper() == ".ENDWHILE":
+            upper = self.peek().text.strip().upper()
+            if upper == ".ENDWHILE":
                 self.i += 1
                 return ast.WhileLoop(line.no, condition, body)
-            if self.peek().text.strip().upper() == ".ENDSUB":
+            if _is_block_terminator(upper):
                 break
             body.append(self.parse_statement())
         raise SonCompileError("WHILE 缺少 .ENDWHILE", line.no)
@@ -393,7 +399,9 @@ class Parser:
         )
 
     def parse_sub_header(self, line: SourceLine) -> tuple[str, list[ast.Param], str, ast.TypeSpec]:
-        match = re.match(r"^SUB\s+([A-Za-z_][A-Za-z0-9_]*)(?:\((.*)\))?(.*)$", line.text, re.IGNORECASE)
+        # 括号前允许空白：贴不贴函数名都行，否则参数表会整段掉进 suffix，
+        # 报出「未知 SUB 修饰符: (a」这种完全看不懂的错
+        match = re.match(r"^SUB\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?(.*)$", line.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("SUB 头不完整", line.no)
 
@@ -449,7 +457,12 @@ class Parser:
         match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\.INPUT\s+(.+)$", text, re.IGNORECASE)
         if not match:
             return None
-        prompt_text, target = _split_top_level_comma(match.group(2), line_no)
+        rest = match.group(2)
+        # `cfg.INPUT = "x"` 是给名叫 INPUT 的 ENTITY 字段赋值，不是 IO.INPUT 语句。
+        # 这里不让它继续往下走，否则会被当成缺参数的 IO.INPUT 报一个南辕北辙的错。
+        if rest.lstrip().startswith("="):
+            return None
+        prompt_text, target = _split_top_level_comma(rest, line_no)
         _validate_name(target.strip(), line_no)
         return ast.Input(line_no, match.group(1), parse_expr(prompt_text.strip(), line_no), target.strip())
 
@@ -505,6 +518,22 @@ class Parser:
 
 def _starts_word(text: str, word: str) -> bool:
     return text == word or text.startswith(word + " ")
+
+
+# 所有块终结符（外加 SUB 头，它同样不可能出现在块体里）。任何嵌套块的语句循环撞见
+# 不属于自己的终结符都要立刻停手且不消费，由外层块去报「缺少对应终结符」。否则终结符
+# 会被当成普通语句解析，报出来的是「无法解析的语句: .ENDFOR」这种指向无关行的级联噪音，
+# 真正的根因（某个块没闭合）反而一个字都看不到。
+_BLOCK_TERMINATORS = {".ENDSUB", ".ENDFOR", ".ENDWHILE", ".ENDIF", "END IF", "ELSE", ".ENDTRY", ".ENDENTITY", ".ENDENUM"}
+
+
+def _is_block_terminator(upper: str) -> bool:
+    return (
+        upper in _BLOCK_TERMINATORS
+        or _starts_word(upper, "ELSE IF")
+        or _starts_word(upper, "CATCH")
+        or _starts_word(upper, "SUB")
+    )
 
 
 def _validate_name(name: str, line_no: int) -> None:
