@@ -38,6 +38,7 @@ UNATTENDED_BLOCKLIST = {
     "use_io": "SYS.IO 的 INPUT 阻塞等 stdin",
     "net_tls": "要连外网，网络不通的失败跟 SDK 无关",
     "desktop": "弹系统消息框，需要人点掉",
+    "web_server": "占端口 8080 等请求，没人访问就要空转到 accept 超时",
 }
 
 # 输出里出现这些字样才算特性真的跑通了，而不只是"没崩"。

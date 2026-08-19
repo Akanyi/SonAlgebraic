@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
 import shutil
+import socket
 import subprocess
 from tempfile import TemporaryDirectory
 from threading import Thread
+import time
 
 import pytest
 
@@ -403,3 +407,108 @@ def test_native_backend_tls_stream_links() -> None:
         src = Path(temp) / "tls.sa"
         src.write_text(_TLS_SOURCE, encoding="utf-8")
         build_exe(src, Path(temp) / "tls_native.exe", keep_c=False, backend="native")
+
+
+# --- examples/web_server.sa 端到端 ----------------------------------------
+
+_WEB_SERVER_EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "web_server.sa"
+_WEB_SERVER_LISTEN = 'N.TCP_LISTEN("127.0.0.1", 8080, 16)'
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def web_server_source(port: int) -> str:
+    """把 example 里写死的 8080 换成空闲端口。
+
+    example 面向的是人——端口固定，跑起来直接用浏览器开就行。测试要的是别和本机
+    已有服务撞车，所以这里改写。断言 replace 生效，免得 example 改了写法之后测试
+    悄悄退化成「测另一个端口上的陌生服务」。
+    """
+    source = _WEB_SERVER_EXAMPLE.read_text(encoding="utf-8")
+    patched = source.replace(_WEB_SERVER_LISTEN, f'N.TCP_LISTEN("127.0.0.1", {port}, 16)')
+    assert patched != source, f"example 里找不到 `{_WEB_SERVER_LISTEN}`，端口替换失效"
+    return patched
+
+
+def _http_get(port: int, path: str) -> tuple[int, bytes]:
+    conn = HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
+def _http_get_when_ready(port: int, path: str, proc: subprocess.Popen) -> tuple[int, bytes]:
+    """重试首个请求直到 server 起来。
+
+    不能用「先探测一次连接再发请求」的写法：探测连接会被 accept 掉，server 日志里
+    就多出一条来路不明的记录，后面的输出断言全废。所以直接拿真实请求来重试。
+    """
+    deadline = time.monotonic() + 20
+    last: OSError | None = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"server 提前退出，returncode={proc.returncode}")
+        try:
+            return _http_get(port, path)
+        except OSError as exc:
+            last = exc
+            time.sleep(0.1)
+    raise AssertionError(f"20 秒内没连上 server: {last}")
+
+
+def _run_web_server_example(temp: str, backend: str) -> None:
+    port = _free_port()
+    src = Path(temp) / "web_server.sa"
+    src.write_text(web_server_source(port), encoding="utf-8")
+    exe = Path(temp) / f"web_server_{backend}.exe"
+    build_exe(src, exe, keep_c=False, backend=backend)
+
+    proc = subprocess.Popen(
+        [str(exe)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        assert _http_get_when_ready(port, "/hello", proc) == (200, b"hello from SonAlgebraic")
+        assert _http_get(port, "/") == (200, b"index: try /hello or /quit")
+        assert _http_get(port, "/nope") == (404, b"no such path")
+        # /quit 让 accept 循环收尾，进程自己退出——测试不靠 kill 也能拿到完整 stdout
+        assert _http_get(port, "/quit") == (200, b"bye")
+        stdout, stderr = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 0, stderr
+    assert stdout.splitlines() == [
+        f"listening on http://127.0.0.1:{port}",
+        "127.0.0.1 /hello",
+        "127.0.0.1 /",
+        "127.0.0.1 /nope",
+        "127.0.0.1 /quit",
+        "server stopped",
+    ]
+
+
+@requires_c_compiler
+def test_c_backend_web_server_example() -> None:
+    with net_temp("sonalgebraic-web-c-") as temp:
+        _run_web_server_example(temp, "c")
+
+
+@requires_native_compiler
+def test_native_backend_web_server_example() -> None:
+    with net_temp("sonalgebraic-web-native-") as temp:
+        _run_web_server_example(temp, "native")
+
+
+def test_web_server_example_routes_are_covered() -> None:
+    """example 增删路由时，上面那个端到端测试必须跟着改。"""
+    source = _WEB_SERVER_EXAMPLE.read_text(encoding="utf-8")
+    assert sorted(re.findall(r'IF path = "([^"]+)"', source)) == ["/", "/hello", "/quit"]
