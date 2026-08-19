@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
-from tempfile import TemporaryDirectory
 
-from conftest import compile_c, expect_error, requires_c_compiler
+from conftest import build_temp, compile_c, expect_error, requires_c_compiler
 from sonalgebraic.analysis.semantics import check_program
 from sonalgebraic.core.lines import apply_lint_source, detect_lint_options, read_numbered_lines
 from sonalgebraic.driver.compiler import build_exe
@@ -85,7 +84,7 @@ PRINT "lint ok"
 CALL main
 END
 """
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-lint-") as temp:
+    with build_temp("sonalgebraic-lint-") as temp:
         root = Path(temp)
         path = root / "lint.sa"
         path.write_text(source, encoding="utf-8")

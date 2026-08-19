@@ -523,3 +523,38 @@ def test_c_and_native_backends_agree(name: str) -> None:
     assert outputs["c"] == outputs["native"], (
         f"两个后端输出不一致\nC:\n{outputs['c']}\nnative:\n{outputs['native']}"
     )
+
+
+def test_native_backend_links_libm_for_posix_targets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """runtime 的 SYMBOL 求值调 pow/log/exp/sin/cos/tan/sqrt。
+
+    glibc 把这些放在单独的 libm 里，链接命令漏了 `-lm` 就是一串 undefined
+    reference。C 后端一直带着，native 那条曾经没有——用到 SYMBOL 的程序在 Linux
+    上根本链接不过，而本地在 Windows 上怎么跑都发现不了。
+
+    反过来 Windows 目标不能加：MSVC ABI 没有 m.lib，传了 lld-link 会直接报
+    `could not open 'm.lib'`。所以判断依据是目标平台，不是编译器。
+    """
+    from sonalgebraic.driver import compiler as driver
+
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(command, *args, **kwargs):
+        seen[str(command[0])] = [str(part) for part in command]
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+
+    ir = tmp_path / "app.ll"
+    ir.write_text("; ir\n", encoding="utf-8")
+
+    for compiler in ("clang", "zig"):
+        seen.clear()
+        driver.run_native_compiler(compiler, ir, tmp_path / "app", target="x86_64-linux-gnu")
+        command = next(iter(seen.values()))
+        assert "-lm" in command, f"{compiler} 的 POSIX 链接命令缺少 -lm: {' '.join(command)}"
+
+        seen.clear()
+        driver.run_native_compiler(compiler, ir, tmp_path / "app", target="x86_64-windows-msvc")
+        command = next(iter(seen.values()))
+        assert "-lm" not in command, f"{compiler} 不该给 Windows 目标加 -lm: {' '.join(command)}"

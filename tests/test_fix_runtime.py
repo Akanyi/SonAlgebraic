@@ -14,6 +14,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 
 import pytest
 
@@ -31,6 +32,9 @@ HAS_ZIG = shutil.which("zig") is not None
 
 requires_gcc = pytest.mark.skipif(not HAS_GCC, reason="需要 MinGW gcc 才能实际编译运行 runtime")
 requires_zig = pytest.mark.skipif(not HAS_ZIG, reason="需要 zig 才能交叉编译到 POSIX 目标")
+requires_windows = pytest.mark.skipif(
+    sys.platform != "win32", reason="只在 Windows 上有意义（探针调 Win32 API）"
+)
 
 # 打开所有可选模块，保证每条 #ifdef 分支都被编译器看到
 ALL_FEATURES = (
@@ -246,6 +250,7 @@ int main(int argc, char** argv) {
 
 
 @requires_gcc
+@requires_windows  # 探针直接调 Win32 的 MSG/PeekMessageW 和只在 Win32 分支定义的 GUI 符号
 def test_runtime_behaviour_on_host() -> None:
     with work_dir("sa-rt-") as temp:
         root = Path(temp)
@@ -306,6 +311,7 @@ int main(void) {
 
 
 @requires_gcc
+@requires_windows  # 同上：GUI 探针是 Win32 专属的
 def test_closing_window_invalidates_its_widget_handles() -> None:
     """关窗后控件句柄必须失效，否则 HWND 被系统复用时 SET_TEXT 会打到别人窗口上。"""
     with work_dir("sa-gui-") as temp:

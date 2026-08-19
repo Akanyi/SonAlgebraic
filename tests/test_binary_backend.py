@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
-from tempfile import TemporaryDirectory
 
-from conftest import compile_c, expect_error, requires_c_compiler, requires_native_compiler
+from conftest import build_temp, compile_c, expect_error, requires_c_compiler, requires_native_compiler
 from sonalgebraic.analysis.semantics import check_program
 from sonalgebraic.backend.native import generate_native_llvm_ir
 from sonalgebraic.driver.compiler import build_exe
@@ -115,11 +114,11 @@ def _run_binary_program(temp: str, backend: str) -> list[str]:
 
 @requires_c_compiler
 def test_c_backend_binary_packet_roundtrip() -> None:
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-binary-c-") as temp:
+    with build_temp("sonalgebraic-binary-c-") as temp:
         assert _run_binary_program(temp, "c") == _EXPECTED
 
 
 @requires_native_compiler
 def test_native_backend_binary_packet_roundtrip() -> None:
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-binary-native-") as temp:
+    with build_temp("sonalgebraic-binary-native-") as temp:
         assert _run_binary_program(temp, "native") == _EXPECTED

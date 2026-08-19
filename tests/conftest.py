@@ -39,6 +39,11 @@ requires_gcc = pytest.mark.skipif(
 requires_native_compiler = pytest.mark.skipif(
     not HAS_NATIVE_COMPILER, reason="未找到 clang 或 zig（native 后端需要 LLVM IR 编译工具）"
 )
+# 断言 Windows 独有产物（import lib、DLL）或直接调 Win32 API 的测试用这个。
+# 不是"暂时没在别的平台验证"，是那些东西在别的平台压根不存在。
+requires_windows = pytest.mark.skipif(
+    sys.platform != "win32", reason="只在 Windows 上有意义（import lib / DLL / Win32 API）"
+)
 
 
 def build_temp(prefix: str, subdir: str = "native-tests") -> TemporaryDirectory[str]:

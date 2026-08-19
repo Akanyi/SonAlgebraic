@@ -248,6 +248,19 @@ def read_slib_root_source_for_check(slib_path: Path) -> str:
     raise SonCompileError(f".slib 缺少根模块源码: {slib_path}")
 
 
+def module_project_dir(output_path: Path, intermediate_path: Path | None) -> Path:
+    """带用户模块时，生成的 C / IR 项目落在哪个目录。
+
+    目录名带 `-c` 后缀而不是直接用 `output_path.stem`：Windows 上 `-o out/app.exe`
+    的 stem 是 `app`，和可执行文件不冲突；但在可执行文件不带扩展名的平台上
+    `-o out/app` 的 stem 也是 `app`，项目目录就和 exe 抢同一个路径——目录先建好，
+    链接器再去写同名文件，报的是 `cannot open output file ...: Is a directory`。
+    等于 Linux/macOS 上任何带用户模块的构建都不能用。
+    """
+    parent = intermediate_path.parent if intermediate_path is not None else output_path.parent
+    return parent / f"{output_path.stem}-c"
+
+
 def build_exe(
     source_path: Path,
     output_path: Path,
@@ -262,7 +275,7 @@ def build_exe(
     if backend != "c":
         raise SonCompileError(f"未知后端: {backend}")
     if source_has_user_modules(source_path):
-        out_dir = (c_path.parent if c_path is not None else output_path.parent) / output_path.stem
+        out_dir = module_project_dir(output_path, c_path)
         plan = compile_project(source_path, out_dir, target, spkgs=spkgs)
         compiler = find_c_compiler(target)
         if compiler is None:
@@ -302,7 +315,7 @@ def build_native_exe(
     spkgs: list[Path] | None = None,
 ) -> BuildResult:
     if source_has_user_modules(source_path):
-        out_dir = (ir_path.parent if ir_path is not None else output_path.parent) / output_path.stem
+        out_dir = module_project_dir(output_path, ir_path)
         plan = compile_project(source_path, out_dir, target, spkgs=spkgs)
         ir_file = ir_path or out_dir / source_path.with_suffix(".ll").name
         compile_main_to_native_ir_with_modules(source_path, ir_file, plan)
@@ -466,12 +479,18 @@ def run_native_compiler(
     rpath_args = rpath_flags(libs or [], normalize_target(target))
     passthrough = extra_args or []
     gc_compile, gc_link = gc_section_flags(compiler, normalize_target(target))
+    # runtime 的 SYMBOL 求值和化简会调 pow/log/exp/sin/cos/tan/sqrt。glibc 把它们放在
+    # 单独的 libm 里，不显式链接就是一串 undefined reference——C 后端一直带着 -lm，
+    # native 这条漏了，于是任何用到 SYMBOL 的程序在 Linux 上都链接不过。
+    # 只对非 Windows 目标加：MSVC ABI 的 CRT 自带数学函数，压根没有 m.lib，
+    # 给 clang 传 -lm 会让 lld-link 直接报 "could not open 'm.lib'"。
+    math_lib = [] if "windows" in normalize_target(target) else ["-lm"]
     if compiler == "zig":
         target_args = ["-target", normalize_target(target)] if target else []
-        command = ["zig", "cc", *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *gc_compile, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path)]
+        command = ["zig", "cc", *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *gc_compile, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path), *math_lib]
     else:
         target_args = ["--target", normalize_target(target)] if target else []
-        command = [compiler, *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *gc_compile, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path)]
+        command = [compiler, *target_args, *sources, *lib_args, "-O2", "-D_CRT_SECURE_NO_WARNINGS", *gc_compile, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path), *math_lib]
     proc = subprocess.run(command, text=True, capture_output=True)
     if proc.returncode != 0:
         output = (proc.stdout + proc.stderr).strip()

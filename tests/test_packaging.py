@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from conftest import requires_gcc
+from conftest import requires_gcc, requires_windows
 from sonalgebraic.core.errors import SonCompileError
 from sonalgebraic.driver.compiler import check_source, compile_to_c
 from sonalgebraic.frontend.parser import parse_program
@@ -69,6 +69,7 @@ def test_binary_slib_loads_static_library_for_target() -> None:
 
 
 @requires_gcc
+@requires_windows  # 断言产物里有 .dll 和 import lib，POSIX 上是 .so 且没有后者
 def test_dynamic_slib_loads_dll_and_import_lib() -> None:
     with TemporaryDirectory(prefix="sonalgebraic-test-") as temp:
         temp_dir = Path(temp)

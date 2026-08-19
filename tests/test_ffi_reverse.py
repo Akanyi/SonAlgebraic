@@ -14,11 +14,13 @@ import subprocess
 
 import pytest
 
-from conftest import requires_gcc
+from conftest import requires_gcc, requires_windows
 from sonalgebraic.backend.c_runtime import RUNTIME_HEADER
 from sonalgebraic.packaging.slib import build_slib
 
-pytestmark = [pytest.mark.ffi, requires_gcc]
+# 整个文件断言的是 Windows 的反向 FFI 产物：manifest 里的 import_lib、随 exe
+# 落地的 .dll。POSIX 的动态库没有 import lib 这个概念，测不了同一件事。
+pytestmark = [pytest.mark.ffi, requires_gcc, requires_windows]
 
 FFI_DIR = Path(__file__).resolve().parent / "ffi_c"
 

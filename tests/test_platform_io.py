@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
-from tempfile import TemporaryDirectory
 
-from conftest import compile_c, expect_error, requires_c_compiler, requires_native_compiler
+from conftest import build_temp, compile_c, expect_error, requires_c_compiler, requires_native_compiler
 from sonalgebraic.backend.native import generate_native_llvm_ir
 from sonalgebraic.driver.compiler import build_exe
 from sonalgebraic.frontend.parser import parse_program
@@ -119,13 +118,13 @@ _FILE_EXPECTED = [
 
 @requires_c_compiler
 def test_c_backend_file_module_roundtrip() -> None:
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-file-c-") as temp:
+    with build_temp("sonalgebraic-file-c-") as temp:
         assert _run_file_program(temp, "c") == _FILE_EXPECTED
 
 
 @requires_native_compiler
 def test_native_backend_file_module_roundtrip() -> None:
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-file-native-") as temp:
+    with build_temp("sonalgebraic-file-native-") as temp:
         assert _run_file_program(temp, "native") == _FILE_EXPECTED
 
 
@@ -162,7 +161,7 @@ def test_desktop_module_links_without_running() -> None:
 60 CALL main
 70 END
 '''
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-desktop-link-") as temp:
+    with build_temp("sonalgebraic-desktop-link-") as temp:
         root = Path(temp)
         source_path = root / "desktop.sa"
         source_path.write_text(source, encoding="utf-8")
@@ -179,7 +178,7 @@ def test_native_desktop_module_links_without_running() -> None:
 60 CALL main
 70 END
 '''
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-desktop-native-link-") as temp:
+    with build_temp("sonalgebraic-desktop-native-link-") as temp:
         root = Path(temp)
         source_path = root / "desktop.sa"
         source_path.write_text(source, encoding="utf-8")
@@ -200,7 +199,7 @@ def test_user_module_propagates_file_runtime_feature() -> None:
 60 CALL main
 70 END
 '''
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-file-module-") as temp:
+    with build_temp("sonalgebraic-file-module-") as temp:
         root = Path(temp)
         (root / "filelib.sa").write_text(module_source, encoding="utf-8")
         main = root / "main.sa"
@@ -224,7 +223,7 @@ def test_source_slib_preserves_file_runtime_feature() -> None:
 60 CALL main
 70 END
 '''
-    with TemporaryDirectory(dir=Path("build"), prefix="sonalgebraic-file-slib-") as temp:
+    with build_temp("sonalgebraic-file-slib-") as temp:
         root = Path(temp)
         module = root / "filelib.sa"
         module.write_text(module_source, encoding="utf-8")

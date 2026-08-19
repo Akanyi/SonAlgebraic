@@ -216,7 +216,7 @@ def test_discard_c_removes_the_generated_project_directory(tmp_path: Path) -> No
 
     assert cli_main(["build", str(app), "-o", str(exe), "--discard-c"]) == 0
     assert exe.is_file()
-    assert not (exe.parent / "app").exists()
+    assert not (exe.parent / "app-c").exists()
     assert list(exe.parent.rglob("*.c")) == []
     assert subprocess.run([str(exe)], capture_output=True, text=True).stdout.strip() == "n=5"
 
@@ -227,7 +227,28 @@ def test_build_keeps_the_project_directory_by_default(tmp_path: Path) -> None:
     exe = tmp_path / "out" / f"app{exe_suffix()}"
 
     assert cli_main(["build", str(app), "-o", str(exe)]) == 0
-    assert (exe.parent / "app" / "app.c").is_file()
+    assert (exe.parent / "app-c" / "app.c").is_file()
+
+
+def test_module_project_dir_does_not_collide_with_a_suffixless_exe(tmp_path: Path) -> None:
+    """项目目录曾经直接取 output 的 stem，和不带扩展名的 exe 抢同一个路径。
+
+    Windows 上看不出来：`-o out/app.exe` 的 stem 是 `app`，本来就不撞；就算写
+    `-o out/app`，MinGW 的 ld 也会自己补成 `app.exe`。而 Linux/macOS 的 exe 没有
+    扩展名，目录先建好、链接器再去写同名文件，报 `cannot open output file
+    ...: Is a directory`——带用户模块的构建全废。
+
+    所以这里断言的是路径推导本身，不依赖本机是什么平台、有没有 C 编译器。
+    """
+    from sonalgebraic.driver.compiler import module_project_dir
+
+    for name in ("app", "app.exe"):
+        output = tmp_path / "out" / name
+        assert module_project_dir(output, None) != output
+
+    # 中间产物指定到别处时，项目目录跟着走，同样不能和 exe 同名
+    output = tmp_path / "out" / "app"
+    assert module_project_dir(output, tmp_path / "gen" / "app.c") == tmp_path / "gen" / "app-c"
 
 
 # --------------------------------------------------------------------------
@@ -285,9 +306,15 @@ def test_cross_compile_error_names_zig_instead_of_already_installed_gcc() -> Non
 
 @pytest.mark.skipif(shutil.which("zig") is not None, reason="装了 zig 就不会走到这条报错")
 def test_cross_compile_without_zig_reports_the_real_reason(tmp_path: Path) -> None:
+    from sonalgebraic.packaging.toolchain import host_target
+
+    # 目标得对当前平台确定是"交叉"。写死 x86_64-linux-gnu 的话，在 Linux 上它就是
+    # 本机 target，gcc 直接编译成功，这条断言永远等不到那句报错。
+    cross = "x86_64-windows-gnu" if "windows" not in host_target() else "x86_64-linux-gnu"
+
     source = tmp_path / "hello.sa"
     source.write_text("10 SUB main AS PUBLIC AS VOID\n20 PRINT 1\n30 .ENDSUB\n40 CALL main\n50 END\n", encoding="utf-8")
-    code, _, err = _run_cli("build", str(source), "-o", str(tmp_path / "hello"), "--target", "x86_64-linux-gnu")
+    code, _, err = _run_cli("build", str(source), "-o", str(tmp_path / "hello"), "--target", cross)
     assert code == 1
     assert "zig" in err
 
