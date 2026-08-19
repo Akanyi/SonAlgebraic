@@ -101,6 +101,23 @@ def test_cast_to_entity_pointer_compiles() -> None:
     assert "SaEntity_hero* sa_back" in compile_c(source)
 
 
+# --- 表达式里的 CALL ------------------------------------------------------
+
+
+def test_call_inside_expression_reports_actionable_error() -> None:
+    with pytest.raises(SonCompileError) as excinfo:
+        parse_expr("CAST CPTR (CALL CSTD.calloc(8, 8))", 10)
+    assert "CALL" in excinfo.value.message
+    assert "CSTD.calloc(...)" in excinfo.value.message
+
+
+def test_call_as_whole_assign_rhs_still_parses() -> None:
+    source = _wrap("20 DIM p AS CPTR AS VAR\n30 p = CALL make()\n")
+    stmt = parse_program(source).subs[0].body[1]
+    assert isinstance(stmt, ast.Assign)
+    assert isinstance(stmt.expr, ast.CallExpr) and stmt.expr.name == "make"
+
+
 # --- INPUT 字段赋值 -------------------------------------------------------
 
 

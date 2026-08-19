@@ -102,6 +102,11 @@ class ExprParser:
             if word == "CAST":
                 type_spec = self.parse_cast_type()
                 return ast.Cast(self.line_no, type_spec, self.parse(_PREFIX_PREC))
+            # CALL 是语句级关键字，表达式层压根不认识它，会把它读成变量 `CALL` 然后在
+            # 后面那个函数名上撞出「表达式缺少 `)`」之类指向无关位置的诊断。这里提前
+            # 拦下 `CALL 名字` 这个形态，把用户真正要改的地方说清楚。
+            if word == "CALL" and self.tokens[self.i].kind == "IDENT":
+                self.reject_nested_call(self.tokens[self.i].value)
             if self.match_op("("):
                 args = self.parse_args()
                 return ast.CallExpr(self.line_no, token.value, args)
@@ -118,6 +123,13 @@ class ExprParser:
             return expr
 
         raise SonCompileError("表达式不完整或语法错误", self.line_no)
+
+    def reject_nested_call(self, callee: str) -> None:
+        raise SonCompileError(
+            f"`CALL` 不能出现在表达式中间；这里直接写 `{callee}(...)` 即可。"
+            f"CALL 只能作为独立语句，或者整条赋值的右侧（`x = CALL {callee}(...)`）",
+            self.line_no,
+        )
 
     def parse_cast_type(self) -> ast.TypeSpec:
         from .parser import _parse_type_parts
