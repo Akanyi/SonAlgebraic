@@ -1,31 +1,74 @@
 # SADK 安装包
 
 把 SonAlgebraic 打成 Windows 上双击就能装的 `SADK-Setup-<版本>.exe`：编译器冻结成不依赖
-Python 的 `sonc.exe`，配上文档、示例、VSCode 扩展，C 工具链按需在线补齐。
+Python 的 `sonc.exe`，配上文档、示例、VSCode 扩展，以及 C 工具链。
+
+## 两种形态
+
+| 产物 | 大小 | zig 从哪来 |
+| --- | --- | --- |
+| `SADK-Setup-<版本>.exe` | 约 17 MB | 安装向导里下载（x64 约 93 MB / ARM64 约 89 MB） |
+| `SADK-Setup-<版本>-with-zig.exe` | 约 72 MB | x64 的已在包内，装完即可 `sonc build`；ARM64 仍回退到在线下载 |
+
+离线版只内置 x64：为一个小众架构给每一份包再塞 90 MB 不值得。两种包装完的
+`toolchain/` 布局完全一样，`sonc doctor` 看不出区别。
 
 ## 构建
 
 ```powershell
-python installer/build_installer.py
+python installer/build_installer.py               # 在线版
+python installer/build_installer.py --bundle-zig  # 离线版
 ```
 
-产物落在 `build/installer/SADK-Setup-<版本>.exe`，约 17 MB。
+产物落在 `build/installer/`。
 
 需要两样东西：
 
 - `pip install pyinstaller`
 - `winget install --id JRSoftware.InnoSetup`（构建脚本会自己找 ISCC.exe，winget 和官网两种安装位置都认）
 
-只改了 `.iss` 想快速重打包时加 `--skip-freeze`，跳过几十秒的 PyInstaller 冻结。
+只改了 `.iss` 想快速重打包时加 `--skip-freeze`，跳过几十秒的 PyInstaller 冻结。两种形态
+连着出的话，第二次加上它就能复用同一份冻结产物：
+
+```powershell
+python installer/build_installer.py
+python installer/build_installer.py --skip-freeze --bundle-zig
+```
+
+`--bundle-zig` 会先下载 zig 官方 zip 到 `build/zig-cache/`（校验 SHA-256，命中缓存就复用），
+再解压到 `build/zig-extract/`。分成两个目录是为了 CI：缓存只需要背那份 93 MB 的 zip，
+解压出来的 380 MB 目录树每次重新展开就好。
+
+> 为什么不把 zip 直接塞进安装包让它自己解压？Inno 的 `extractarchive` 标志只能配
+> `external` 用——它解压的是安装时下载的东西，没法展开包内的归档。所以离线版必须在
+> 构建时就解压好，按目录树交给 `[Files]`。顺带让 Inno 的 lzma2 接手压缩，比原样塞一个
+> deflate 的 zip 更省，93 MB 的 zig 进包后只占约 55 MB。
+
+### 升级 zig 版本
+
+URL、SHA-256 和字节数都在 `sadk.iss` 顶部的 `#define` 里，**那是单一来源**——
+`build_installer.py` 的 `--bundle-zig` 也从那里读。改的时候三行一起改，别在别处抄第二份：
+抄了就会出现在线版和离线版拿到不同编译器，而且不到安装那一刻发现不了。
+
+摘要对不上时，在线版由 Inno 中止安装，离线版由构建脚本中止打包。两边都是宁可失败，
+也不把来路不明的编译器塞给用户。
+
+## CI
+
+`.github/workflows/installer.yml` 在 Windows runner 上把两种形态都构一遍：
+
+- push / PR：产物作为 artifact 上传
+- 打 `v*` tag：额外传到 GitHub Release
+- zig 归档用 `actions/cache` 缓存，缓存键是 `sadk.iss` 的哈希，所以升级 zig 会自然让键失效
 
 ## 文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `build_installer.py` | 入口：生成图标 → PyInstaller 冻结 → ISCC 打包，版本号从 `sonalgebraic/__init__.py` 读 |
+| `build_installer.py` | 入口：生成图标 →（可选下载解压 zig）→ PyInstaller 冻结 → ISCC 打包，版本号从 `sonalgebraic/__init__.py` 读 |
 | `smoke.py` | super smoke：装一遍 → 全面验证 → 卸一遍 |
 | `sonc.spec` | PyInstaller 配置，onedir 模式 |
-| `sadk.iss` | Inno Setup 脚本：组件、任务、PATH、文件关联、zig 下载 |
+| `sadk.iss` | Inno Setup 脚本：组件、任务、PATH、文件关联、zig 来源（在线/内置双模式） |
 | `sadk-env.cmd` | 开始菜单里「SADK 命令提示符」的启动脚本 |
 | `make_icon.py` | 用标准库生成 `assets/sadk.ico`，不引 Pillow |
 | `languages/` | 简体中文语言文件，见该目录下的 README |

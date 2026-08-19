@@ -57,12 +57,13 @@ python -m sonalgebraic run examples/allexample.sa
 Windows 上可以装 SADK 安装包，目标机器不需要 Python 环境。构建：
 
 ```powershell
-python installer/build_installer.py
+python installer/build_installer.py               # 在线版，约 17 MB
+python installer/build_installer.py --bundle-zig  # 离线版，约 72 MB，自带 x64 Zig
 ```
 
-产物是 `build/installer/SADK-Setup-<版本>.exe`，约 17 MB，包含冻结后的 `sonc.exe`、文档、示例和 VSCode 语法高亮扩展。向导里可以选：加入 PATH、关联 `.sa` 文件和右键菜单、把扩展装进 VSCode 用户扩展目录。
+产物在 `build/installer/`，包含冻结后的 `sonc.exe`、文档、示例和 VSCode 语法高亮扩展。向导里可以选：加入 PATH、关联 `.sa` 文件和右键菜单、把扩展装进 VSCode 用户扩展目录。
 
-`sonc build` / `run` 需要一个 C 编译器，所以向导还提供「下载并安装 Zig C 工具链」（约 92 MB，官方源 + SHA-256 校验）。进入任务页时会先扫一遍 PATH：本机已经有 gcc / clang / zig 就默认不勾，没有才自动勾上。装进 `SADK\toolchain\` 的 zig 不写系统环境变量也能被 `sonc` 找到。
+`sonc build` / `run` 需要一个 C 编译器。**在线版**在向导里提供「下载并安装 Zig C 工具链」（约 92 MB，官方源 + SHA-256 校验），进入任务页时会先扫一遍 PATH：本机已经有 gcc / clang / zig 就默认不勾，没有才自动勾上。**离线版**把 x64 的 Zig 直接打进了安装包，装的时候不联网，任务默认勾选（ARM64 机器上仍回退到在线下载）。两种包装进 `SADK\toolchain\` 的 zig 不写系统环境变量也能被 `sonc` 找到。
 
 装完确认一下：
 
@@ -70,7 +71,7 @@ python installer/build_installer.py
 sonc doctor
 ```
 
-构建细节和设计取舍见 [installer/README.md](./installer/README.md)。
+构建细节和设计取舍见 [installer/README.md](./installer/README.md)。CI 会在每次 push 时构出两种安装包，打 `v*` tag 时传到 Release。
 
 ## 特性概览
 

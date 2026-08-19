@@ -1,8 +1,9 @@
 """SADK 安装包的 super smoke：从 exe 装起，把整套 SDK 过一遍，再卸干净。
 
-    python installer/smoke.py                # 用 build/installer 里现成的包
+    python installer/smoke.py                # 用 build/installer 里现成的在线版
     python installer/smoke.py --build        # 先构建再测
     python installer/smoke.py --with-zig     # 连 zig 在线下载一起测（多下 ~93 MB）
+    python installer/smoke.py --bundled      # 测内置 zig 的离线包，不走网络
     python installer/smoke.py --integration  # 连 PATH / 文件关联一起测（会动注册表，测完校验恢复）
 
 和 pytest 那套的分工：那边测的是编译器逻辑，跑的是仓库里的 Python 源码；这边测的是
@@ -191,11 +192,23 @@ def isolated_path_env() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def find_setup() -> Path:
-    candidates = list((PROJECT_ROOT / "build" / "installer").glob("SADK-Setup-*.exe"))
+def find_setup(bundled: bool = False) -> Path:
+    """挑一个安装包。bundled=True 时只认内置 zig 的那个。
+
+    两种形态共存时不能只按 mtime 取最新——刚构完离线版再跑一次 smoke，测的就悄悄
+    从在线版换成了离线版。想测哪个要么用 --bundled 说清楚，要么用 --setup 直接给路径。
+    """
+    pattern = "SADK-Setup-*-with-zig.exe" if bundled else "SADK-Setup-*.exe"
+    candidates = list((PROJECT_ROOT / "build" / "installer").glob(pattern))
+    if not bundled:
+        # 默认要的是在线版，把离线版排掉，否则两者都命中
+        candidates = [p for p in candidates if not p.stem.endswith("-with-zig")]
     if not candidates:
+        which = "内置 zig 的安装包" if bundled else "安装包"
+        extra = " --bundle-zig" if bundled else ""
         raise SystemExit(
-            "找不到安装包。先跑 python installer/build_installer.py，或给 smoke.py 加 --build。"
+            f"找不到{which}。先跑 python installer/build_installer.py{extra}，"
+            "或给 smoke.py 加 --build。"
         )
     # 按文件名排会让 0.10.0 排在 0.9.0 前面，取最近构建的那个更符合直觉
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -589,9 +602,14 @@ def main() -> int:
     force_utf8_output()
 
     parser = argparse.ArgumentParser(description="SADK 安装包 super smoke")
-    parser.add_argument("--setup", type=Path, help="指定安装包路径，默认取 build/installer 里最新的")
+    parser.add_argument("--setup", type=Path, help="指定安装包路径，默认取 build/installer 里最新的在线版")
     parser.add_argument("--build", action="store_true", help="先跑 build_installer.py 再测")
-    parser.add_argument("--with-zig", action="store_true", help="连 zig 在线下载一起测（多下约 93 MB）")
+    parser.add_argument(
+        "--bundled",
+        action="store_true",
+        help="测内置 zig 的离线包（-with-zig）；隐含 --with-zig，因为那个包本来就该装上工具链",
+    )
+    parser.add_argument("--with-zig", action="store_true", help="勾选 zig 任务：在线版会下载约 93 MB，离线包直接用内置的")
     parser.add_argument("--integration", action="store_true", help="连 PATH / 文件关联一起测（会动注册表，测完校验恢复）")
     parser.add_argument("--keep", action="store_true", help="跑完不卸载，留着人工检查")
     args = parser.parse_args()
@@ -601,13 +619,18 @@ def main() -> int:
 
     if args.build:
         section("构建安装包")
-        result = subprocess.run([sys.executable, str(INSTALLER_DIR / "build_installer.py")], cwd=PROJECT_ROOT)
+        command = [sys.executable, str(INSTALLER_DIR / "build_installer.py")]
+        if args.bundled:
+            command.append("--bundle-zig")
+        result = subprocess.run(command, cwd=PROJECT_ROOT)
         if result.returncode != 0:
             raise SystemExit("构建失败，smoke 中止")
 
-    setup = args.setup or find_setup()
+    setup = args.setup or find_setup(bundled=args.bundled)
+    # 离线包的全部意义就是装完自带工具链，不勾 zig 等于什么都没验
+    want_zig = args.with_zig or args.bundled
     tasks = ",".join(
-        (["zig"] if args.with_zig else []) + (["addtopath", "assoc"] if args.integration else [])
+        (["zig"] if want_zig else []) + (["addtopath", "assoc"] if args.integration else [])
     )
 
     print(f"安装包: {setup}  ({setup.stat().st_size / 1048576:.1f} MB)")

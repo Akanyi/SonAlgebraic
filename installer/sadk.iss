@@ -2,6 +2,14 @@
 ;
 ; 用 installer/build_installer.py 构建——它会先跑 PyInstaller 产出 sonc.exe，
 ; 再把版本号通过 /D 传进来。直接用 ISCC 编译这个文件会因为缺 SadkVersion 而失败。
+;
+; 两种形态由 BundleZigDir 决定：
+;   不定义                                   → 在线版（约 17 MB），zig 在安装时下载
+;   /DBundleZigDir=<解压好的 zig 目录>
+;   /DBundleZigName=<该目录的名字>            → 离线版（约 72 MB），zig 已在包内
+; 走 --bundle-zig 时由构建脚本负责下载、校验摘要和解压，这里只管把目录树塞进去。
+; 之所以要传解压后的目录而不是 zip：Inno 的 extractarchive 标志只能配 external 用，
+; 它解压的是安装时下载的东西，没法展开包内的归档。
 
 #ifndef SadkVersion
   #error 请通过 build_installer.py 构建，或手动传入 /DSadkVersion=x.y.z
@@ -15,6 +23,8 @@
 
 ; zig 官方发布的 Windows 构建。版本升级时这三行要一起改——hash 对不上安装器会
 ; 直接报错中止，这正是想要的：宁可装不上，也不能把来路不明的编译器塞进用户机器。
+; build_installer.py 的 --bundle-zig 也从这里读 URL/hash/size，所以这是单一来源，
+; 不要在别处抄第二份。
 #define ZigVersion "0.16.0"
 #define ZigUrlX64 "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip"
 #define ZigHashX64 "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"
@@ -37,7 +47,11 @@ DefaultGroupName={#SadkName}
 UninstallDisplayName={#SadkName} {#SadkVersion}
 UninstallDisplayIcon={app}\bin\sonc.exe
 OutputDir={#SourceRoot}\build\installer
+#ifdef BundleZigDir
+OutputBaseFilename=SADK-Setup-{#SadkVersion}-with-zig
+#else
 OutputBaseFilename=SADK-Setup-{#SadkVersion}
+#endif
 SetupIconFile=assets\sadk.ico
 WizardStyle=modern
 Compression=lzma2/max
@@ -72,7 +86,12 @@ Name: "vscode"; Description: "VSCode 语法高亮扩展"; Types: full
 [Tasks]
 Name: "addtopath"; Description: "把 sonc 加入 PATH 环境变量"; GroupDescription: "系统集成:"
 Name: "assoc"; Description: "关联 .sa 文件并添加右键菜单"; GroupDescription: "系统集成:"
+#ifdef BundleZigDir
+; 离线版里 zig 已经在包内，装它不产生任何额外下载，所以默认勾上。
+Name: "zig"; Description: "安装内置的 Zig C 工具链（已包含在安装包中，sonc build / run 必需）"; GroupDescription: "C 工具链:"
+#else
 Name: "zig"; Description: "下载并安装 Zig C 工具链（约 {#(ZigSizeX64 + 1048575) / 1048576} MB，sonc build / run 必需）"; GroupDescription: "C 工具链:"; Flags: unchecked
+#endif
 Name: "vscodeext"; Description: "安装到 VSCode 用户扩展目录"; GroupDescription: "编辑器:"; Components: vscode; Check: VSCodeExtensionsDirExists
 
 [Files]
@@ -91,12 +110,26 @@ Source: "{#SourceRoot}\editors\vscode\sonalgebraic\*"; DestDir: "{code:VSCodeExt
 ; download 标志走的是安装器内建流程，两种模式行为一致，还自带进度和 SHA-256 校验。
 ; 解压出来的目录名带版本号（zig-x86_64-windows-0.16.0），不做重命名——sdk_env.py 的
 ; 工具链探测本来就认这种目录名，而重命名会让卸载日志里的路径对不上，留下删不掉的残留。
+#ifdef BundleZigDir
+; 离线版：x64 的 zig 已在包内（构建时下载、校验摘要、解压好），这里不走网络。
+; DestDir 用和在线版解压出来完全一样的目录名，两种包装完的 toolchain/ 布局才一致，
+; sdk_env.py 的工具链探测也就不用区分对待。
+; ARM64 机器上没有内置副本可用，仍旧回退到在线下载——为一个小众架构再往每一份
+; 安装包里塞 90MB 不值得。
+Source: "{#BundleZigDir}\*"; DestDir: "{app}\toolchain\{#BundleZigName}"; \
+  Tasks: zig; Check: not IsArm64; \
+  Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#ZigUrlArm64}"; DestName: "zig-toolchain.zip"; DestDir: "{app}\toolchain"; \
+  Hash: "{#ZigHashArm64}"; ExternalSize: {#ZigSizeArm64}; Tasks: zig; Check: IsArm64; \
+  Flags: external download extractarchive recursesubdirs createallsubdirs ignoreversion
+#else
 Source: "{#ZigUrlX64}"; DestName: "zig-toolchain.zip"; DestDir: "{app}\toolchain"; \
   Hash: "{#ZigHashX64}"; ExternalSize: {#ZigSizeX64}; Tasks: zig; Check: not IsArm64; \
   Flags: external download extractarchive recursesubdirs createallsubdirs ignoreversion
 Source: "{#ZigUrlArm64}"; DestName: "zig-toolchain.zip"; DestDir: "{app}\toolchain"; \
   Hash: "{#ZigHashArm64}"; ExternalSize: {#ZigSizeArm64}; Tasks: zig; Check: IsArm64; \
   Flags: external download extractarchive recursesubdirs createallsubdirs ignoreversion
+#endif
 
 [Icons]
 Name: "{group}\SADK 命令提示符"; Filename: "{cmd}"; Parameters: "/k ""{app}\bin\sadk-env.cmd"""; WorkingDir: "{userdocs}"; IconFilename: "{app}\bin\sonc.exe"
@@ -136,8 +169,11 @@ Root: HKA; Subkey: "Software\Classes\SonAlgebraic.Source\shell\soncrun\command";
 Type: filesandordirs; Name: "{app}\toolchain"
 
 [Code]
+#ifndef BundleZigDir
+{ 只有在线版需要它：离线版的 zig 任务默认就勾着，没有"替用户勾一次"这回事。 }
 var
   TaskDefaultsApplied: Boolean;
+#endif
 
 function VSCodeExtensionsDir: String;
 begin
@@ -154,8 +190,10 @@ begin
   Result := AddBackslash(VSCodeExtensionsDir) + 'sonalgebraic-{#SadkVersion}';
 end;
 
+#ifndef BundleZigDir
 { 本机已经有能用的 C 编译器时就别劝人再下 93MB。FileSearch 直接扫 PATH，
-  比 Exec 一个 where.exe 轻，也不会闪黑框。 }
+  比 Exec 一个 where.exe 轻，也不会闪黑框。
+  离线版用不上：zig 就在包内，装不装跟本机有没有编译器无关。 }
 function HostCompilerFound: Boolean;
 begin
   Result := (FileSearch('zig.exe', GetEnv('PATH')) <> '') or
@@ -163,6 +201,7 @@ begin
             (FileSearch('clang.exe', GetEnv('PATH')) <> '') or
             (FileSearch('cl.exe', GetEnv('PATH')) <> '');
 end;
+#endif
 
 function PathContains(const RootKey: Integer; const SubKey, Dir: String): Boolean;
 var
@@ -187,6 +226,7 @@ begin
   Result := (not IsAdminInstallMode) and not PathContains(HKEY_CURRENT_USER, 'Environment', Dir);
 end;
 
+#ifndef BundleZigDir
 procedure CurPageChanged(CurPageID: Integer);
 var
   Selected: String;
@@ -203,6 +243,7 @@ begin
     end;
   end;
 end;
+#endif
 
 // 卸载时把自己加的那段从 PATH 摘掉。Inno 能回滚它写过的注册表值，但这里的 PATH 是
 // "旧值;新目录" 这种拼接写入，整体回滚会把用户在这期间加的其它路径一起抹掉，
