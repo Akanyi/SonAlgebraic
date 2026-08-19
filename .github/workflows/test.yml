@@ -22,6 +22,7 @@ jobs:
   unit:
     name: unit (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +47,9 @@ jobs:
   full:
     name: full (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # 这里会真编译真运行被测程序，卡住的可能是程序而不是测试代码。
+    # 平台默认上限是 6 小时，不设这个就是拿额度干等。
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -78,5 +82,8 @@ jobs:
           done
           python -m sonalgebraic doctor || true
 
+      # --timeout 让挂死的用例变成一条带名字的失败，而不是整个 job 干等。
+      # thread 方法能打断卡在 subprocess.wait 上的调用，signal 方法在 Windows 上没有。
+      # --durations 把最慢的十个列出来，慢和卡才能分清。
       - name: pytest（全量）
-        run: python -m pytest -q
+        run: python -m pytest -q --timeout=300 --timeout-method=thread --durations=10

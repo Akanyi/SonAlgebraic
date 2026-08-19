@@ -15,6 +15,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # 挂死的测试要变成带名字的失败，而不是让 CI job 干等到平台上限。
+    # e2e 会真编译真运行，卡住的可能是被测程序而不是测试代码本身。
+    "pytest-timeout>=2.3",
 ]
 
 [project.scripts]
