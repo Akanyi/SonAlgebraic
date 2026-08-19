@@ -1,0 +1,84 @@
+name: installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
+jobs:
+  build:
+    # 安装包是 Inno Setup + PyInstaller 产物，只能在 Windows 上出
+    runs-on: windows-latest
+    permissions:
+      contents: write        # 打 tag 时要往 Release 传附件
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          pip install -e .[dev]
+          pip install pyinstaller
+
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: 读出版本号
+        id: meta
+        shell: bash
+        run: |
+          version=$(python -c "import sonalgebraic; print(sonalgebraic.__version__)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "SADK $version"
+
+      # zig 的 URL 和摘要写在 sadk.iss 里（单一来源），缓存键跟着它走：
+      # 升级 zig 改了那几行，键自然失效重新下载，不会拿旧归档蒙混过关。
+      - name: 缓存 Zig 归档
+        uses: actions/cache@v4
+        with:
+          path: build/zig-cache
+          key: zig-${{ hashFiles('installer/sadk.iss') }}
+
+      - name: 构建在线版
+        run: python installer/build_installer.py
+
+      # 复用上一步的冻结产物，省掉重跑一遍 PyInstaller
+      - name: 构建离线版（内置 Zig）
+        run: python installer/build_installer.py --skip-freeze --bundle-zig
+
+      - name: 列出产物
+        shell: bash
+        run: ls -lh build/installer/*.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SADK-Setup-${{ steps.meta.outputs.version }}
+          path: build/installer/*.exe
+          if-no-files-found: error
+
+      - name: 发布到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/installer/*.exe
+          body: |
+            SADK ${{ steps.meta.outputs.version }}
+
+            | 安装包 | 说明 |
+            |---|---|
+            | `SADK-Setup-${{ steps.meta.outputs.version }}.exe` | 在线版。约 17 MB，需要 C 工具链时在安装向导里下载 Zig（约 93 MB）。 |
+            | `SADK-Setup-${{ steps.meta.outputs.version }}-with-zig.exe` | 离线版。约 72 MB，x64 的 Zig 已在包内，装完直接能 `sonc build`。ARM64 机器仍会回退到在线下载。 |

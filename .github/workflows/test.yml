@@ -1,0 +1,82 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时取消上一轮，别让排队的 run 白烧额度
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 诊断文案是中文的，Windows 控制台默认代码页会把它变成乱码，连断言一起带偏
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
+jobs:
+  # 不需要任何 C 工具链的那部分。缺编译器时相关测试自己会 skip，
+  # 所以这个 job 在任何 runner 上都该是绿的——它守的是编译器前端和打包逻辑。
+  unit:
+    name: unit (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # requires-python 是 >=3.10，两头都测：最低支持位和当前主线
+        python: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -e .[dev]
+
+      - name: pytest（跳过需要 C 工具链的部分）
+        run: python -m pytest -q -m "not e2e and not ffi"
+
+  # 真过一遍 C 编译器的那部分：e2e、反向 FFI、native 后端。
+  full:
+    name: full (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -e .[dev]
+
+      # POSIX 的 HTTPS / 原始 TLS stream 走 OpenSSL，缺开发文件的话
+      # 带 TLS 的用例会编译失败而不是优雅跳过
+      - name: 安装 OpenSSL 开发文件（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+
+      - name: 报告可用的编译器
+        shell: bash
+        run: |
+          for tool in gcc clang zig cl; do
+            printf '%-6s ' "$tool"
+            command -v "$tool" || echo '(缺)'
+          done
+          python -m sonalgebraic doctor || true
+
+      - name: pytest（全量）
+        run: python -m pytest -q
