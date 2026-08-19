@@ -66,9 +66,12 @@ jobs:
         run: pip install -e .[dev]
 
       # POSIX 的 HTTPS / 原始 TLS stream 走 OpenSSL，缺开发文件的话
-      # 带 TLS 的用例会编译失败而不是优雅跳过
+      # 带 TLS 的用例会编译失败而不是优雅跳过。
+      # 加超时是因为 Azure 的 Ubuntu 镜像源挂过一次：apt-get update 一声不吭地
+      # 吊了 50 分钟，pytest 一个字都没跑到。宁可这步失败得快一点。
       - name: 安装 OpenSSL 开发文件（Linux）
         if: runner.os == 'Linux'
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev
