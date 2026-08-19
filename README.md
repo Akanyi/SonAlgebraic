@@ -1,6 +1,6 @@
 # SonAlgebraic
 
-SonAlgebraic 是一个小语言编译器。完整文档见 [docs/](./docs/)，语言参考见 [docs/02-language-reference.md](./docs/02-language-reference.md)，入门指南见 [docs/01-getting-started.md](./docs/01-getting-started.md)。
+SonAlgebraic 是一个小语言编译器。完整文档见 [docs/](./docs/)：[入门](./docs/01-getting-started.md)、[语言基础](./docs/02-language-basics.md)、[标准库](./docs/08-stdlib.md)。
 
 当前链路：`.sa` 源码 → C11 源码 → 原生可执行文件。
 
@@ -28,16 +28,8 @@ sa_print_string(sa_message);
   - [检查工具链](#检查工具链)
 - [诊断系统](#诊断系统)
 - [示例程序](#示例程序)
-- [模块系统](#模块系统)
-  - [USE 引用规则](#use-引用规则)
-  - [.slib 单模块包](#slib-单模块包)
-  - [.spkg 多模块包](#spkg-多模块包)
-- [FFI](#ffi)
+- [语言文档](#语言文档)
 - [测试](#测试)
-- [运行时语义补充](#运行时语义补充)
-  - [ENTITY 字符串字段](#entity-字符串字段)
-  - [局部资源清理](#局部资源清理)
-  - [SYMBOL](#symbol)
 - [当前支持](#当前支持)
 - [当前限制](#当前限制)
 
@@ -105,7 +97,7 @@ sonc doctor
 - 原生网络栈：HTTP/HTTPS、DNS、TCP client/server、TLS client stream、UDP 和二进制 BUFFER 数据包；C/native 后端共用同一 runtime。
 - Windows 原生系统交互：WinHTTP、Schannel、UTF-8 文件路径、消息框、系统打开和 Unicode 文本剪贴板。
 
-> 新增的现代语言特性（ELSE/循环/数组/BOOL/NULL/位运算/字符串/枚举/SYMBOL 代数）详见 [docs/08-language-extensions.md](./docs/08-language-extensions.md)。
+> 语言特性的完整参考在 [docs/](./docs/)，本 README 只列工具链相关内容。
 
 ## CLI 命令
 
@@ -215,7 +207,7 @@ python -m sonalgebraic slib examples/statslib.sa -o build/statslib_dynamic.slib 
 
 ### 打包 .spkg
 
-`.spkg` 是自包含的多模块包格式，详细规范见 [docs/06-spkg-format.md](./docs/06-spkg-format.md)。
+`.spkg` 是自包含的多模块包格式，详细规范见 [docs/11-spkg-format.md](./docs/11-spkg-format.md)。
 
 ```powershell
 # 单文件包（会作为包的根模块）
@@ -293,6 +285,8 @@ examples/broken.sa:4:10 error: [SA 40] 变量未声明: missing
 - `lists.sa`：`SYS.LIST` 数值/字符串动态列表。
 - `maps.sa`：`SYS.MAP` 关联容器和 KEYS 遍历。
 - `gui_hello.sa`：`SYS.GUI` 窗口、按钮、输入框和事件循环。
+- `net_tls.sa`：`SYS.NET` 的 TLS client，握手后手写一条 HTTP 请求。
+- `web_server.sa`：`SYS.NET` 的 TCP listener，accept 循环 + 路由的迷你 HTTP server，访问 `/quit` 关服。
 - `ptr_basic.sa`、`ptr_arith.sa`、`ptr_cast.sa`：typed pointer、取址、解引用和 CAST。
 - `ffi_hello.sa`：C FFI 的 `USEC` / `DECLARE C`。
 - `use_math.sa`、`use_io.sa`：内置系统模块导入。
@@ -309,122 +303,21 @@ python -m sonalgebraic check examples/allexample.sa
 python -m sonalgebraic run examples/allexample.sa
 ```
 
-## 模块系统
+## 语言文档
 
-### USE 引用规则
+语言本身的语法、语义和标准库都在 [docs/](./docs/)。这里只放工具链相关的内容，避免同一件事两边各写一份。
 
-在 SA 源码中：
-
-```basic
-10 USE STATSLIB AS ST
-```
-
-编译器按以下顺序解析模块：
-
-1. 当前源码目录下的 `.sa` 文件：
-   - `USE MATHLIB AS LIB` → 查找 `mathlib.sa`
-   - `USE DATA.MODELS AS DATA` → 优先 `data/models.sa`，再回退 `data_models.sa`
-2. 当前源码目录下的同名 `.slib`：
-   - 例如 `mathlib.slib` 或 `data/models.slib`
-3. 编译时通过 `--pkg` 传入的 `.spkg` 包内模块
-
-模块递归加载会检测循环依赖，例如 `A -> B -> A` 会直接报出完整链路：
-
-```text
-模块循环依赖: A -> B -> A
-```
-
-如果模块内部使用了 `USELIB`，链接阶段会递归汇总主程序和所有用户模块声明的 C 库，避免 FFI 依赖只写在模块里时被漏掉。
-
-### .slib 单模块包
-
-`.slib` 是 zip 包，详细规范见 [docs/07-slib-format.md](./docs/07-slib-format.md)，包含：
-
-- `manifest.json`
-- 原始 SA 源码副本
-- 生成的模块 C 文件和头文件
-- 可选的目标平台静态库/动态库
-
-导出规则：
-
-- `PUBLIC SUB` → 模块头文件
-- `CONST` → `extern` 常量
-- `ENTITY` → C `typedef struct`
-- `DIM` 全局变量 → 模块私有
-
-示例：
-
-```basic
-10 USE MATHLIB AS LIB
-20 DIM answer AS NUM AS DOUBLE AS VAR
-30 SUB main AS PUBLIC AS VOID
-40 answer = LIB.SCALE + LIB.twice(4.0)
-50 PRINT answer
-60 .ENDSUB
-70 CALL main
-80 END
-```
-
-### .spkg 多模块包
-
-`.spkg` 把一个或多个模块（以及未来版本的依赖）bundle 成一个 zip。当前实现为源码包，模块按 `module_to_package` 映射查找。
-
-当前 `.spkg` 已实现的安全校验：
-
-- 解包时拒绝绝对路径、`..`、冒号和反斜杠绕过，避免 zip 路径穿越。
-- 解包时拒绝 Windows 保留设备名（`CON` / `NUL` / `COM1` 等，含带扩展名的 `NUL.sa`），避免写到设备而不是磁盘。
-- 解包后校验 `manifest.json` 中 `hashes` 声明的 `sha256`。
-- 反查每个 `modules[*].source`：实际参与编译的源文件必须被 `hashes` 覆盖，否则报错。省掉条目或把 `hashes` 留空都不能绕过校验。
-- 如果 hash 文件缺失、hash 格式不支持或内容被篡改，会直接报编译错误。
-
-`USELIB` 的值会进入 C 编译器命令行，而它可以来自第三方包的源码，所以只接受纯库名（字母数字和 `_ . + -`）和不以 `-` 开头的库文件路径。像 `USELIB "-fplugin=./evil.so"` 这种会被当成编译器选项、在构建期加载任意插件的写法直接报错。
-
-当前 `.spkg` 仍以源码包为主；规范里描述的多 target 二进制 artifact、依赖递归 bundle 和版本冲突处理还在 TODO 中。
-
-> `.slib` 目前**没有**完整性校验：语义检查用的导出签名来自包内 `.sa` 源码的重新解析，而实际链接的是包里的 `.a` / `.dll`，两者不一致时不会被发现。引用来源不明的 `.slib` 前请自行确认。
-
-## FFI
-
-示例：
-
-```basic
-10 USEC "stdio.h" AS STDIO
-20 USELIB "m" AS M_LIB
-30 DECLARE C SUB STDIO.puts(s AS STRING) AS NUM AS LONG
-40 SUB main AS PUBLIC AS VOID
-50 CALL STDIO.puts("hello from C FFI")
-60 .ENDSUB
-70 CALL main
-80 END
-```
-
-语法说明：
-
-- `USEC "header.h" AS H`：生成 `#include "header.h"`
-- `USEC <header> AS H`：生成 `#include <header>`
-- `USELIB "curl" AS CURL_LIB`：链接阶段加 `-lcurl`；如果是具体文件路径则直接链接该文件
-- `DECLARE C SUB H.func(args...) AS return_type`：注册 C 函数签名
-- `CPTR`：映射到 C `void*`，可接收和传递不透明指针
-- `PTR TO <类型>`：带类型的 C 指针
-- `^p`：解引用指针
-- `@x`：取变量地址
-- `CAST <类型> expr`：强制类型转换
-- 指针支持 `+` / `-` 整数偏移
-
-指针示例：
-
-```basic
-10 DIM x AS NUM AS LONG AS VAR
-20 DIM p AS PTR TO NUM AS LONG AS VAR
-30 SUB main AS PUBLIC AS VOID
-40 x = 42
-50 p = @x
-60 ^p = 100
-70 PRINT x
-80 .ENDSUB
-90 CALL main
-100 END
-```
+| 想查的东西 | 去哪 |
+|---|---|
+| 语法、类型、运算符、控制流 | [语言基础](./docs/02-language-basics.md) |
+| `SUB`、传参、`AS REF`、`GOSUB` | [子程序](./docs/03-subroutines.md) |
+| `ENTITY`、`ENUM`、数组、`HANDLE` | [复合类型](./docs/04-composite-types.md) |
+| `TRY` / `CATCH` / `THROW`、`SYMBOL` 代数 | [错误处理与符号代数](./docs/05-errors-and-symbols.md) |
+| 指针、`CAST`、`USEC` / `USELIB` / `DECLARE C` | [指针与 C FFI](./docs/06-pointers-and-ffi.md) |
+| `USE` 解析顺序、模块导出规则 | [模块系统](./docs/07-modules.md) |
+| `SYS.*` 标准库 API | [标准库](./docs/08-stdlib.md) |
+| 生成的 C 是什么样、资源清理、异常实现 | [实现说明](./docs/09-implementation-notes.md) |
+| `.slib` / `.spkg` 包格式规范 | [.slib](./docs/10-slib-format.md) / [.spkg](./docs/11-spkg-format.md) |
 
 ## 测试
 
@@ -473,73 +366,6 @@ python installer/smoke.py --with-zig --integration
 ```
 
 它测的是「用户双击安装包之后拿到的东西」——冻结产物有没有漏模块、安装布局对不对、只靠自带 zig 能不能编译、卸载后 PATH 有没有精确还原。这几类问题从源码测试里看不出来，所以它没有接进 pytest。详见 [installer/README.md](./installer/README.md)。
-
-## 运行时语义补充
-
-### ENTITY 字符串字段
-
-`ENTITY` 中的 `STRING` 字段会被编译器按值语义管理：
-
-- 声明局部/全局 ENTITY 时，字符串字段初始化为空字符串。
-- `second = first` 这类整体赋值会深拷贝字符串字段。
-- 按值参数传入 ENTITY 时，会复制字符串字段，函数内修改不会影响外部对象。
-- 局部/全局 ENTITY 生命周期结束时会递归释放字符串字段。
-- 嵌套 ENTITY 中的字符串字段也会递归处理。
-
-示例：
-
-```basic
-10 FOR ENTITY AS NameBox
-20 DIM text AS STRING AS VAR
-30 .ENDENTITY
-40 FOR ENTITY AS Profile
-50 DIM name AS ENTITY AS NameBox AS VAR
-60 DIM score AS NUM AS LONG AS VAR
-70 .ENDENTITY
-80 SUB main AS PUBLIC AS VOID
-90 DIM first AS ENTITY AS Profile AS VAR
-100 DIM second AS ENTITY AS Profile AS VAR
-110 first.name.text = "LANS"
-120 second = first
-130 second.name.text = "SA"
-140 PRINT first.name.text
-150 PRINT second.name.text
-160 .ENDSUB
-170 CALL main
-180 END
-```
-
-### 局部资源清理
-
-局部 `STRING`、`SYMBOL`、`ERROR` 以及含托管字段的 `ENTITY` 会在常规函数路径上清理。非 `VOID RETURN` 会先保存返回值，再清理局部资源，再返回。
-
-`THROW` 逃逸也会清理当前 SUB 的局部资源：`THROW` 被拆成 `sa_raise_*`（装入错误）→ 清理本帧局部 → `sa_throw_dispatch`（longjmp 或退出）三步，保证跳走前不泄漏。无匹配 `CATCH` 向外层重抛同样会先清理本帧。程序结束时还会释放运行时全局错误对象残留的 message。
-
-异常**穿过**某个 SUB（即该 SUB 调用的下层函数抛出、且本 SUB 没有 `TRY` 接住）时也已覆盖：编译器给每个「持有托管局部、又调用用户/外部 SUB」的语句注入一个只做清理的 per-call landing pad（`sa_try_top++` + `SA_SETJMP`，失败分支释放本帧局部后 `sa_throw_dispatch` 继续向外重抛）。这样局部资源在 `longjmp` 越过该帧之前就被释放，全链路（显式 `THROW`、无匹配 `CATCH` 重抛、穿透传播）在 `-O2` 下均经 malloc/free 计数桩验证净分配为 0。
-
-### SYMBOL
-
-`SYMBOL` 当前用于捕获表达式树并打印公式字符串，例如：
-
-```basic
-10 DIM a AS NUM AS LONG AS VAR
-20 DIM expr AS SYMBOL AS VAR
-30 SUB main AS PUBLIC AS VOID
-40 a = 7
-50 expr = a + 2
-60 PRINT expr
-70 .ENDSUB
-80 CALL main
-90 END
-```
-
-输出类似：
-
-```text
-(a + 2)
-```
-
-当前还没有 `sa_symbol_clone`，所以 `ENTITY` 内的 `SYMBOL` 字段暂不做深层 clone/free 托管。
 
 ## 当前支持
 
@@ -597,11 +423,11 @@ python installer/smoke.py --with-zig --integration
 - native 后端暂不支持 `NUM AS FLOAT`，会报明确错误。不把它映射成 `double` 是因为 `ENTITY` 里的 FLOAT 字段会从 4 字节变 8 字节，与 C 后端编出来的模块 struct 布局对不上。这类程序请用 `AS DOUBLE` 或 C 后端。
 - 局部声明是块作用域：`IF` / `FOR` / `WHILE` / `CATCH` 块内的 `DIM` 在块外不可见（与生成 C 的 `{ }` 一致），兄弟分支可以声明同名变量，但不允许遮蔽外层已有的同名局部。
 - 数组常量下标越界在编译期报错；变量下标越界仍是运行期未定义行为，不做边界检查。
-- `ENTITY` 内 `SYMBOL` 字段暂不做深层 clone/free 托管，避免浅拷贝导致双释放；后续需要给 SYMBOL runtime 增加 clone 能力。
+- `ENTITY` 内 `SYMBOL` 字段暂不做深层 clone/free 托管，避免浅拷贝导致双释放。runtime 的 `sa_symbol_clone` 能力已经有了，缺的是把它接进实体的拷贝/析构路径。
 - MSVC 支持仍需要完整验证；`GOSUB` 本身已不再依赖 GCC/Clang 的 label-address 扩展。
 - `HANDLE` 是可复制的资源 token，不会自动关闭；FILE、BUFFER、LIST、STR_LIST、MAP、STR_MAP、NET_STREAM、TCP_LISTENER、UDP_SOCKET 都必须调用对应 CLOSE。runtime 会让已关闭句柄的旧副本失效，并在进程退出时兜底清理。
 - `SYS.LIST` / `SYS.MAP` 数值元素按 `DOUBLE` 存储，约 2^53 以内整数无损；需要精确 64 位整数序列时用 `SYS.BINARY`。
 - BUFFER 返回值必须直接赋给 `HANDLE AS BUFFER` 变量（或从同类型 SUB 直接 RETURN），不能匿名嵌套进参数/F-string；否则无法显式 CLOSE。
 - POSIX TLS/HTTPS 需要 OpenSSL 开发文件和 `libssl` / `libcrypto`；Windows 使用系统 Schannel，不要求外部 TLS SDK。
-- POSIX 网络 runtime 当前只支持 HTTP，HTTPS 仍需接入 TLS 库；`SYS.DESKTOP` 的非 Windows 实现当前返回失败并提供 `LAST_ERROR()`，不会拼 shell 命令执行用户输入。
+- `SYS.DESKTOP` 的非 Windows 实现当前返回失败并提供 `LAST_ERROR()`，不会拼 shell 命令执行用户输入。
 - `SYS.GUI` 在 Linux/macOS 依赖 GTK3 开发文件（`pkg-config` + `gtk+-3.0`，如 `libgtk-3-dev`）；未安装时编译仍成功，但 GUI 函数运行时返回失败并提供 `LAST_ERROR()`。交叉编译目标不启用 GTK 后端。

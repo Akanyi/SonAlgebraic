@@ -1,10 +1,10 @@
 # SonAlgebraic Library Format (.slib)
 
-版本：2（向后兼容版本 1）
+版本：3（向后兼容版本 1、2）
 
 `.slib` 是 SonAlgebraic 的单模块库包格式。一个 `.slib` 文件是一个 zip 压缩包，内含一个根模块（及其递归依赖的用户模块）的 SA 源码副本、生成的 C 源码与头文件、可选的目标平台静态库或动态库，以及描述这些内容的 `manifest.json`。
 
-与多模块、面向分发的 [`.spkg`](./06-spkg-format.md) 相比，`.slib` 更轻量，定位是「单个模块编译产物的打包单元」。`.spkg` 在概念上可以视为多个 `.slib` 的聚合。
+与多模块、面向分发的 [`.spkg`](./11-spkg-format.md) 相比，`.slib` 更轻量，定位是「单个模块编译产物的打包单元」。`.spkg` 在概念上可以视为多个 `.slib` 的聚合。
 
 ## 目录
 
@@ -15,6 +15,7 @@
   - [顶层字段](#顶层字段)
   - [units](#units)
   - [archives](#archives)
+  - [hashes](#hashes)
 - [文件命名规则](#文件命名规则)
 - [加载与链接逻辑](#加载与链接逻辑)
 - [打包命令](#打包命令)
@@ -71,12 +72,13 @@ statslib.slib (zip)
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `format` | string | 固定值 `"sonalgebraic-slib"` |
-| `version` | integer | 格式版本，当前为 `2`；加载时兼容 `1` |
+| `version` | integer | 格式版本，当前为 `3`；加载时兼容 `1` / `2` |
 | `root_module` | string | 根模块名（大写），如 `"STATSLIB"` |
 | `kind` | string | `"source"` / `"static"` / `"dynamic"` |
 | `target` | string \| null | 二进制形态的归一化 target；`source` 形态为 `null` |
 | `units` | array | 包内所有模块单元的清单 |
 | `archives` | object | target → 二进制条目映射；`source` 形态为空对象 |
+| `hashes` | object | 包内成员 → `sha256:<hex>` 摘要。v3 起**必填** |
 
 ### units
 
@@ -86,17 +88,20 @@ statslib.slib (zip)
 {
   "module": "STATSLIB",
   "source_entry": "sources/sa_user_statslib.sa",
-  "c_entry": "c/sa_user_statslib.c",
-  "h_entry": "include/sa_user_statslib.h"
+  "h_entry": "include/sa_user_statslib.h",
+  "runtime_features": ["net"],
+  "c_entry": "c/sa_user_statslib.c"
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `module` | string | 模块名（大写） |
-| `source_entry` | string | SA 源码在包内的路径 |
-| `c_entry` | string | 生成的 C 源码路径 |
-| `h_entry` | string | 生成的头文件路径 |
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `module` | string | 是 | 模块名（大写） |
+| `source_entry` | string | 是 | SA 源码在包内的路径 |
+| `h_entry` | string | 是 | 生成的头文件路径 |
+| `runtime_features` | array | 是 | 该单元需要的 runtime 特性切片，如 `["net", "tls"]` |
+| `c_entry` | string | 否 | 生成的 C 源码路径。**来自二进制 `.slib` 的依赖单元没有 C 源码，此字段缺失** |
+| `archives` | object | 否 | 单元级预编译产物。依赖单元本身来自二进制包时，把它的产物挂在单元上带走 |
 
 ### archives
 
@@ -128,6 +133,30 @@ statslib.slib (zip)
 - `dynamic` 在 Linux/macOS 下用 `dll` 字段承载 `.so` / `.dylib`（字段名固定为 `dll`），且无 `import_lib`。
 - Windows 动态库必须同时含 `dll` 与 `import_lib`：链接传 import lib，运行时加载 `.dll`。
 
+### hashes
+
+包内每个成员的 sha256 摘要，键是 zip 内路径，值是 `sha256:` 前缀的十六进制串：
+
+```json
+{
+  "hashes": {
+    "sources/sa_user_statslib.sa": "sha256:9f86d0…",
+    "c/sa_user_statslib.c": "sha256:2c26b4…",
+    "include/sa_user_statslib.h": "sha256:fcde2b…"
+  }
+}
+```
+
+加载时的校验规则：
+
+- **v3 起 `hashes` 必填**，缺失直接报 `.slib v3 必须带 hashes 清单`。
+- v1 / v2 存量包没这个字段，加载器只打一条 warning 并跳过校验——直接废掉会让老包全部编译不了。
+- 只接受 `sha256:` 前缀，其他算法报 `不支持的 hash 格式`。
+- 摘要不匹配报 `.slib hash 校验失败`；条目指向的文件不在包里报错。
+- **反查**：`units` 里所有 `source_entry` / `c_entry` / `h_entry`，以及单元级和顶层 `archives` 引用的每个条目，都必须出现在 `hashes` 里。少一条就报 `.slib 缺少 hash 声明`——否则删掉某条声明就能让对应文件零校验参与编译。
+
+这套清单挡得住换掉某个成员这类局部篡改和传输损坏，**挡不住整份 manifest 被重写**——`.slib` 没有签名机制。引用来源不明的包之前仍需自行确认。
+
 ## 文件命名规则
 
 命名由模块名经 `module_c_name`（小写、`.` 换 `_`）和归一化 target（小写、`-` 换 `_`）推导：
@@ -149,14 +178,15 @@ target 归一化：未指定时取本机（如 Windows → `x86_64-windows-gnu`�
 
 引用方在 `USE` 解析时找到 `.slib`，按以下顺序处理：
 
-1. 读取 `manifest.json`，校验 `format` 与 `version`（仅接受 `1` / `2`）。
-2. 逐个解包 `units`：写出源码副本和头文件；解析源码收集导出符号（`PUBLIC SUB` / `CONST` / `ENTITY`）。
-3. 对**根模块**，若 `archives` 命中当前 `--target`：
+1. 读取 `manifest.json`，校验 `format` 与 `version`（仅接受 `1` / `2` / `3`）。
+2. 校验 `hashes`：逐条比对包内成员摘要，并反查 `units` / `archives` 引用的条目是否都被声明。v1 / v2 包无此字段时打 warning 跳过。
+3. 逐个解包 `units`：写出源码副本和头文件；解析源码收集导出符号（`PUBLIC SUB` / `CONST` / `ENTITY`）。
+4. 对**根模块**，若 `archives` 命中当前 `--target`：
    - 跳过根模块 `c_entry` 的解包与编译，改为解包对应静态/动态库。
    - `static`：链接 `.a`。
    - `dynamic`：解包 DLL/SO/dylib（Windows 额外解包 import lib 并以其作为链接库），运行时由 `compiler` 把动态库复制到 exe 输出目录。
-4. 对**非根的依赖单元**，始终解包 `c_entry` 以源码形式参与链接。
-5. 模块内部声明的 `USELIB` 会被记录到 `link_libs`，递归汇总进最终链接命令。
+5. 对**非根的依赖单元**，有 `c_entry` 时解包以源码形式参与链接；来自二进制包、只带单元级 `archives` 的依赖则链接其预编译产物。
+6. 模块内部声明的 `USELIB` 会被记录到 `link_libs`，递归汇总进最终链接命令。
 
 target 未命中或为 `source` 形态时，全部模块走 C 源码编译路径。
 
@@ -176,11 +206,13 @@ python -m sonalgebraic slib examples/statslib.sa -o build/statslib_dynamic.slib 
 python -m sonalgebraic slib examples/statslib.sa -o build/statslib_linux.slib --binary --target x86_64-linux-gnu
 ```
 
-引用方无需特殊参数，把 `.slib` 与引用它的 `.sa` 放在 `USE` 能解析到的目录即可（参见[模块系统](./05-module-system.md)）。
+引用方无需特殊参数，把 `.slib` 与引用它的 `.sa` 放在 `USE` 能解析到的目录即可（参见[模块系统](./07-modules.md#模块解析顺序)）。
 
 ## 版本与兼容性
 
-- 当前格式版本为 `2`，加载器同时接受版本 `1`。
+- 当前格式版本为 `3`，加载器同时接受版本 `1` / `2`。
+- v3 相对 v2 的唯一变化是 `hashes` 成为必填字段，见[上文](#hashes)。v1 / v2 包仍能加载，但会警告跳过完整性校验。
 - `.slib` 不是 ABI 固定的预编译静态库分发格式：`source` 形态最终仍由消费者本机 C 编译器链接。
 - 二进制形态（`static` / `dynamic`）的库必须与消费者指定的 `--target` 匹配，否则会 fallback 到源码（若包内有源码）或报错。
 - 非本机 `--target` 的二进制打包依赖 `zig`。
+- 动态形态还有两条限制：运行时要求库与可执行文件同目录（或对应 `rpath` 目录）；依赖 net / binary / file / desktop 等进程内 runtime 状态的模块**不支持**动态 `.slib`，否则 DLL 与主程序会各持一套句柄槽位。这类模块请用源码或静态形态。
