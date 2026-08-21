@@ -22,9 +22,9 @@ jobs:
     permissions:
       contents: write        # 打 tag 时要往 Release 传附件
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
           cache: pip
@@ -48,7 +48,7 @@ jobs:
       # zig 的 URL 和摘要写在 sadk.iss 里（单一来源），缓存键跟着它走：
       # 升级 zig 改了那几行，键自然失效重新下载，不会拿旧归档蒙混过关。
       - name: 缓存 Zig 归档
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/zig-cache
           key: zig-${{ hashFiles('installer/sadk.iss') }}
@@ -64,7 +64,7 @@ jobs:
         shell: bash
         run: ls -lh build/installer/*.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: SADK-Setup-${{ steps.meta.outputs.version }}
           path: build/installer/*.exe
@@ -72,7 +72,7 @@ jobs:
 
       - name: 发布到 Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: build/installer/*.exe
           body: |
