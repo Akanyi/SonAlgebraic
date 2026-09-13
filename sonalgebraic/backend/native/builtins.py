@@ -111,9 +111,10 @@ class BuiltinsMixin(NativeGenBase):
         elif value.type_name == "i64":
             self.use_runtime("sa_to_string_long")
             self.emit(f"  {temp} = call ptr @sa_to_string_long(i64 {value.value})")
-        else:  # double
+        else:  # FLOAT / DOUBLE 统一复用 double 版运行时
+            wide = self.cast_to_double(value)
             self.use_runtime("sa_to_string_double")
-            self.emit(f"  {temp} = call ptr @sa_to_string_double(double {value.value})")
+            self.emit(f"  {temp} = call ptr @sa_to_string_double(double {wide.value})")
         self.use_runtime("free")
         self.add_temp_cleanup(f"  call void @free(ptr {temp})")
         return LLVMValue("ptr", temp, ast.TypeSpec("STRING"))

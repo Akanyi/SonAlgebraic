@@ -428,8 +428,12 @@ def test_repeated_input_compiles_and_runs(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_native_backend_rejects_float_subtype() -> None:
-    """以前 FLOAT 落进 i64 分支，1.5 被静默存成 1。"""
+def test_native_backend_supports_float_subtype() -> None:
+    """FLOAT 现在映射成真 32 位 LLVM float：1.5 存进 float 而不再被 fptosi 截断成 1。
+
+    以前 FLOAT 落进 i64 分支静默存成 1，后来一刀切抛错拒绝；现在用真 float，
+    ENTITY 字段布局也与 C 后端对齐（端到端一致性见 test_c_and_native_backends_agree[float]）。
+    """
     from sonalgebraic.backend.native import generate_native_llvm_ir
     from sonalgebraic.analysis.semantics import check_program
     from sonalgebraic.frontend.parser import parse_program
@@ -438,8 +442,11 @@ def test_native_backend_rejects_float_subtype() -> None:
         "10 DIM f AS NUM AS FLOAT AS VAR\n20 SUB main AS PUBLIC AS VOID\n30 f = 1.5\n"
         "40 PRINT f\n50 .ENDSUB\n60 CALL main\n70 END"
     ))
-    with pytest.raises(SonCompileError, match="NUM AS FLOAT"):
-        generate_native_llvm_ir(checked)
+    ir = generate_native_llvm_ir(checked)
+    assert "@sa_f = global float" in ir       # 全局 FLOAT 是真 float，不是 i64
+    assert "fptrunc double" in ir             # 1.5 收窄成 float
+    assert "store float" in ir
+    assert "fptosi double" not in ir          # 旧 bug 指纹：把 1.5 当整数存
 
 
 def test_native_and_or_short_circuit_in_ir() -> None:
@@ -485,6 +492,12 @@ _DIFFERENTIAL_PROGRAMS = {
     "arithmetic": (
         "10 DIM x AS NUM AS DOUBLE AS VAR\n20 SUB main AS PUBLIC AS VOID\n"
         "30 x = 7.5\n40 PRINT x * 2.0\n50 PRINT 10 / 4\n60 .ENDSUB\n70 CALL main\n80 END"
+    ),
+    "float": (
+        # f=1.5 暴露旧截断 bug（应 1.5 而非 1）；f*2.0 是 float*double→double；f+1 是 float+long→float
+        "10 DIM f AS NUM AS FLOAT AS VAR\n20 SUB main AS PUBLIC AS VOID\n"
+        "30 f = 1.5\n40 PRINT f\n50 f = f * 2.0\n60 PRINT f\n70 PRINT f + 1\n"
+        "80 .ENDSUB\n90 CALL main\n100 END"
     ),
 }
 

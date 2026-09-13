@@ -30,6 +30,8 @@ class TypesMixin(NativeGenBase):
     def for_cast(self, value: LLVMValue, var_ty: str) -> LLVMValue:
         if var_ty == "i64":
             return self.cast_to_i64(value)
+        if var_ty == "float":
+            return self.cast_to_float(value)
         return self.cast_to_double(value)
 
     def cast_value(self, value: LLVMValue, target: ast.TypeSpec) -> LLVMValue:
@@ -60,6 +62,8 @@ class TypesMixin(NativeGenBase):
             return LLVMValue(value.type_name, value.value, target)
         if target.name == "BOOL":
             return self.truthy(value)
+        if target.name == "NUM" and target.subtype == "FLOAT":
+            return self.cast_to_float(value)
         if target.name == "NUM" and target.subtype == "DOUBLE":
             return self.cast_to_double(value)
         if target.name == "NUM":
@@ -78,6 +82,9 @@ class TypesMixin(NativeGenBase):
         if value.type_name == "double":
             self.emit(f"  {temp} = fptosi double {value.value} to i64")
             return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
+        if value.type_name == "float":
+            self.emit(f"  {temp} = fptosi float {value.value} to i64")
+            return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
         if value.type_name == "ptr":
             self.emit(f"  {temp} = ptrtoint ptr {value.value} to i64")
             return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
@@ -90,6 +97,9 @@ class TypesMixin(NativeGenBase):
         if value.type_name == "i64":
             self.emit(f"  {temp} = sitofp i64 {value.value} to double")
             return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
+        if value.type_name == "float":
+            self.emit(f"  {temp} = fpext float {value.value} to double")
+            return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
         if value.type_name == "i1":
             wide = self.cast_to_i64(value)
             self.emit(f"  {temp} = sitofp i64 {wide.value} to double")
@@ -100,6 +110,24 @@ class TypesMixin(NativeGenBase):
             return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
         raise SonCompileError(f"native 后端无法转为 DOUBLE: {value.type_name}")
 
+    def cast_to_float(self, value: LLVMValue) -> LLVMValue:
+        # float 与其它类型互转的枢纽：double 用 fptrunc 收窄，整数用 sitofp。所有「值存进
+        # FLOAT」的路径（AS FLOAT、FLOAT 参数/字段赋值、FOR 变量、INPUT）最终都汇到这里。
+        if value.type_name == "float":
+            return LLVMValue("float", value.value, ast.TypeSpec("NUM", "FLOAT"))
+        temp = self.next_temp()
+        if value.type_name == "double":
+            self.emit(f"  {temp} = fptrunc double {value.value} to float")
+            return LLVMValue("float", temp, ast.TypeSpec("NUM", "FLOAT"))
+        if value.type_name == "i64":
+            self.emit(f"  {temp} = sitofp i64 {value.value} to float")
+            return LLVMValue("float", temp, ast.TypeSpec("NUM", "FLOAT"))
+        if value.type_name in {"i1", "ptr"}:
+            wide = self.cast_to_i64(value)
+            self.emit(f"  {temp} = sitofp i64 {wide.value} to float")
+            return LLVMValue("float", temp, ast.TypeSpec("NUM", "FLOAT"))
+        raise SonCompileError(f"native 后端无法转为 FLOAT: {value.type_name}")
+
     def truthy(self, value: LLVMValue) -> LLVMValue:
         if value.type_name == "i1":
             return LLVMValue("i1", value.value, ast.TypeSpec("BOOL"))
@@ -109,6 +137,9 @@ class TypesMixin(NativeGenBase):
             return LLVMValue("i1", temp, ast.TypeSpec("BOOL"))
         if value.type_name == "double":
             self.emit(f"  {temp} = fcmp one double {value.value}, 0.0")
+            return LLVMValue("i1", temp, ast.TypeSpec("BOOL"))
+        if value.type_name == "float":
+            self.emit(f"  {temp} = fcmp one float {value.value}, 0.0")
             return LLVMValue("i1", temp, ast.TypeSpec("BOOL"))
         if value.type_name == "ptr":
             self.emit(f"  {temp} = icmp ne ptr {value.value}, null")
@@ -150,10 +181,11 @@ class TypesMixin(NativeGenBase):
         if type_spec.name == "NUM" and type_spec.subtype == "DOUBLE":
             return "double"
         if type_spec.name == "NUM" and type_spec.subtype == "FLOAT":
-            # 以前 FLOAT 落到下面的 i64 分支，1.5 被 fptosi 存成 1，而 C 后端是真 float。
-            # 不能简单改映射成 double：ENTITY 里的 FLOAT 字段会从 4 字节变 8 字节，
-            # 与 C 后端编出来的模块 struct 布局对不上，比截断更糟。
-            raise SonCompileError("native 后端暂不支持 NUM AS FLOAT，请改用 AS DOUBLE 或改用 C 后端")
+            # 真 32 位 float：与 C 后端 c_type(FLOAT)="float" 的布局/ABI 对齐，ENTITY 里的
+            # FLOAT 字段才是 4 字节，跟 C 编出来的模块 struct 对得上（映射成 double 会膨胀成
+            # 8 字节、错位得比截断更糟）。float 与 double 之间一律走 fpext/fptrunc 互转，
+            # 从而复用现成的 double 版运行时，不必新增任何 float 运行时。
+            return "float"
         if type_spec.name == "NUM":
             return "i64"
         raise SonCompileError(f"native 后端暂不支持类型: {type_spec.name}")
@@ -182,7 +214,7 @@ class TypesMixin(NativeGenBase):
             return "zeroinitializer"
         if is_bool(type_spec):
             return "0"
-        if is_numeric(type_spec) and type_spec.subtype == "DOUBLE":
+        if is_numeric(type_spec) and type_spec.subtype in {"DOUBLE", "FLOAT"}:
             return "0.0"
         return "0"
 

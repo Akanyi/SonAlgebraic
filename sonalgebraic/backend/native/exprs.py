@@ -89,9 +89,11 @@ class ExprsMixin(NativeGenBase):
             return
         # 数值/布尔先转字符串再 append，临时串当场释放
         piece = self.next_temp()
-        if value.type_name == "double":
+        if value.type_name in {"double", "float"}:
+            # float 先 fpext 成 double（无损），复用 double 版转串，与 C 后端 %.15g 一致
+            wide = self.cast_to_double(value)
             self.use_runtime("sa_to_string_double")
-            self.emit(f"  {piece} = call ptr @sa_to_string_double(double {value.value})")
+            self.emit(f"  {piece} = call ptr @sa_to_string_double(double {wide.value})")
         else:
             wide = self.cast_to_i64(value)
             self.use_runtime("sa_to_string_long")
@@ -317,6 +319,9 @@ class ExprsMixin(NativeGenBase):
             if value.type_name == "double":
                 self.emit(f"  {temp} = fsub double -0.0, {value.value}")
                 return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
+            if value.type_name == "float":
+                self.emit(f"  {temp} = fsub float -0.0, {value.value}")
+                return LLVMValue("float", temp, ast.TypeSpec("NUM", "FLOAT"))
             self.emit(f"  {temp} = sub i64 0, {self.cast_value(value, ast.TypeSpec('NUM', 'LONG')).value}")
             return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
         if expr.op == "NOT":
@@ -378,7 +383,7 @@ class ExprsMixin(NativeGenBase):
             temp = self.next_temp()
             self.emit(f"  {temp} = call double @pow(double {lhs.value}, double {rhs.value})")
             return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
-        if is_ptr(left.type_spec or ast.TypeSpec("VOID")) and right.type_name in {"i64", "i1", "double"} and op in {"+", "-"}:
+        if is_ptr(left.type_spec or ast.TypeSpec("VOID")) and right.type_name in {"i64", "i1", "double", "float"} and op in {"+", "-"}:
             offset = self.cast_to_i64(right)
             if op == "-":
                 neg = self.next_temp()
@@ -397,6 +402,17 @@ class ExprsMixin(NativeGenBase):
                 raise SonCompileError(f"native 后端暂不支持运算: {op}", expr.line_no)
             self.emit(f"  {temp} = {instr} double {lhs.value}, {rhs.value}")
             return LLVMValue("double", temp, ast.TypeSpec("NUM", "DOUBLE"))
+        if left.type_name == "float" or right.type_name == "float":
+            # 一方 float 且无 double 参与：按 float 精度算（对齐 typesys 的 LONG<FLOAT<DOUBLE
+            # 提升与 C 的 usual arithmetic conversion，float+long→float）。
+            lhs = self.cast_to_float(left)
+            rhs = self.cast_to_float(right)
+            temp = self.next_temp()
+            instr = {"+": "fadd", "-": "fsub", "*": "fmul", "/": "fdiv"}.get(op)
+            if instr is None:
+                raise SonCompileError(f"native 后端暂不支持运算: {op}", expr.line_no)
+            self.emit(f"  {temp} = {instr} float {lhs.value}, {rhs.value}")
+            return LLVMValue("float", temp, ast.TypeSpec("NUM", "FLOAT"))
         lhs = self.cast_to_i64(left)
         rhs = self.cast_to_i64(right)
         temp = self.next_temp()
@@ -432,7 +448,7 @@ class ExprsMixin(NativeGenBase):
             pred = "eq" if op in {"=", "=="} else "ne"
             self.emit(f"  {temp} = icmp {pred} ptr {left.value}, {right.value}")
             return LLVMValue("i1", temp, ast.TypeSpec("BOOL"))
-        if left.type_name == "double" or right.type_name == "double":
+        if left.type_name in {"double", "float"} or right.type_name in {"double", "float"}:
             lhs = self.cast_to_double(left)
             rhs = self.cast_to_double(right)
             pred = {"=": "oeq", "==": "oeq", "!=": "one", "<>": "one", "<": "olt", "<=": "ole", ">": "ogt", ">=": "oge"}[op]

@@ -877,6 +877,18 @@ def test_native_ir_entity_struct_and_fields() -> None:
     assert "define void @sa_move(ptr %sa_point)" in ir
 
 
+def test_native_ir_float_entity_field_is_four_byte() -> None:
+    """FLOAT 字段必须落成真 float(4B) 而非 double(8B)，否则与 C 后端编出的模块 struct 布局错位。"""
+    src = (
+        "10 FOR ENTITY AS Vec2f\n20 DIM x AS NUM AS FLOAT AS VAR\n30 DIM y AS NUM AS FLOAT AS VAR\n"
+        "40 .ENDENTITY\n50 SUB main AS PUBLIC AS VOID\n60 DIM p AS ENTITY AS Vec2f AS VAR\n"
+        "70 p.x = 1.5\n80 p.y = 2.5\n90 PRINT F\"({p.x}, {p.y})\"\n100 .ENDSUB\n110 CALL main\n120 END"
+    )
+    ir = compile_native_ir(src)
+    assert "%SaEntity_vec2f = type { float, float }" in ir
+    assert "store float" in ir
+
+
 @requires_native_compiler
 def test_native_backend_entity_runs() -> None:
     with native_temp("sonalgebraic-native-entity-") as temp:

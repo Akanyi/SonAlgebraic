@@ -50,8 +50,6 @@ RUNTIME_SIGNATURES: dict[str, str] = {
     "sa_net_udp_recv_buffer": "declare i64 @sa_net_udp_recv_buffer(i64, i64)",
     "sa_net_udp_close": "declare i32 @sa_net_udp_close(i64)",
     "sa_net_udp_local_port": "declare i64 @sa_net_udp_local_port(i64)",
-    # BINARY
-    "sa_binary_new": "declare i64 @sa_binary_new(i64)",
     # LIST
     "sa_list_new": "declare i64 @sa_list_new()",
     "sa_list_push": "declare i32 @sa_list_push(i64, double)",
@@ -105,6 +103,9 @@ RUNTIME_SIGNATURES: dict[str, str] = {
     "sa_gui_wait_event": "declare i64 @sa_gui_wait_event()",
     "sa_gui_close": "declare i32 @sa_gui_close(i64)",
     "sa_gui_last_error_copy": "declare ptr @sa_gui_last_error_copy()",
+
+    # BINARY
+    "sa_binary_new": "declare i64 @sa_binary_new(i64)",
     "sa_binary_close": "declare i32 @sa_binary_close(i64)",
     "sa_binary_length": "declare i64 @sa_binary_length(i64)",
     "sa_binary_slice": "declare i64 @sa_binary_slice(i64, i64, i64)",

@@ -205,6 +205,9 @@ class StmtsMixin(NativeGenBase):
             extended = self.next_temp()
             self.emit(f"  {extended} = zext i1 {value.value} to i64")
             value = LLVMValue("i64", extended)
+        if value.type_name == "float":
+            # 与 C 后端 sa_print_double 一致：float 无损提升 double 后走 %.15g
+            value = self.cast_to_double(value)
         if value.type_name == "i64":
             fmt = "@.sa_fmt_i64" if newline else "@.sa_fmt_i64_part"
             self.emit(f"  call i32 (ptr, ...) @printf(ptr {fmt}, i64 {value.value})")
@@ -335,14 +338,12 @@ class StmtsMixin(NativeGenBase):
             return
         if is_numeric(target.type_spec):
             self.use_runtime("sa_number")
-            value = self.next_temp()
-            self.emit(f"  {value} = call double @sa_number(ptr {buf})")
-            if target.type_spec.subtype == "LONG":
-                long_value = self.next_temp()
-                self.emit(f"  {long_value} = fptosi double {value} to i64")
-                self.emit(f"  store i64 {long_value}, ptr {target.ptr}")
-            else:
-                self.emit(f"  store double {value}, ptr {target.ptr}")
+            raw = self.next_temp()
+            self.emit(f"  {raw} = call double @sa_number(ptr {buf})")
+            # sa_number 统一给 double，按目标子类型收窄（LONG→fptosi、FLOAT→fptrunc），
+            # 否则 FLOAT 槽位会被 store double 撑爆类型
+            value = self.cast_value(LLVMValue("double", raw, ast.TypeSpec("NUM", "DOUBLE")), target.type_spec)
+            self.emit(f"  store {value.type_name} {value.value}, ptr {target.ptr}")
             return
         raise SonCompileError("IO.INPUT 当前只支持 STRING 和 NUM", stmt.line_no)
 
@@ -590,7 +591,7 @@ class StmtsMixin(NativeGenBase):
     def for_stmt(self, stmt: ast.ForLoop) -> None:
         slot = self.slot(stmt.var, stmt.line_no)
         var_ty = self.llvm_type(slot.type_spec)
-        if var_ty not in {"i64", "double"}:
+        if var_ty not in {"i64", "double", "float"}:
             raise SonCompileError("native 后端 FOR 循环变量必须是数值类型", stmt.line_no)
         self.emit(self.source_comment(stmt.line_no))
         # 边界与步长进循环前只求值一次（BASIC 语义）。native 是 SSA 直接发射，
@@ -621,9 +622,10 @@ class StmtsMixin(NativeGenBase):
             self.emit(f"  {le} = icmp sle i64 {cur}, {end.value}")
             self.emit(f"  {ge} = icmp sge i64 {cur}, {end.value}")
         else:
-            self.emit(f"  {pos} = fcmp oge double {step.value}, 0.0")
-            self.emit(f"  {le} = fcmp ole double {cur}, {end.value}")
-            self.emit(f"  {ge} = fcmp oge double {cur}, {end.value}")
+            # fcmp 对 float/double 写法相同，只差类型串，跟着循环变量走
+            self.emit(f"  {pos} = fcmp oge {var_ty} {step.value}, 0.0")
+            self.emit(f"  {le} = fcmp ole {var_ty} {cur}, {end.value}")
+            self.emit(f"  {ge} = fcmp oge {var_ty} {cur}, {end.value}")
         self.emit(f"  {cond} = select i1 {pos}, i1 {le}, i1 {ge}")
         self.emit(f"  br i1 {cond}, label %{body_label}, label %{end_label}")
         self.terminated = True
@@ -638,7 +640,7 @@ class StmtsMixin(NativeGenBase):
             if var_ty == "i64":
                 self.emit(f"  {inc} = add i64 {nv}, {step.value}")
             else:
-                self.emit(f"  {inc} = fadd double {nv}, {step.value}")
+                self.emit(f"  {inc} = fadd {var_ty} {nv}, {step.value}")
             self.emit(f"  store {var_ty} {inc}, ptr {slot.ptr}")
             self.emit(f"  br label %{cond_label}")
 
