@@ -26,12 +26,15 @@ from sonalgebraic.backend.c_runtime import (
     RUNTIME_PRELUDE,
     RUNTIME_SOURCE,
 )
+from sonalgebraic.driver.compiler import find_c_compiler
 
 HAS_GCC = shutil.which("gcc") is not None
 HAS_ZIG = shutil.which("zig") is not None
+HAS_C_COMPILER = find_c_compiler() is not None
 
 requires_gcc = pytest.mark.skipif(not HAS_GCC, reason="需要 MinGW gcc 才能实际编译运行 runtime")
 requires_zig = pytest.mark.skipif(not HAS_ZIG, reason="需要 zig 才能交叉编译到 POSIX 目标")
+requires_c_compiler = pytest.mark.skipif(not HAS_C_COMPILER, reason="未找到可用的 C 编译器")
 requires_windows = pytest.mark.skipif(
     sys.platform != "win32", reason="只在 Windows 上有意义（探针调 Win32 API）"
 )
@@ -49,6 +52,10 @@ ALL_FEATURES = (
 )
 # OpenSSL/GTK 的头在交叉编译的 sysroot 里没有，交叉目标只开不依赖外部库的部分
 PORTABLE_FEATURES = ALL_FEATURES.replace("#define SA_ENABLE_TLS\n", "")
+# 全量语法网再叠上 ASYNC（事件循环/协程那块 C）。GUI 只开 SA_ENABLE_GUI 不开
+# SA_ENABLE_GUI_GTK：GTK 分支要 gtk/gtk.h，本机语法检查不该背 GTK 开发头这个依赖，
+# Win32/桩两条分支已经覆盖 GUI 的表层 API。
+FULL_SYNTAX_FEATURES = ALL_FEATURES + "#define SA_ENABLE_ASYNC\n"
 
 
 def work_dir(prefix: str) -> TemporaryDirectory[str]:
@@ -416,3 +423,49 @@ def test_module_ships_expected_public_names() -> None:
     """防手滑：拆前导之后这几个名字还得都在。"""
     for name in ("RUNTIME", "RUNTIME_PRELUDE", "RUNTIME_IMPL", "RUNTIME_HEADER", "RUNTIME_SOURCE"):
         assert isinstance(getattr(c_runtime, name), str)
+
+
+# --------------------------------------------------------------------------- 全量语法网
+
+
+def _compile_object(compiler: str, source: Path, out: Path) -> subprocess.CompletedProcess[str]:
+    """把 source 编译成目标文件（compile-only，不链接）。
+
+    刻意用 compile-only 而不是 -fsyntax-only：一是 -fsyntax-only 各家写法不一、
+    zig 0.16 的这个模式还坏着（真编译/-c 都正常）；二是不链接就不用挂 ws2_32/
+    winhttp/secur32/openssl 那串外部库，纯粹验语法/语义，不会被"缺某个 .lib"带偏。
+    _CRT_SECURE_NO_WARNINGS 压掉 MSVC UCRT 头对 strcpy/strerror 的弃用唠叨。
+    """
+    if compiler == "cl":
+        command = [compiler, "/nologo", "/c", "/D_CRT_SECURE_NO_WARNINGS", str(source), f"/Fo:{out}"]
+    elif compiler == "zig":
+        command = ["zig", "cc", "-c", "-std=c11", "-D_CRT_SECURE_NO_WARNINGS", str(source), "-o", str(out)]
+    else:
+        command = [compiler, "-c", "-std=c11", "-D_CRT_SECURE_NO_WARNINGS", str(source), "-o", str(out)]
+    return subprocess.run(command, capture_output=True, text=True, timeout=600)
+
+
+@requires_c_compiler
+def test_full_runtime_compiles_with_every_feature() -> None:
+    """整份 RUNTIME 十宏全开（NET/TLS/FILE/BINARY/LIST/MAP/DESKTOP/GUI/ASYNC）编一遍。
+
+    这是唯一一道"全 feature 一起编"的闸。平时 e2e 走 slicer，只编测试恰好够得着的
+    片段，冷门块（尤其 host=Windows 时的 _WIN32 + schannel + winsock 那半边）可能
+    带着语法错一路漏到用户 `sonc build`。本用例按 host 平台真编一遍堵住这个缺口：
+    在 CI 的 ubuntu+windows 矩阵上，两半 #ifdef 各被对应平台的编译器过一遍。
+
+    用 host 编译器（gcc/clang/zig cc/cl 有啥用啥），compile-only 到目标文件。
+    """
+    compiler = find_c_compiler()
+    assert compiler is not None  # requires_c_compiler 已保证
+    with work_dir("sa-rt-full-") as temp:
+        root = Path(temp)
+        source = root / "full_runtime.c"
+        source.write_text(
+            FULL_SYNTAX_FEATURES + RUNTIME + "\nint main(void){return 0;}\n",
+            encoding="utf-8",
+        )
+        out = root / ("full_runtime.obj" if compiler == "cl" else "full_runtime.o")
+        result = _compile_object(compiler, source, out)
+        assert result.returncode == 0, (result.stdout + result.stderr)[-4000:]
+        assert out.exists()
