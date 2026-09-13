@@ -417,7 +417,7 @@ def _native_runtime_source(runtime_features: set[str] | None = None, ir_text: st
     from ..backend.c_runtime import RUNTIME_HEADER, RUNTIME_SOURCE
     from ..backend.runtime_slicer import runtime_impl_for, runtime_symbols_in
 
-    macros = {"net": "SA_ENABLE_NET", "tls": "SA_ENABLE_TLS", "file": "SA_ENABLE_FILE", "desktop": "SA_ENABLE_DESKTOP", "binary": "SA_ENABLE_BINARY", "list": "SA_ENABLE_LIST", "map": "SA_ENABLE_MAP", "gui": "SA_ENABLE_GUI"}
+    macros = {"net": "SA_ENABLE_NET", "tls": "SA_ENABLE_TLS", "file": "SA_ENABLE_FILE", "desktop": "SA_ENABLE_DESKTOP", "binary": "SA_ENABLE_BINARY", "list": "SA_ENABLE_LIST", "map": "SA_ENABLE_MAP", "gui": "SA_ENABLE_GUI", "async": "SA_ENABLE_ASYNC"}
     features = runtime_features or set()
     lines = [f"#define {macros[feature]}" for feature in sorted(features) if feature in macros]
     prefix = "" if not lines else "\n".join(lines) + "\n"

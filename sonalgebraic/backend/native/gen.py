@@ -106,6 +106,9 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         for decl in self.checked.program.declarations:
             self.require_supported_type(decl.type_spec, decl.line_no)
         for sub in self.checked.program.subs:
+            # ASYNC SUB 要编译成无栈状态机协程 + 事件循环，native 后端首期不接，退回 C 后端
+            if sub.is_async:
+                raise SonCompileError("native 后端暂不支持 ASYNC SUB，请改用 C 后端", sub.line_no)
             self.require_supported_type(sub.return_type, sub.line_no, allow_void=True)
             for param in sub.params:
                 self.require_supported_type(param.type_spec, param.line_no)

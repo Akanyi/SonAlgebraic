@@ -63,7 +63,13 @@ def sub_lines(exports: ModuleExports, dynamic: bool = False) -> list[str]:
     prefix = module_symbol_prefix(exports.module)
     api = "SA_API " if dynamic else ""
     lines = [f"{api}void {prefix}_init(void);", f"{api}void {prefix}_free(void);"]
-    lines.extend(f"{api}{external_c_type(sub.return_type)} {prefix}_sub_{sub.name.lower()}({params_signature(sub)});" for sub in exports.subs.values())
+    for sub in exports.subs.values():
+        if sub.is_async:
+            # async sub 的公共入口是 start（返回 PROMISE 句柄、非阻塞投入就绪队列），不是
+            # 普通调用符号——codegen 只导出 sa_mod_<模块>_sub_<名>_start，这里跟着声明它。
+            lines.append(f"{api}SaHandle {prefix}_sub_{sub.name.lower()}_start({params_signature(sub)});")
+        else:
+            lines.append(f"{api}{external_c_type(sub.return_type)} {prefix}_sub_{sub.name.lower()}({params_signature(sub)});")
     return lines
 
 

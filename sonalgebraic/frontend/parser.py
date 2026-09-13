@@ -8,8 +8,13 @@ from .expr_parser import parse_expr
 from ..core.lines import SourceLine, read_numbered_lines
 
 
-_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_LABEL_RE = re.compile(r"^::([A-Za-z_][A-Za-z0-9_]*)$")
+# 标识符与带成员路径的标识符子模式。原先这两段字面量散在十几条语句正则里，集中一处，
+# 将来改名字规则（比如允许新字符）只动这里，不必逐条正则去找、还生怕漏掉一条。
+_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+_DOTTED_NAME = r"[A-Za-z_][A-Za-z0-9_.]*"
+
+_NAME_RE = re.compile(rf"^{_NAME}$")
+_LABEL_RE = re.compile(rf"^::({_NAME})$")
 
 
 def parse_program(source: str) -> ast.Program:
@@ -49,7 +54,7 @@ class Parser:
                 program.entities.append(self.parse_entity())
             elif _starts_word(upper, "ENUM"):
                 program.enums.append(self.parse_enum())
-            elif _starts_word(upper, "SUB"):
+            elif _starts_word(upper, "ASYNC") or _starts_word(upper, "SUB"):
                 program.subs.append(self.parse_sub())
             else:
                 program.top_level.append(self.parse_statement())
@@ -58,16 +63,16 @@ class Parser:
 
     def parse_sub(self) -> ast.Subroutine:
         header = self.advance()
-        name, params, visibility, return_type = self.parse_sub_header(header)
+        name, params, visibility, return_type, is_async = self.parse_sub_header(header)
         body: list[ast.Stmt] = []
 
         while not self.at_end():
             upper = self.peek().text.strip().upper()
             if upper == ".ENDSUB":
                 self.i += 1
-                return ast.Subroutine(name, params, visibility, return_type, body, header.no)
-            # SUB 不能嵌套，撞见下一个 SUB 头说明本 SUB 忘了 .ENDSUB，报头部这行才是根因
-            if _starts_word(upper, "SUB"):
+                return ast.Subroutine(name, params, visibility, return_type, body, header.no, is_async)
+            # SUB 不能嵌套，撞见下一个 SUB 头（含 ASYNC SUB）说明本 SUB 忘了 .ENDSUB，报头部这行才是根因
+            if _starts_word(upper, "SUB") or _starts_word(upper, "ASYNC"):
                 break
             body.append(self.parse_statement())
 
@@ -75,7 +80,7 @@ class Parser:
 
     def parse_enum(self) -> ast.EnumDef:
         header = self.advance()
-        match = re.match(r"^ENUM\s+([A-Za-z_][A-Za-z0-9_]*)$", header.text.strip(), re.IGNORECASE)
+        match = re.match(rf"^ENUM\s+({_NAME})$", header.text.strip(), re.IGNORECASE)
         if not match:
             raise SonCompileError("ENUM 必须写成 `ENUM Name`", header.no)
         members: list[str] = []
@@ -102,7 +107,7 @@ class Parser:
 
     def parse_entity(self) -> ast.EntityDef:
         header = self.advance()
-        match = re.match(r"^FOR\s+ENTITY\s+AS\s+([A-Za-z_][A-Za-z0-9_.]*)$", header.text, re.IGNORECASE)
+        match = re.match(rf"^FOR\s+ENTITY\s+AS\s+({_DOTTED_NAME})$", header.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("ENTITY 必须写成 `FOR ENTITY AS Name`", header.no)
 
@@ -139,10 +144,10 @@ class Parser:
         if label_match:
             return ast.Label(line.no, label_match.group(1))
         if _starts_word(upper, "PRINT"):
-            expr_text = text[5:].strip()
+            expr_text = _after_keyword(text, "PRINT")
             return ast.Print(line.no, parse_expr(expr_text, line.no) if expr_text else None)
         if _starts_word(upper, "CALL"):
-            name, args = self.parse_call(text[4:].strip(), line.no)
+            name, args = self.parse_call(_after_keyword(text, "CALL"), line.no)
             return ast.Call(line.no, name, args)
         if _starts_word(upper, "TRY"):
             return self.parse_try(line, text)
@@ -153,11 +158,11 @@ class Parser:
         if _starts_word(upper, "WHILE"):
             return self.parse_while(line, text)
         if _starts_word(upper, "GOTO"):
-            return ast.Goto(line.no, self.parse_label_ref(text[4:].strip(), line.no))
+            return ast.Goto(line.no, self.parse_label_ref(_after_keyword(text, "GOTO"), line.no))
         if _starts_word(upper, "GOSUB"):
-            return ast.Gosub(line.no, self.parse_label_ref(text[5:].strip(), line.no))
+            return ast.Gosub(line.no, self.parse_label_ref(_after_keyword(text, "GOSUB"), line.no))
         if _starts_word(upper, "RETURN"):
-            expr_text = text[6:].strip()
+            expr_text = _after_keyword(text, "RETURN")
             return ast.Return(line.no, parse_expr(expr_text, line.no) if expr_text else None)
         if upper == "END":
             return ast.End(line.no)
@@ -165,6 +170,11 @@ class Parser:
             return ast.Cls(line.no)
         if _starts_word(upper, "THROW"):
             return self.parse_throw(line, text)
+        if _starts_word(upper, "AWAIT") or _starts_word(upper, "SYNC"):
+            # 独立成句的 AWAIT/SYNC：执行异步操作并丢弃结果
+            expr = self.try_parse_await_sync_expr(text, line.no)
+            assert expr is not None  # 前缀已确认，必命中
+            return ast.AwaitStmt(line.no, expr)
         if upper.startswith("CATCH") or upper == ".ENDTRY":
             raise SonCompileError(f"孤立的 `{text}`", line.no)
         input_stmt = self.try_parse_input(text, line.no)
@@ -179,7 +189,7 @@ class Parser:
 
     def parse_try(self, line: SourceLine, text: str) -> ast.TryCatch:
         match = re.match(
-            r"^TRY\s+CALL\s+(.+)\s+TRACEBACK\s+ERROR\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$",
+            rf"^TRY\s+CALL\s+(.+)\s+TRACEBACK\s+ERROR\s+AS\s+({_NAME})$",
             text,
             re.IGNORECASE,
         )
@@ -201,7 +211,7 @@ class Parser:
                 return ast.TryCatch(line.no, call_name, args, traceback_var, catches)
             if _is_block_terminator(upper) and not _starts_word(upper, "CATCH"):
                 break
-            catch_match = re.match(r"^CATCH\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$", current_text, re.IGNORECASE)
+            catch_match = re.match(rf"^CATCH\s+({_NAME})\s+AS\s+({_NAME})$", current_text, re.IGNORECASE)
             if not catch_match:
                 raise SonCompileError("TRY 内只能包含 CATCH 分支", current.no)
             self.i += 1
@@ -216,8 +226,8 @@ class Parser:
         raise SonCompileError("TRY 缺少 .ENDTRY", line.no)
 
     def parse_throw(self, line: SourceLine, text: str) -> ast.ThrowNew | ast.ThrowVar:
-        rest = text[5:].strip()
-        new_match = re.match(r"^NEW\s+([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(.+)$", rest, re.IGNORECASE)
+        rest = _after_keyword(text, "THROW")
+        new_match = re.match(rf"^NEW\s+({_NAME})\s*,\s*(.+)$", rest, re.IGNORECASE)
         if new_match:
             return ast.ThrowNew(line.no, new_match.group(1).upper(), parse_expr(new_match.group(2), line.no))
         _validate_name(rest, line.no)
@@ -272,7 +282,7 @@ class Parser:
 
     def parse_for(self, line: SourceLine, text: str) -> ast.ForLoop:
         match = re.match(
-            r"^FOR\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s+TO\s+(.+?)(?:\s+STEP\s+(.+))?$",
+            rf"^FOR\s+({_NAME})\s*=\s*(.+?)\s+TO\s+(.+?)(?:\s+STEP\s+(.+))?$",
             text,
             re.IGNORECASE,
         )
@@ -313,13 +323,14 @@ class Parser:
         raise SonCompileError("WHILE 缺少 .ENDWHILE", line.no)
 
     def parse_use(self, line: SourceLine) -> ast.UseModule:
-        match = re.match(r"^USE\s+([A-Za-z0-9_.]+)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$", line.text, re.IGNORECASE)
+        # 模块名首字符允许是数字（跟普通标识符不同），第一段故意不套 _DOTTED_NAME
+        match = re.match(rf"^USE\s+([A-Za-z0-9_.]+)\s+AS\s+({_NAME})$", line.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("USE 必须写成 `USE 模块名 AS 别名`", line.no)
         return ast.UseModule(match.group(1).upper(), match.group(2), line.no)
 
     def parse_usec(self, line: SourceLine) -> ast.UseCHeader:
-        match = re.match(r'^USEC\s+(.+?)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$', line.text, re.IGNORECASE)
+        match = re.match(rf'^USEC\s+(.+?)\s+AS\s+({_NAME})$', line.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("USEC 必须写成 `USEC \"header.h\" AS 别名` 或 `USEC <header> AS 别名`", line.no)
         raw = match.group(1).strip()
@@ -333,7 +344,7 @@ class Parser:
         return ast.UseCHeader(raw, alias, False, line.no)
 
     def parse_uselib(self, line: SourceLine) -> ast.UseLibrary:
-        match = re.match(r'^USELIB\s+(.+?)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$', line.text, re.IGNORECASE)
+        match = re.match(rf'^USELIB\s+(.+?)\s+AS\s+({_NAME})$', line.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("USELIB 必须写成 `USELIB \"lib\" AS 别名`", line.no)
         lib = match.group(1).strip()
@@ -342,7 +353,7 @@ class Parser:
         return ast.UseLibrary(lib, match.group(2), line.no)
 
     def parse_c_decl(self, line: SourceLine) -> ast.CFunctionDecl:
-        match = re.match(r'^DECLARE\s+C\s+(SUB|FUNCTION)\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s+AS\s+(.+)$', line.text, re.IGNORECASE)
+        match = re.match(rf'^DECLARE\s+C\s+(SUB|FUNCTION)\s+({_NAME})\.({_NAME})\s*\((.*)\)\s+AS\s+(.+)$', line.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("DECLARE C 必须写成 `DECLARE C SUB/FUNCTION 别名.函数名(参数...) AS 返回类型`", line.no)
         alias = match.group(2)
@@ -360,7 +371,7 @@ class Parser:
 
         name = tokens[1]
         array_size = None
-        array_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]$", name)
+        array_match = re.match(rf"^({_NAME})\[(\d+)\]$", name)
         if array_match:
             name = array_match.group(1)
             array_size = int(array_match.group(2))
@@ -398,17 +409,19 @@ class Parser:
             line.no,
         )
 
-    def parse_sub_header(self, line: SourceLine) -> tuple[str, list[ast.Param], str, ast.TypeSpec]:
+    def parse_sub_header(self, line: SourceLine) -> tuple[str, list[ast.Param], str, ast.TypeSpec, bool]:
         # 括号前允许空白：贴不贴函数名都行，否则参数表会整段掉进 suffix，
-        # 报出「未知 SUB 修饰符: (a」这种完全看不懂的错
-        match = re.match(r"^SUB\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?(.*)$", line.text, re.IGNORECASE)
+        # 报出「未知 SUB 修饰符: (a」这种完全看不懂的错。
+        # 可选的 ASYNC 前缀把这个 SUB 标成协程（编译成无栈状态机 + PROMISE 返回）。
+        match = re.match(rf"^(ASYNC\s+)?SUB\s+({_NAME})\s*(?:\((.*)\))?(.*)$", line.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("SUB 头不完整", line.no)
 
-        name = match.group(1)
+        is_async = match.group(1) is not None
+        name = match.group(2)
         _validate_name(name, line.no)
-        params = self.parse_params(match.group(2) or "", line.no)
-        suffix_tokens = (match.group(3) or "").strip().split()
+        params = self.parse_params(match.group(3) or "", line.no)
+        suffix_tokens = (match.group(4) or "").strip().split()
         visibility = "PRIVATE"
         return_type = ast.TypeSpec("VOID")
 
@@ -431,7 +444,7 @@ class Parser:
             else:
                 raise SonCompileError(f"未知 SUB 修饰符: {suffix_tokens[i]}", line.no)
 
-        return name, params, visibility, return_type
+        return name, params, visibility, return_type, is_async
 
     def parse_params(self, text: str, line_no: int) -> list[ast.Param]:
         if not text.strip():
@@ -454,7 +467,7 @@ class Parser:
         return params
 
     def try_parse_input(self, text: str, line_no: int) -> ast.Input | None:
-        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\.INPUT\s+(.+)$", text, re.IGNORECASE)
+        match = re.match(rf"^({_NAME})\.INPUT\s+(.+)$", text, re.IGNORECASE)
         if not match:
             return None
         rest = match.group(2)
@@ -477,11 +490,21 @@ class Parser:
         target = parse_expr(left_text, line_no)
         if not isinstance(target, ast.VarRef | ast.Deref | ast.Index):
             return None
-        call_expr = self.try_parse_call_expr(expr_text, line_no)
-        return ast.Assign(line_no, target, call_expr or parse_expr(expr_text, line_no))
+        # 赋值右侧允许 AWAIT / SYNC / CALL 这些语句级关键字打头，其余走普通表达式
+        right = self.try_parse_await_sync_expr(expr_text, line_no) or self.try_parse_call_expr(expr_text, line_no)
+        return ast.Assign(line_no, target, right or parse_expr(expr_text, line_no))
+
+    def try_parse_await_sync_expr(self, text: str, line_no: int) -> ast.Expr | None:
+        stripped = text.strip()
+        upper = stripped.upper()
+        if _starts_word(upper, "AWAIT"):
+            return ast.AwaitExpr(line_no, parse_expr(_after_keyword(stripped, "AWAIT"), line_no))
+        if _starts_word(upper, "SYNC"):
+            return ast.SyncExpr(line_no, parse_expr(_after_keyword(stripped, "SYNC"), line_no))
+        return None
 
     def parse_call(self, text: str, line_no: int) -> tuple[str, list[ast.Expr]]:
-        match = re.match(r"^([A-Za-z_][A-Za-z0-9_.]*)(?:\((.*)\))?$", text, re.IGNORECASE)
+        match = re.match(rf"^({_DOTTED_NAME})(?:\((.*)\))?$", text, re.IGNORECASE)
         if not match:
             raise SonCompileError("CALL 必须写成 `CALL name` 或 `CALL name(args...)`", line_no)
         name = match.group(1)
@@ -495,7 +518,7 @@ class Parser:
     def try_parse_call_expr(self, text: str, line_no: int) -> ast.CallExpr | None:
         if not _starts_word(text.strip().upper(), "CALL"):
             return None
-        name, args = self.parse_call(text.strip()[4:].strip(), line_no)
+        name, args = self.parse_call(_after_keyword(text.strip(), "CALL"), line_no)
         return ast.CallExpr(line_no, name, args)
 
     def parse_label_ref(self, text: str, line_no: int) -> str:
@@ -520,6 +543,13 @@ def _starts_word(text: str, word: str) -> bool:
     return text == word or text.startswith(word + " ")
 
 
+def _after_keyword(text: str, keyword: str) -> str:
+    """剥掉开头的关键字，返回剩下的部分（已 strip）。替代散落各处的 `text[5:]` 魔法切片——
+    那种写法把关键字长度手数成数字，关键字每处等于写两遍（一遍判断、一遍数字），
+    改个关键字名就得同步改数字，漏一个就是指向无关位置的隐蔽 bug。"""
+    return text[len(keyword):].strip()
+
+
 # 所有块终结符（外加 SUB 头，它同样不可能出现在块体里）。任何嵌套块的语句循环撞见
 # 不属于自己的终结符都要立刻停手且不消费，由外层块去报「缺少对应终结符」。否则终结符
 # 会被当成普通语句解析，报出来的是「无法解析的语句: .ENDFOR」这种指向无关行的级联噪音，
@@ -533,6 +563,7 @@ def _is_block_terminator(upper: str) -> bool:
         or _starts_word(upper, "ELSE IF")
         or _starts_word(upper, "CATCH")
         or _starts_word(upper, "SUB")
+        or _starts_word(upper, "ASYNC")
     )
 
 
@@ -550,6 +581,17 @@ def _read_as_parts(tokens: list[str], line_no: int) -> list[str]:
         parts.append(tokens[i + 1].upper())
         i += 2
     return parts
+
+
+# 类型声明里能出现的全部关键字，权威来源。expr_parser 做 CAST 类型扫描时从这里派生
+# 子集（CAST_TYPE_KEYWORDS），加新类型不会再漏掉 CAST 那一处、导致 `CAST 新类型 x` 扫不到。
+_TYPE_DECL_KEYWORDS = frozenset({
+    "NUM", "LONG", "DOUBLE", "FLOAT",
+    "STRING", "SYMBOL", "ERROR", "CPTR", "BOOL", "VOID",
+    "ENTITY", "HANDLE", "PTR", "TO", "PROMISE", "OF", "AS",
+})
+# CAST 不接受 PROMISE OF——那是 async 的返回类型，语言里不允许强转过去。
+CAST_TYPE_KEYWORDS = _TYPE_DECL_KEYWORDS - {"PROMISE", "OF"}
 
 
 def _parse_type_parts(parts: list[str], line_no: int) -> ast.TypeSpec:
@@ -575,6 +617,10 @@ def _parse_type_tokens(tokens: list[str], line_no: int) -> ast.TypeSpec:
     if first == "PTR" and len(tokens) > 1 and tokens[1].upper() == "TO":
         inner = _parse_type_tokens(tokens[2:], line_no)
         return ast.TypeSpec("PTR", inner=inner)
+    if first == "PROMISE" and len(tokens) > 1 and tokens[1].upper() == "OF":
+        # PROMISE OF <类型>：结果类型放进 inner，与 PTR TO T 同构
+        inner = _parse_type_tokens(tokens[2:], line_no)
+        return ast.TypeSpec("PROMISE", inner=inner)
     if len(tokens) == 1 and first in {"STRING", "SYMBOL", "ERROR", "CPTR", "VOID", "BOOL"}:
         return ast.TypeSpec(first)
     raise SonCompileError("无法识别的类型声明", line_no)

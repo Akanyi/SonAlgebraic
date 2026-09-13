@@ -7,7 +7,7 @@ from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
 from ..core.lines import LINT_OPTIONS
-from .typesys import BUILTIN_MODULES, describe_type, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
+from .typesys import BUILTIN_MODULES, describe_type, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_promise, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
 
 
 @dataclass(frozen=True)
@@ -135,6 +135,12 @@ def collect_sub_diagnostics(
 
     try:
         reject_end_in_sub(sub.body)
+    except SonCompileError as exc:
+        if _add_diagnostic(diagnostics, exc, max_errors):
+            return
+
+    try:
+        check_await_placement(sub.body, sub.is_async)
     except SonCompileError as exc:
         if _add_diagnostic(diagnostics, exc, max_errors):
             return
@@ -298,6 +304,8 @@ def collect_subs(
             if key_param in seen_params:
                 raise SonCompileError(f"重复参数: {param.name}", param.line_no)
             seen_params.add(key_param)
+            if sub.is_async and param.by_ref:
+                raise SonCompileError("ASYNC SUB 不支持 AS REF 参数（协程帧需独占参数所有权）", param.line_no)
             reject_use_alias_conflict(param.name, uses, param.line_no)
             reject_unsupported_type(param.type_spec, param.line_no, allow_entity=True, uses=uses, external_modules=external_modules)
         subs[key] = sub
@@ -321,6 +329,7 @@ def check_sub(
 
     labels = collect_labels(sub.body)
     reject_end_in_sub(sub.body)
+    check_await_placement(sub.body, sub.is_async)
     for stmt in sub.body:
         check_stmt(stmt, scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
         check_return(stmt, sub.return_type, scope, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
@@ -409,6 +418,37 @@ def has_required_return_path(body: list[ast.Stmt], jump_targets: set[str] | None
             return False
         return False
     return False
+
+
+def _reject_await_here(is_async: bool, in_try: bool, line_no: int) -> None:
+    if not is_async:
+        raise SonCompileError("AWAIT 只能在 ASYNC SUB 内使用；同步取值请用 SYNC", line_no)
+    if in_try:
+        raise SonCompileError("AWAIT 暂不支持出现在 TRY 块内（协程挂起会破坏异常栈）", line_no)
+
+
+def check_await_placement(body: list[ast.Stmt], is_async: bool, in_try: bool = False) -> None:
+    """AWAIT 的位置约束：只能在 ASYNC SUB 内、且不能落在 TRY 块体内。
+
+    AWAIT / SYNC 经解析后只可能出现在 Assign 右侧或独立 AwaitStmt（表达式中间已被
+    expr_parser 拦死），所以这里只需扫这两处 + 递归复合语句，不必深挖任意表达式树。
+    SYNC 是同步阻塞驱动、不挂起当前帧，因此不受这两条约束。
+    """
+    for stmt in body:
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.expr, ast.AwaitExpr):
+            _reject_await_here(is_async, in_try, stmt.line_no)
+        elif isinstance(stmt, ast.AwaitStmt) and isinstance(stmt.expr, ast.AwaitExpr):
+            _reject_await_here(is_async, in_try, stmt.line_no)
+        elif isinstance(stmt, ast.If):
+            check_await_placement(stmt.body, is_async, in_try)
+            for branch in stmt.elifs:
+                check_await_placement(branch.body, is_async, in_try)
+            check_await_placement(stmt.else_body, is_async, in_try)
+        elif isinstance(stmt, ast.ForLoop | ast.WhileLoop):
+            check_await_placement(stmt.body, is_async, in_try)
+        elif isinstance(stmt, ast.TryCatch):
+            for branch in stmt.catches:
+                check_await_placement(branch.body, is_async, in_try=True)
 
 
 def check_return(
@@ -521,6 +561,8 @@ def check_stmt(
         if sub is None and c_func is None:
             raise SonCompileError(f"未知 SUB 或 C 函数: {stmt.name}", stmt.line_no)
         target = sub if sub is not None else c_func
+        if sub is not None and sub.is_async:
+            raise SonCompileError("ASYNC SUB 不能用独立 CALL 调用；请用 `AWAIT`、`SYNC` 或 `p = CALL ...`", stmt.line_no)
         if sub is not None and target.return_type.name != "VOID":
             raise SonCompileError("带返回值的 SUB 必须通过 `x = CALL name(...)` 使用", stmt.line_no)
         check_call_args(stmt.name, stmt.args, target, symbols, subs, entities, uses, external_modules, stmt.line_no, c_headers, c_libs, c_funcs)
@@ -531,6 +573,8 @@ def check_stmt(
         sub = subs.get(stmt.call_name.lower()) or resolve_external_sub(stmt.call_name, uses, external_modules)
         if sub is None:
             raise SonCompileError(f"未知 SUB: {stmt.call_name}", stmt.line_no)
+        if sub.is_async:
+            raise SonCompileError("TRY CALL 不能作用于 ASYNC SUB", stmt.line_no)
         check_call_args(stmt.call_name, stmt.args, sub, symbols, subs, entities, uses, external_modules, stmt.line_no, c_headers, c_libs, c_funcs)
         for branch in stmt.catches:
             branch_symbols = symbols.copy()
@@ -590,6 +634,8 @@ def check_stmt(
         if labels and stmt.label.lower() not in labels:
             raise SonCompileError(f"未知标签: {stmt.label}", stmt.line_no)
     elif isinstance(stmt, ast.Return) and stmt.expr is not None:
+        check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+    elif isinstance(stmt, ast.AwaitStmt):
         check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
 
 
@@ -663,6 +709,21 @@ def check_expr(
         for part in expr.parts:
             if isinstance(part, ast.Expr):
                 check_expr(part, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+    elif isinstance(expr, ast.AwaitExpr | ast.SyncExpr):
+        check_expr(expr.operand, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        keyword = "AWAIT" if isinstance(expr, ast.AwaitExpr) else "SYNC"
+        # 合法 operand 有三类：用户 ASYNC SUB 调用、返回 PROMISE 的内置调用（SYS.NET 的
+        # *_ASYNC）、以及已持有 PROMISE 的变量。前者靠 subs 直接认，后两者统一落到「type_of
+        # 是不是 PROMISE」——net async 调用的返回类型正是 PROMISE OF X，天然被接住。
+        callee = None
+        if isinstance(expr.operand, ast.CallExpr):
+            callee = subs.get(expr.operand.name.lower())
+        if callee is not None and callee.is_async:
+            pass
+        else:
+            operand_type = type_of(expr.operand, symbols, subs, entities, uses, external_modules, c_funcs)
+            if not is_promise(operand_type):
+                raise SonCompileError(f"{keyword} 只能作用于 ASYNC SUB 的调用或 PROMISE 值", expr.line_no)
     elif isinstance(expr, ast.CallExpr):
         sub = subs.get(expr.name.lower()) or resolve_external_sub(expr.name, uses, external_modules)
         c_func = resolve_c_func(expr.name, c_funcs)
@@ -734,7 +795,8 @@ def check_expr(
             raise SonCompileError(f"未知内置函数或 SUB: {expr.name}", expr.line_no)
         target = sub if sub is not None else c_func
         if target is not None:
-            if target.return_type.name == "VOID":
+            # ASYNC SUB 即使返回 VOID，其调用也产出 PROMISE（非 void 值），可作表达式
+            if target.return_type.name == "VOID" and not (sub is not None and sub.is_async):
                 raise SonCompileError("VOID SUB 或 C 函数不能作为表达式使用", expr.line_no)
             check_call_args(expr.name, expr.args, target, symbols, subs, entities, uses, external_modules, expr.line_no, c_headers, c_libs, c_funcs)
         for arg in expr.args:
@@ -847,6 +909,9 @@ def require_assignable(target: ast.TypeSpec, source: ast.TypeSpec, line_no: int)
     if target.name == "ENTITY" and source.name == "ENTITY" and (target.subtype or "").lower() == (source.subtype or "").lower():
         return
     if same_handle_kind(target, source):
+        return
+    # PROMISE 赋值（p = CALL asyncfoo()）：single-consumer + move，结果类型须逐层一致
+    if is_promise(target) and is_promise(source) and target.inner is not None and source.inner is not None and same_type_spec(target.inner, source.inner):
         return
     if is_symbol(target):
         return
@@ -1004,6 +1069,13 @@ def reject_unsupported_type(
         return
     if type_spec.name == "PTR":
         if type_spec.inner is not None:
+            reject_unsupported_type(type_spec.inner, line_no, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
+        return
+    if type_spec.name == "PROMISE":
+        if type_spec.inner is None:
+            raise SonCompileError("PROMISE 必须写成 `PROMISE OF <类型>`", line_no)
+        # 结果类型允许 VOID（async void sub 的 promise），其余按普通类型校验
+        if type_spec.inner.name != "VOID":
             reject_unsupported_type(type_spec.inner, line_no, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
         return
     if allow_entity and type_spec.name == "ENTITY":

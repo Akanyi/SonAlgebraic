@@ -25,7 +25,9 @@ RUNTIME_PRELUDE = r'''
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#ifdef SA_ENABLE_NET
+/* winsock2.h 必须在 windows.h 之前，且异步 I/O 也要它（WSAPoll、非阻塞 socket）。
+ * 首期 async 必伴 SYS.NET，NET 一定共现，但放宽到 NET||ASYNC 让头依赖自洽、不靠巧合。 */
+#if defined(SA_ENABLE_NET) || defined(SA_ENABLE_ASYNC)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #endif
@@ -58,7 +60,9 @@ RUNTIME_PRELUDE = r'''
 #else
 #include <unistd.h>
 #include <signal.h>
-#ifdef SA_ENABLE_NET
+/* 异步 I/O 与 NET 共用这批 socket/poll 头。放宽到 NET||ASYNC 让头依赖自洽——
+ * 首期 async 必伴 SYS.NET 只是巧合共现，不该拿它当头可见性的保证。 */
+#if defined(SA_ENABLE_NET) || defined(SA_ENABLE_ASYNC)
 #include <fcntl.h>
 #include <poll.h>
 #include <arpa/inet.h>
@@ -160,7 +164,8 @@ enum {
     SA_HANDLE_MAP = 8,
     SA_HANDLE_STR_MAP = 9,
     SA_HANDLE_GUI_WINDOW = 10,
-    SA_HANDLE_GUI_WIDGET = 11
+    SA_HANDLE_GUI_WIDGET = 11,
+    SA_HANDLE_PROMISE = 12
 };
 
 static SaHandle sa_handle_make(unsigned int kind, uint32_t generation, size_t index) {
@@ -4139,6 +4144,634 @@ static void sa_setup_console(void) {
     SetConsoleCP(CP_UTF8);
 #endif
 }
+
+/* ============================ 协程 / 异步运行时 ============================
+ * ASYNC SUB 编译成「无栈状态机」：一个协程帧（存状态号 + 跨 AWAIT 存活的局部）加一个
+ * resume 函数（顶部 switch 跳回上次挂起点，照抄 GOSUB 的返回地址派发）。单线程事件
+ * 循环轮转就绪队列——没有线程、没有栈切换，纯可移植 C。整块只在源码出现 ASYNC SUB
+ * 时注入（SA_ENABLE_ASYNC 由编译器按 AST 事实自动开，用户不写 USE）。 */
+#ifdef SA_ENABLE_ASYNC
+
+/* 异步 I/O 依赖 SYS.NET 的 socket 层。纯计算协程（源码有 ASYNC SUB 但没 USE SYS.NET）
+ * 也要能编过这套结构体，所以 socket fd 类型走一个别名：NET 在场时就是真 SaSocket，
+ * 不在场时退化成 int 占位——占位从不被赋值（没有 net async 调用），只为让结构体成立。 */
+#ifdef SA_ENABLE_NET
+typedef SaSocket SaNetSocket;
+#else
+typedef int SaNetSocket;
+#endif
+
+/* 所有协程帧的公共头，放在具体帧结构体的第一个成员——C 保证首成员地址等于结构体
+ * 地址，于是 SaCoroBase* 与帧指针可安全互转。调度器只认 SaCoroBase*，靠 resume 函数
+ * 指针回调具体协程体，运行时因此不必前向声明每个用户协程，解开了「运行时定义在前、
+ * 用户协程在后」的顺序死结。 */
+#ifndef SA_COROBASE_DEFINED
+#define SA_COROBASE_DEFINED
+typedef struct SaCoroBase {
+    int state;                            /* 0=未启动，-1=已终结，k>0=第 k 个挂起点 */
+    void (*resume)(struct SaCoroBase*);   /* 指向 codegen 生成的 sa_coro_<sub>_resume */
+    void (*cleanup)(struct SaCoroBase*);  /* 挂起中被回收时释放帧内 strdup 的参数/局部 */
+    SaHandle self;                        /* 自己的 promise 句柄 */
+    SaHandle awaited;                     /* 当前 AWAIT 的子 promise */
+} SaCoroBase;
+#endif
+
+enum {
+    SA_PROMISE_PENDING = 0,
+    SA_PROMISE_FULFILLED = 1,
+    SA_PROMISE_REJECTED = 2,
+    SA_PROMISE_CONSUMED = 3    /* 结果已被取走。single-consumer：再取即 runtime error */
+};
+
+#define SA_ASYNC_SLOT_COUNT 256
+
+typedef struct {
+    int live;
+    uint32_t generation;
+    int status;
+    /* 结果类型在编译期已知、运行时不记，只需一个标志区分「result 里躺着的是不是需要
+     * free 的堆字符串」——NUM/HANDLE 是值语义，STRING 是 move 进来的独占指针。 */
+    int has_string_result;
+    union {
+        double d;
+        long long i;
+        char* s;
+        SaHandle h;
+    } result;
+    char* error;              /* REJECTED 时的消息 */
+    SaCoroBase* coro;         /* 关联协程帧；纯值 promise 为 NULL */
+    SaHandle waiter;          /* 等它完成的协程（single-waiter，是 single-consumer 的推论）*/
+    /* I/O promise 专用：这类 promise 的 coro 为 NULL，不靠 resume 推进，而是登记一个
+     * fd 交给事件循环 poll，就绪后由循环执行真正的非阻塞 syscall 再 fulfill。字段仅在
+     * io_op != 0 时有效。io_fd 用 SaNetSocket——它在 NET 未启用时退化成 int 占位，
+     * 保证纯计算协程（无 SYS.NET）也能编译这个结构体。 */
+    int io_op;                /* 0=非 I/O，1=accept，2=recv，3=send */
+    SaNetSocket io_fd;        /* 要 poll 的 socket；accept 是监听 fd，recv/send 是流 fd */
+    SaHandle io_stream;       /* recv/send 的 NET_STREAM 句柄（syscall 时用它取最新 slot）*/
+    long long io_arg;         /* recv 的 max_bytes */
+    char* io_data;            /* send 待发数据（move 进来，slot 负责 free）*/
+    size_t io_sent;           /* send 已发字节，支持 poll 多轮续传 */
+    size_t io_len;            /* send 数据总长 */
+} SaAsyncSlot;
+
+static SaAsyncSlot sa_async_slots[SA_ASYNC_SLOT_COUNT];
+static int sa_async_cleanup_registered = 0;
+
+/* 回收一个未完成 I/O promise 时的游离 fd 处理钩子。真身在 NET 块里（只有 CONNECT 的 fd
+ * 尚未归属任何 stream 句柄，取消/丢弃时必须关掉），NET 未启用时是空操作。dispose 在无
+ * 条件区、abandon 定义在 NET 块之后，故这里前向声明。 */
+static void sa_net_io_abandon(SaAsyncSlot* slot);
+
+/* 就绪队列：可立即 resume 的协程句柄。环形缓冲，容量与槽位数相同——每个协程同一时刻
+ * 至多入队一次（挂起时不在队列里），故绝不溢出。 */
+static SaHandle sa_ready_queue[SA_ASYNC_SLOT_COUNT];
+static int sa_ready_head = 0;
+static int sa_ready_tail = 0;
+
+static SaAsyncSlot* sa_async_slot(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_PROMISE, SA_ASYNC_SLOT_COUNT, &index, &generation)) return NULL;
+    SaAsyncSlot* slot = &sa_async_slots[index];
+    return slot->live && slot->generation == generation ? slot : NULL;
+}
+
+/* 释放槽位持有的资源。已 CONSUMED 的字符串结果所有权已交出，这里不能再碰。 */
+static void sa_async_slot_dispose(SaAsyncSlot* slot) {
+    if (slot->has_string_result && slot->status == SA_PROMISE_FULFILLED) free(slot->result.s);
+    free(slot->error);
+    free(slot->io_data);
+    sa_net_io_abandon(slot);   /* CONNECT 的游离 fd 在这里关掉；其他 op 的 fd 归句柄所有，不碰 */
+    if (slot->coro) {
+        /* 协程还挂着（pending 中被 drop、或程序退出时未跑完）：帧里 strdup 的参数与 DIM
+         * 的局部尚未经过 resume 终结点清理，靠 codegen 生成的 cleanup 逐个释放。帧 calloc
+         * 零初始化，还没执行到的局部是 NULL，cleanup free(NULL) 安全。已正常 settle 的协程
+         * 其 coro 已在 settle 里置 NULL，走不到这里，故不会 double-free。 */
+        if (slot->coro->cleanup) slot->coro->cleanup(slot->coro);
+        free(slot->coro);
+        slot->coro = NULL;
+    }
+    slot->live = 0;
+    slot->status = SA_PROMISE_PENDING;
+    slot->has_string_result = 0;
+    slot->result.s = NULL;
+    slot->error = NULL;
+    slot->waiter = 0;
+    slot->io_op = 0;
+    slot->io_data = NULL;
+}
+
+static void sa_async_close_all(void) {
+    for (size_t i = 0; i < SA_ASYNC_SLOT_COUNT; i++) {
+        if (sa_async_slots[i].live) sa_async_slot_dispose(&sa_async_slots[i]);
+        sa_async_slots[i].generation++;
+    }
+}
+
+/* 分配 promise 槽位。coro 为关联协程帧（codegen 已 malloc）；纯值 promise 传 NULL。 */
+static SaHandle sa_promise_alloc(SaCoroBase* coro) {
+    for (size_t i = 0; i < SA_ASYNC_SLOT_COUNT; i++) {
+        SaAsyncSlot* slot = &sa_async_slots[i];
+        if (slot->live) continue;
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->live = 1;
+        slot->status = SA_PROMISE_PENDING;
+        slot->has_string_result = 0;
+        slot->result.i = 0;
+        slot->error = NULL;
+        slot->coro = coro;
+        slot->waiter = 0;
+        slot->io_op = 0;
+        slot->io_data = NULL;
+        slot->io_sent = 0;
+        slot->io_len = 0;
+        if (!sa_async_cleanup_registered) { atexit(sa_async_close_all); sa_async_cleanup_registered = 1; }
+        SaHandle handle = sa_handle_make(SA_HANDLE_PROMISE, slot->generation, i);
+        if (coro) coro->self = handle;
+        return handle;
+    }
+    fputs("SonAlgebraic runtime: too many live promises\n", stderr);
+    exit(1);
+}
+
+static void sa_coro_schedule(SaHandle promise) {
+    sa_ready_queue[sa_ready_tail] = promise;
+    sa_ready_tail = (sa_ready_tail + 1) % SA_ASYNC_SLOT_COUNT;
+}
+
+/* 协程终结（fulfill/reject 共用）：翻状态、回收帧、把等待者投入就绪队列。fulfill 内
+ * free 帧，故 RETURN 发射的 C 必须保证 fulfill 之后立即 return、不再触碰帧字段。 */
+static void sa_promise_settle(SaAsyncSlot* slot, int status) {
+    slot->status = status;
+    if (slot->coro) { free(slot->coro); slot->coro = NULL; }
+    if (slot->waiter) {
+        SaHandle waiter = slot->waiter;
+        slot->waiter = 0;
+        sa_coro_schedule(waiter);
+    }
+}
+
+static void sa_promise_fulfill_long(SaHandle promise, long long value) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) return;
+    slot->result.i = value;
+    sa_promise_settle(slot, SA_PROMISE_FULFILLED);
+}
+
+static void sa_promise_fulfill_double(SaHandle promise, double value) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) return;
+    slot->result.d = value;
+    sa_promise_settle(slot, SA_PROMISE_FULFILLED);
+}
+
+static void sa_promise_fulfill_handle(SaHandle promise, SaHandle value) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) return;
+    slot->result.h = value;
+    sa_promise_settle(slot, SA_PROMISE_FULFILLED);
+}
+
+/* STRING 结果：接管 value 的所有权（move）。协程帧清理时已把这个指针排除在外，故不会
+ * double-free；slot 持有它直到被 take 走或 promise 销毁。 */
+static void sa_promise_fulfill_str(SaHandle promise, char* value) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) { free(value); return; }
+    slot->result.s = value;
+    slot->has_string_result = 1;
+    sa_promise_settle(slot, SA_PROMISE_FULFILLED);
+}
+
+static void sa_promise_fulfill_void(SaHandle promise) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) return;
+    sa_promise_settle(slot, SA_PROMISE_FULFILLED);
+}
+
+static void sa_promise_reject(SaHandle promise, const char* message) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) return;
+    slot->error = sa_strdup(message ? message : "async error");
+    sa_promise_settle(slot, SA_PROMISE_REJECTED);
+}
+
+/* take 前的公共校验。single-consumer 违规、取到未完成或已失效句柄都在这里拦死；取到被
+ * 拒的 promise 则把协程内未捕获的错误重抛给当前上下文。 */
+static SaAsyncSlot* sa_promise_require(SaHandle promise) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) {
+        fputs("SonAlgebraic runtime: invalid or dead promise\n", stderr);
+        exit(1);
+    }
+    if (slot->status == SA_PROMISE_CONSUMED) {
+        fputs("SonAlgebraic runtime: promise already consumed (a PROMISE can be taken only once)\n", stderr);
+        exit(1);
+    }
+    if (slot->status == SA_PROMISE_REJECTED) {
+        sa_raise_new("ERR_ASYNC", slot->error ? slot->error : "async error", 0, "<coroutine>");
+        sa_throw_dispatch();   /* 不返回 */
+    }
+    if (slot->status != SA_PROMISE_FULFILLED) {
+        fputs("SonAlgebraic runtime: took a pending promise\n", stderr);
+        exit(1);
+    }
+    return slot;
+}
+
+static long long sa_promise_take_long(SaHandle promise) {
+    SaAsyncSlot* slot = sa_promise_require(promise);
+    long long value = slot->result.i;
+    slot->status = SA_PROMISE_CONSUMED;
+    return value;
+}
+
+static double sa_promise_take_double(SaHandle promise) {
+    SaAsyncSlot* slot = sa_promise_require(promise);
+    double value = slot->result.d;
+    slot->status = SA_PROMISE_CONSUMED;
+    return value;
+}
+
+static SaHandle sa_promise_take_handle(SaHandle promise) {
+    SaAsyncSlot* slot = sa_promise_require(promise);
+    SaHandle value = slot->result.h;
+    slot->status = SA_PROMISE_CONSUMED;
+    return value;
+}
+
+/* move 出字符串结果：调用方接管指针，slot 交出所有权（销毁时不再 free）。 */
+static char* sa_promise_take_str(SaHandle promise) {
+    SaAsyncSlot* slot = sa_promise_require(promise);
+    char* value = slot->result.s;
+    slot->result.s = NULL;
+    slot->has_string_result = 0;
+    slot->status = SA_PROMISE_CONSUMED;
+    return value;
+}
+
+static void sa_promise_take_void(SaHandle promise) {
+    SaAsyncSlot* slot = sa_promise_require(promise);
+    slot->status = SA_PROMISE_CONSUMED;
+}
+
+/* 协程 base 在 AWAIT awaited：子 promise 已完成就直接把自己排回就绪队列，否则登记为
+ * 子 promise 的等待者，等它 fulfill 时被唤醒。 */
+static void sa_coro_await(SaCoroBase* base, SaHandle awaited) {
+    base->awaited = awaited;
+    SaAsyncSlot* slot = sa_async_slot(awaited);
+    if (!slot) {
+        fputs("SonAlgebraic runtime: AWAIT on invalid promise\n", stderr);
+        exit(1);
+    }
+    if (slot->status == SA_PROMISE_PENDING) {
+        slot->waiter = base->self;
+    } else {
+        sa_coro_schedule(base->self);
+    }
+}
+
+/* ---- 异步网络 I/O ------------------------------------------------------- */
+/* 整段只在 NET 与 ASYNC 同时启用时编译：它引用 SaSocket、sa_net_stream_slot、accept/
+ * recv/send 这些 NET 层符号。纯计算协程（无 SYS.NET）跳过整段，事件循环里对应的 poll
+ * 分支也随之关掉——那种程序本就没有 I/O promise，只靠 resume 推进。
+ *
+ * accept/recv/send 的异步版分两半：登记阶段只记下 fd 和操作类型、绝不 syscall；就绪
+ * 阶段由事件循环 poll 醒来后执行真正的非阻塞 syscall 再 fulfill。connect 不在其列——
+ * 它的 fd 是白纸，poll 不知道要连谁，必须先 syscall 才能等，留到阶段 3。 */
+#ifdef SA_ENABLE_NET
+
+/* I/O 操作码。0 保留给「非 I/O promise」。每个常量单独一行——切分器靠行首模式认
+ * enum 常量当作本片段的 provides，挤在一行会漏掉后两个，闭包就会报悬空依赖。 */
+enum {
+    SA_IO_ACCEPT = 1,
+    SA_IO_RECV = 2,
+    SA_IO_SEND = 3,
+    SA_IO_CONNECT = 4
+};
+
+/* 单个 fd 的 poll 抽象：Win 用 WSAPoll（无 FD_SETSIZE 上限，胜过 select），POSIX 用
+ * poll。want_write 选等可写（send）还是可读（accept/recv）。返回 >0 就绪、0 超时、
+ * <0 出错。timeout_ms<0 表示无限等。 */
+static int sa_async_poll_one(SaSocket fd, int want_write, int timeout_ms) {
+#ifdef _WIN32
+    WSAPOLLFD pfd;
+    pfd.fd = fd;
+    pfd.events = (short)(want_write ? POLLWRNORM : POLLRDNORM);
+    pfd.revents = 0;
+    return WSAPoll(&pfd, 1, timeout_ms);
+#else
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = (short)(want_write ? POLLOUT : POLLIN);
+    pfd.revents = 0;
+    int result;
+    do {
+        result = poll(&pfd, 1, timeout_ms);
+    } while (result < 0 && errno == EINTR);
+    return result;
+#endif
+}
+
+/* 登记一个 I/O promise：设 fd 非阻塞、记下操作，投入就绪队列让事件循环第一轮就检查它。
+ * 不做任何 syscall。coro=NULL——它不靠 resume 推进。 */
+static SaHandle sa_net_io_promise_new(int op, SaSocket fd, SaHandle stream, long long arg, char* data) {
+    SaHandle promise = sa_promise_alloc(NULL);
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    sa_net_set_nonblocking(fd, 1);
+    slot->io_op = op;
+    slot->io_fd = fd;
+    slot->io_stream = stream;
+    slot->io_arg = arg;
+    slot->io_data = data;
+    slot->io_sent = 0;
+    slot->io_len = data ? strlen(data) : 0;
+    sa_coro_schedule(promise);   /* 让 run_until 的就绪轮先扫到它，判定需 poll */
+    return promise;
+}
+
+static SaHandle sa_net_accept_promise(SaHandle listener_handle) {
+    SaNetSocketSlot* listener = sa_tcp_listener_slot(listener_handle);
+    if (!listener) {
+        SaHandle promise = sa_promise_alloc(NULL);
+        sa_promise_reject(promise, "invalid or closed TCP_LISTENER handle");
+        return promise;
+    }
+    return sa_net_io_promise_new(SA_IO_ACCEPT, listener->socket, listener_handle, 0, NULL);
+}
+
+static SaHandle sa_net_recv_promise(SaHandle stream_handle, long long max_bytes) {
+    SaNetSocketSlot* slot = sa_net_stream_slot(stream_handle);
+    if (!slot) {
+        SaHandle promise = sa_promise_alloc(NULL);
+        sa_promise_reject(promise, "invalid or closed NET_STREAM handle");
+        return promise;
+    }
+    return sa_net_io_promise_new(SA_IO_RECV, slot->socket, stream_handle, max_bytes, NULL);
+}
+
+static SaHandle sa_net_send_promise(SaHandle stream_handle, const char* text) {
+    SaNetSocketSlot* slot = sa_net_stream_slot(stream_handle);
+    if (!slot) {
+        SaHandle promise = sa_promise_alloc(NULL);
+        sa_promise_reject(promise, "invalid or closed NET_STREAM handle");
+        return promise;
+    }
+    /* 拷一份待发数据进 slot：调用点的字符串是临时量，poll 可能要多轮才发完。 */
+    return sa_net_io_promise_new(SA_IO_SEND, slot->socket, stream_handle, 0, sa_strdup(text ? text : ""));
+}
+
+/* 异步 connect：与 accept/recv/send 不同——它的 fd 是新建的白纸，poll 无从等起，必须先
+ * 真的发起非阻塞 connect()。立即连上（本地常见）就直接 fulfill；EINPROGRESS/WSAEWOULDBLOCK
+ * 则登记 writable，poll 醒来后由 try_complete 用 getsockopt(SO_ERROR) 验成败。这个 fd 在
+ * fulfill 前不属于任何 stream 句柄，是游离的——被取消时 sa_net_io_abandon 负责关掉。 */
+static SaHandle sa_net_connect_promise(const char* host, long long port) {
+    SaHandle promise = sa_promise_alloc(NULL);
+    char port_text[16];
+    if (!host || !host[0]) { sa_promise_reject(promise, "host must not be empty"); return promise; }
+    if (!sa_net_port_text(port, port_text, sizeof(port_text))) { sa_promise_reject(promise, "invalid port"); return promise; }
+    /* connect 会新建 socket，可能是整个程序的第一个 net 操作（纯客户端里没先 TCP_LISTEN/
+     * TCP_CONNECT 触发过 WSAStartup）。accept/recv/send 拿的是现成句柄，winsock 早就起了，
+     * 唯独这里必须自己确保初始化，否则 Windows 上 getaddrinfo 直接失败。 */
+    if (!sa_net_initialize()) { sa_promise_reject(promise, "network init failed"); return promise; }
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo* result = NULL;
+    if (getaddrinfo(host, port_text, &hints, &result) != 0) {
+        sa_promise_reject(promise, "address lookup failed");
+        return promise;
+    }
+    SaSocket pending_fd = SA_NET_INVALID_SOCKET;
+    for (struct addrinfo* item = result; item; item = item->ai_next) {
+        SaSocket fd = (SaSocket)socket(item->ai_family, item->ai_socktype, item->ai_protocol);
+        if (fd == SA_NET_INVALID_SOCKET) continue;
+        if (!sa_net_set_nonblocking(fd, 1)) { sa_net_close_socket(fd); continue; }
+        if (connect(fd, item->ai_addr, (SaSockLen)item->ai_addrlen) == 0) {
+            /* 立即连上：转回阻塞（与同步/accept 出来的 stream 一致），异步 recv/send 会各自再设非阻塞 */
+            sa_net_set_nonblocking(fd, 0);
+            SaHandle stream = sa_net_take_stream(fd);
+            freeaddrinfo(result);
+            sa_promise_fulfill_handle(promise, stream);
+            return promise;
+        }
+        if (sa_net_connect_pending()) { pending_fd = fd; break; }  /* 进行中，交给 poll writable */
+        sa_net_close_socket(fd);                                    /* 立即失败，试下一个地址 */
+    }
+    freeaddrinfo(result);
+    if (pending_fd == SA_NET_INVALID_SOCKET) { sa_promise_reject(promise, "connect failed"); return promise; }
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    slot->io_op = SA_IO_CONNECT;
+    slot->io_fd = pending_fd;
+    slot->io_stream = 0;
+    slot->io_arg = 0;
+    slot->io_data = NULL;
+    slot->io_sent = 0;
+    slot->io_len = 0;
+    sa_coro_schedule(promise);   /* 让 run_until 的就绪轮先扫到它，判定需 poll */
+    return promise;
+}
+
+/* 一个 I/O promise 就绪后执行非阻塞 syscall。would-block（伪就绪或 send 未发完）返回 0
+ * 表示「留在 pending 下轮重试」；完成返回 1（已 fulfill/reject）。 */
+static int sa_net_io_try_complete(SaHandle promise) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot || slot->io_op == 0) return 1;
+
+    if (slot->io_op == SA_IO_ACCEPT) {
+        struct sockaddr_storage peer;
+        SaSockLen peer_len = (SaSockLen)sizeof(peer);
+        SaSocket fd = accept(slot->io_fd, (struct sockaddr*)&peer, &peer_len);
+        if (fd == SA_NET_INVALID_SOCKET) {
+            if (sa_net_connect_pending()) return 0;   /* 伪就绪，下轮再来 */
+            sa_promise_reject(promise, "accept failed");
+            return 1;
+        }
+        SaHandle stream = sa_net_take_stream(fd);
+        slot->io_op = 0;
+        sa_promise_fulfill_handle(promise, stream);
+        return 1;
+    }
+
+    if (slot->io_op == SA_IO_RECV) {
+        long long max_bytes = slot->io_arg;
+        if (max_bytes <= 0 || (unsigned long long)max_bytes > (unsigned long long)INT_MAX) max_bytes = 65536;
+        char* buffer = (char*)malloc((size_t)max_bytes + 1);
+        if (!buffer) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+        int count = recv(slot->io_fd, buffer, (int)max_bytes, 0);
+        if (count < 0) {
+            free(buffer);
+            if (sa_net_connect_pending()) return 0;
+            sa_promise_reject(promise, "recv failed");
+            return 1;
+        }
+        buffer[count] = '\0';
+        slot->io_op = 0;
+        sa_promise_fulfill_str(promise, buffer);   /* move：slot 接管 buffer */
+        return 1;
+    }
+
+    if (slot->io_op == SA_IO_SEND) {
+        while (slot->io_sent < slot->io_len) {
+            size_t remaining = slot->io_len - slot->io_sent;
+            int chunk = remaining > INT_MAX ? INT_MAX : (int)remaining;
+#ifdef _WIN32
+            int count = send(slot->io_fd, slot->io_data + slot->io_sent, chunk, 0);
+#else
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags = MSG_NOSIGNAL;
+#endif
+            int count = (int)send(slot->io_fd, slot->io_data + slot->io_sent, (size_t)chunk, flags);
+#endif
+            if (count <= 0) {
+                if (sa_net_connect_pending()) return 0;   /* 发送缓冲满，下轮续发 */
+                sa_promise_reject(promise, "send failed");
+                return 1;
+            }
+            slot->io_sent += (size_t)count;
+        }
+        long long total = (long long)slot->io_sent;
+        slot->io_op = 0;
+        free(slot->io_data);
+        slot->io_data = NULL;
+        sa_promise_fulfill_long(promise, total);
+        return 1;
+    }
+
+    if (slot->io_op == SA_IO_CONNECT) {
+        /* poll 报 writable 后用 SO_ERROR 判定连接成败——非阻塞 connect 的结果不看 connect()
+         * 返回值，而看这里。rc!=0（连状态都取不到）当作还没定、下轮重试。 */
+        int so_error = 0;
+        SaSockLen err_len = (SaSockLen)sizeof(so_error);
+#ifdef _WIN32
+        int rc = getsockopt(slot->io_fd, SOL_SOCKET, SO_ERROR, (char*)&so_error, &err_len);
+#else
+        int rc = getsockopt(slot->io_fd, SOL_SOCKET, SO_ERROR, &so_error, &err_len);
+#endif
+        if (rc != 0) return 0;
+        if (so_error == 0) {
+            SaSocket fd = slot->io_fd;
+            slot->io_op = 0;
+            sa_net_set_nonblocking(fd, 0);   /* 转回阻塞，与 accept/同步 connect 出来的 stream 一致 */
+            sa_promise_fulfill_handle(promise, sa_net_take_stream(fd));
+        } else {
+            sa_net_close_socket(slot->io_fd);
+            slot->io_op = 0;
+            sa_promise_reject(promise, "connect failed");
+        }
+        return 1;
+    }
+
+    return 1;
+}
+
+/* 扫描所有 live 的 pending I/O promise，poll 它们的 fd 一次，就绪者 try_complete。
+ * timeout_ms 传给 poll。返回本轮是否推进了任何 promise。 */
+static int sa_async_pump_io(int timeout_ms) {
+    /* 逐个 poll：I/O promise 通常很少（首期是单连接服务端节奏），逐个 poll 比维护一张
+     * 动态 pollfd 数组简单得多，也不影响正确性。第一个就绪就用它的超时预算。 */
+    int progressed = 0;
+    int any_pending = 0;
+    for (size_t i = 0; i < SA_ASYNC_SLOT_COUNT; i++) {
+        SaAsyncSlot* slot = &sa_async_slots[i];
+        if (!slot->live || slot->io_op == 0 || slot->status != SA_PROMISE_PENDING) continue;
+        any_pending = 1;
+        int want_write = (slot->io_op == SA_IO_SEND || slot->io_op == SA_IO_CONNECT);
+        int ready = sa_async_poll_one(slot->io_fd, want_write, timeout_ms);
+        if (ready > 0) {
+            SaHandle handle = sa_handle_make(SA_HANDLE_PROMISE, slot->generation, i);
+            if (sa_net_io_try_complete(handle)) progressed = 1;
+        }
+        timeout_ms = 0;   /* 后续 promise 只做非阻塞探测，别在一个 fd 上耗光超时 */
+    }
+    return progressed || !any_pending;
+}
+
+/* 有没有 live 的 pending I/O promise——事件循环用它决定「就绪队列空」时该 poll 还是判死锁。 */
+static int sa_async_has_pending_io(void) {
+    for (size_t i = 0; i < SA_ASYNC_SLOT_COUNT; i++) {
+        SaAsyncSlot* slot = &sa_async_slots[i];
+        if (slot->live && slot->io_op != 0 && slot->status == SA_PROMISE_PENDING) return 1;
+    }
+    return 0;
+}
+
+/* 丢弃一个 I/O promise 时的游离 fd 回收。只有 CONNECT 的 fd 还没交给任何 stream 句柄
+ * （accept/recv/send 的 fd 都归 listener/stream 句柄所有，句柄自己会关），取消一个仍在
+ * PENDING 的 CONNECT 时必须在这里把它关掉，否则连 fd 都泄漏。守 PENDING 是必须的而非优化：
+ * 已 reject 的 CONNECT 其 io_fd 早在 try_complete 里 close 过了，再关就是 double-close；
+ * 已 fulfill 的 CONNECT fd 已归句柄，更不能动。 */
+static void sa_net_io_abandon(SaAsyncSlot* slot) {
+    if (slot->io_op == SA_IO_CONNECT && slot->status == SA_PROMISE_PENDING) {
+        sa_net_close_socket(slot->io_fd);
+    }
+}
+
+#else  /* SA_ENABLE_NET 未启用：纯计算协程没有 I/O promise，这些是空操作占位 */
+static int sa_net_io_try_complete(SaHandle promise) { (void)promise; return 1; }
+static int sa_async_pump_io(int timeout_ms) { (void)timeout_ms; return 1; }
+static int sa_async_has_pending_io(void) { return 0; }
+static void sa_net_io_abandon(SaAsyncSlot* slot) { (void)slot; }
+#endif /* SA_ENABLE_NET */
+
+/* 驱动事件循环直到 target 完成。SYNC 从非协程上下文进入协程世界的唯一入口。
+ * 每轮先清空就绪队列（resume 协程 / 探测 I/O），队列空但仍有 I/O 挂起就阻塞 poll；
+ * 既无就绪协程又无 I/O 等待而 target 未完成 = 死锁，显式报错退出，绝不静默 hang。 */
+static void sa_event_loop_run_until(SaHandle target) {
+    for (;;) {
+        SaAsyncSlot* goal = sa_async_slot(target);
+        if (!goal) {
+            fputs("SonAlgebraic runtime: event loop on invalid promise\n", stderr);
+            exit(1);
+        }
+        if (goal->status != SA_PROMISE_PENDING) return;
+
+        if (sa_ready_head != sa_ready_tail) {
+            SaHandle next = sa_ready_queue[sa_ready_head];
+            sa_ready_head = (sa_ready_head + 1) % SA_ASYNC_SLOT_COUNT;
+            SaAsyncSlot* slot = sa_async_slot(next);
+            if (!slot || slot->status != SA_PROMISE_PENDING) continue;
+            if (slot->coro) {
+                slot->coro->resume(slot->coro);   /* 普通协程：推进状态机 */
+            } else if (slot->io_op != 0) {
+                /* I/O promise 第一次从就绪队列出来：先非阻塞探一次，没就绪就交给下面的
+                 * 阻塞 poll 轮。不重新入队——poll 轮会扫描所有 live 的 pending I/O。 */
+                sa_net_io_try_complete(next);
+            }
+            continue;
+        }
+
+        /* 就绪队列空：靠 I/O 推进。有 pending I/O 就阻塞等（100ms 一轮，够响应 target
+         * 完成又不会真卡死）；一个都没有则是死锁。纯计算协程（无 NET）永远走死锁分支，
+         * 因为它根本不会有 I/O promise——那正是「就绪队列空 = 没戏了」的正确判定。 */
+        if (!sa_async_has_pending_io()) {
+            fputs("SonAlgebraic runtime: async deadlock (no runnable coroutines)\n", stderr);
+            exit(1);
+        }
+        sa_async_pump_io(100);
+    }
+}
+
+/* PROMISE 作为局部托管资源离开作用域时释放，或显式丢弃一个 future。挂起中的协程被
+ * release = 取消：先斩断它与所等子 promise 的等待关系，否则子 promise 日后 settle 会去
+ * 唤醒一个已被 free 的帧（UAF）；同时级联取消那个子 promise（它可能又挂着自己的协程或
+ * I/O，一并回收）。已 settle 的协程 coro 已置 NULL、awaited 已无意义，直接 dispose。 */
+static void sa_promise_release(SaHandle promise) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot) return;
+    if (slot->status == SA_PROMISE_PENDING && slot->coro && slot->coro->awaited) {
+        SaHandle child = slot->coro->awaited;
+        slot->coro->awaited = 0;
+        SaAsyncSlot* cslot = sa_async_slot(child);
+        if (cslot && cslot->waiter == promise) cslot->waiter = 0;   /* 摘除等待链 */
+        sa_promise_release(child);                                   /* 级联取消 */
+    }
+    sa_async_slot_dispose(slot);
+}
+
+#endif /* SA_ENABLE_ASYNC */
 '''
 
 
@@ -4322,6 +4955,45 @@ void sa_print_double(double value);
 void sa_read_line(char* buffer, size_t size);
 void sa_cls(void);
 void sa_setup_console(void);
+
+#ifdef SA_ENABLE_ASYNC
+/* 分离编译时用户模块的协程帧把 SaCoroBase 按值内嵌作首成员、还要读 f->base.state 等，
+ * 所以共享头必须给出完整定义（不能是不透明前置声明）。SA_COROBASE_DEFINED 守卫保证它
+ * 与 RUNTIME_IMPL 里的同一份定义在 sa_runtime.c（同时含本头与去 static 的实现切片）中
+ * 只落一次，不会重定义。 */
+#ifndef SA_COROBASE_DEFINED
+#define SA_COROBASE_DEFINED
+typedef struct SaCoroBase {
+    int state;
+    void (*resume)(struct SaCoroBase*);
+    void (*cleanup)(struct SaCoroBase*);
+    SaHandle self;
+    SaHandle awaited;
+} SaCoroBase;
+#endif
+SaHandle sa_promise_alloc(SaCoroBase* coro);
+void sa_coro_schedule(SaHandle promise);
+void sa_coro_await(SaCoroBase* base, SaHandle awaited);
+void sa_event_loop_run_until(SaHandle target);
+void sa_promise_release(SaHandle promise);
+void sa_promise_reject(SaHandle promise, const char* message);
+void sa_promise_fulfill_long(SaHandle promise, long long value);
+void sa_promise_fulfill_double(SaHandle promise, double value);
+void sa_promise_fulfill_handle(SaHandle promise, SaHandle value);
+void sa_promise_fulfill_str(SaHandle promise, char* value);
+void sa_promise_fulfill_void(SaHandle promise);
+long long sa_promise_take_long(SaHandle promise);
+double sa_promise_take_double(SaHandle promise);
+SaHandle sa_promise_take_handle(SaHandle promise);
+char* sa_promise_take_str(SaHandle promise);
+void sa_promise_take_void(SaHandle promise);
+#ifdef SA_ENABLE_NET
+SaHandle sa_net_accept_promise(SaHandle listener_handle);
+SaHandle sa_net_recv_promise(SaHandle stream_handle, long long max_bytes);
+SaHandle sa_net_send_promise(SaHandle stream_handle, const char* text);
+SaHandle sa_net_connect_promise(const char* host, long long port);
+#endif
+#endif
 
 #endif
 '''

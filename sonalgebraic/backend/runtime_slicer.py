@@ -46,6 +46,7 @@ _FEATURE_NAMES = {
     "LIST": "list",
     "MAP": "map",
     "GUI": "gui",
+    "ASYNC": "async",
 }
 
 

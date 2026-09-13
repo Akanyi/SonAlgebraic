@@ -37,11 +37,6 @@ _PREFIX_PREC = 11
 # Python 都是这个约定。BNOT 是位运算，仍然走 _UNARY_PREC。
 _NOT_PREC = _PRECEDENCE["="]
 
-_CAST_TYPE_KEYWORDS = {
-    "PTR", "TO", "AS", "NUM", "LONG", "DOUBLE", "FLOAT",
-    "STRING", "SYMBOL", "ERROR", "CPTR", "ENTITY", "HANDLE", "BOOL", "VOID",
-}
-
 
 def parse_expr(text: str, line_no: int) -> ast.Expr:
     parser = ExprParser(tokenize_expr(text, line_no), line_no)
@@ -102,6 +97,10 @@ class ExprParser:
             if word == "CAST":
                 type_spec = self.parse_cast_type()
                 return ast.Cast(self.line_no, type_spec, self.parse(_PREFIX_PREC))
+            # AWAIT / SYNC 和 CALL 同属语句级关键字，表达式层不认识它们。提前拦下，
+            # 否则会被读成变量 `AWAIT` 再在后面的操作数上撞出指向无关位置的诊断。
+            if word in {"AWAIT", "SYNC"}:
+                self.reject_await_sync(word)
             # CALL 是语句级关键字，表达式层压根不认识它，会把它读成变量 `CALL` 然后在
             # 后面那个函数名上撞出「表达式缺少 `)`」之类指向无关位置的诊断。这里提前
             # 拦下 `CALL 名字` 这个形态，把用户真正要改的地方说清楚。
@@ -131,8 +130,15 @@ class ExprParser:
             self.line_no,
         )
 
+    def reject_await_sync(self, keyword: str) -> None:
+        raise SonCompileError(
+            f"`{keyword}` 不能出现在表达式中间；它只能独立成句，"
+            f"或占据整条赋值右侧（`x = {keyword} ...`）",
+            self.line_no,
+        )
+
     def parse_cast_type(self) -> ast.TypeSpec:
-        from .parser import _parse_type_parts
+        from .parser import _parse_type_parts, CAST_TYPE_KEYWORDS
 
         type_tokens: list[str] = []
         while True:
@@ -147,7 +153,7 @@ class ExprParser:
                 self.i += 1
                 break
             upper = token.value.upper()
-            if upper not in _CAST_TYPE_KEYWORDS:
+            if upper not in CAST_TYPE_KEYWORDS:
                 break
             type_tokens.append(upper)
             self.i += 1

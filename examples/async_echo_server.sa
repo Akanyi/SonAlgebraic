@@ -1,0 +1,40 @@
+10 REM 异步 echo server：单线程事件循环 + 非阻塞 socket，无线程。对照 web_server.sa
+20 REM 的同步 accept 循环——这里 accept/recv/send 全走 AWAIT，挂起时事件循环去 poll
+30 REM 别的 fd，就绪了再回来。首期异步 I/O 锁定服务端三件套：ACCEPT/RECV/SEND_ASYNC。
+40 USE SYS.NET AS N
+50 USE SYS.STRING AS S
+60 REM 处理一条连接：收一次、原样回写、关闭。整个函数是一个协程，三个 AWAIT 是三个
+70 REM 挂起点，其间事件循环可以去干别的。
+80 ASYNC SUB serve(conn AS HANDLE AS NET_STREAM) AS VOID
+90 DIM request AS STRING AS VAR
+100 DIM sent AS NUM AS LONG AS VAR
+110 DIM ok AS BOOL AS VAR
+120 request = AWAIT N.RECV_ASYNC(conn, 4096)
+130 sent = AWAIT N.SEND_ASYNC(conn, request)
+140 ok = N.STREAM_CLOSE(conn)
+150 RETURN
+160 .ENDSUB
+170 REM 接受一条连接并交给 serve 处理完。accept 挂起等新连接，来了之后 AWAIT serve
+180 REM 把这条连接的收发也走完，然后协程终结。
+190 ASYNC SUB accept_and_serve(listener AS HANDLE AS TCP_LISTENER) AS VOID
+200 DIM conn AS HANDLE AS NET_STREAM AS VAR
+210 conn = AWAIT N.ACCEPT_ASYNC(listener)
+220 AWAIT serve(conn)
+230 RETURN
+240 .ENDSUB
+250 SUB main AS PUBLIC AS VOID
+260 DIM listener AS HANDLE AS TCP_LISTENER AS VAR
+270 DIM ok AS BOOL AS VAR
+280 listener = N.TCP_LISTEN("127.0.0.1", 8090, 16)
+290 IF listener = NULL THEN
+300 PRINT F"listen failed: {N.LAST_ERROR()}"
+310 RETURN
+320 .ENDIF
+330 PRINT F"async echo server on 127.0.0.1:{N.LOCAL_PORT(listener)}"
+340 REM SYNC 从普通代码进入协程世界：驱动事件循环直到这一条连接处理完。
+350 SYNC accept_and_serve(listener)
+360 ok = N.TCP_LISTENER_CLOSE(listener)
+370 PRINT "server stopped"
+380 .ENDSUB
+390 CALL main
+400 END

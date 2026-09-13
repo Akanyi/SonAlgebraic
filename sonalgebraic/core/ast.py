@@ -98,6 +98,8 @@ class Subroutine:
     return_type: TypeSpec
     body: list["Stmt"]
     line_no: int
+    # ASYNC SUB：编译成无栈状态机协程，返回 PROMISE 而非直接返回值。
+    is_async: bool = False
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,12 @@ class Assign(Stmt):
 class Call(Stmt):
     name: str
     args: list["Expr"]
+
+
+@dataclass(frozen=True)
+class AwaitStmt(Stmt):
+    """独立成句的 AWAIT / SYNC，执行异步操作并丢弃结果。expr 是 AwaitExpr 或 SyncExpr。"""
+    expr: "Expr"
 
 
 @dataclass(frozen=True)
@@ -306,3 +314,17 @@ class Index(Expr):
 class CallExpr(Expr):
     name: str
     args: list[Expr]
+
+
+@dataclass(frozen=True)
+class AwaitExpr(Expr):
+    """AWAIT p / AWAIT asyncfoo()。operand 要么是 PROMISE 值，要么是对 ASYNC SUB 的
+    CallExpr（此时先隐式启动再等待）。语句级关键字，只能独立成句或占赋值右侧。"""
+    operand: Expr
+
+
+@dataclass(frozen=True)
+class SyncExpr(Expr):
+    """SYNC asyncfoo()。把 ASYNC SUB 按同步方式调用，当前执行流阻塞到结果出来。
+    operand 必须是对 ASYNC SUB 的 CallExpr。"""
+    operand: Expr

@@ -66,6 +66,10 @@ def runtime_features_for_program(program: ast.Program, uses: dict[str, str]) -> 
                 member = split[1].upper()
                 if member == "TLS_CONNECT":
                     features.add("tls")
+                if member in NET_ASYNC_MEMBERS:
+                    # 异步 I/O 也要协程运行时，且必伴 net——纯 net async 程序可能一个
+                    # 用户 ASYNC SUB 都没有，光靠下面的 is_async 检查会漏掉。
+                    features.add("async")
                 url_index = {
                     "GET": 0,
                     "STATUS": 0,
@@ -87,6 +91,10 @@ def runtime_features_for_program(program: ast.Program, uses: dict[str, str]) -> 
                 visit(item)
 
     visit(program)
+    # 语言内建：源码里只要出现 ASYNC SUB 就自动启用协程运行时（不经 USE），按 AST
+    # 事实触发才是「语言内建」——不像 SYS.NET 那样挂在 RUNTIME_FEATURE_MODULES 上。
+    if any(sub.is_async for sub in program.subs):
+        features.add("async")
     return features
 
 
@@ -134,6 +142,10 @@ def is_ptr(type_spec: ast.TypeSpec) -> bool:
 
 def is_handle(type_spec: ast.TypeSpec) -> bool:
     return type_spec.name == "HANDLE"
+
+
+def is_promise(type_spec: ast.TypeSpec) -> bool:
+    return type_spec.name == "PROMISE"
 
 
 def same_handle_kind(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
@@ -232,6 +244,12 @@ def type_of(
         if is_ptr(left) and is_numeric(right) and expr.op in {"+", "-"}:
             return left
         return wider_numeric(left, right, expr.line_no)
+    if isinstance(expr, ast.AwaitExpr | ast.SyncExpr):
+        # AWAIT / SYNC 剥掉一层 PROMISE，取出异步实例的结果类型。
+        operand_type = type_of(expr.operand, symbols, subs, entities, uses, external_modules, c_funcs)
+        if not is_promise(operand_type) or operand_type.inner is None:
+            raise SonCompileError("AWAIT / SYNC 只能作用于 PROMISE 或对 ASYNC SUB 的调用", expr.line_no)
+        return operand_type.inner
     if isinstance(expr, ast.CallExpr):
         name = expr.name.upper()
         if name == "NUMBER":
@@ -281,6 +299,10 @@ def type_of(
             return external_sub
         sub = subs.get(expr.name.lower())
         if sub is not None:
+            # ASYNC SUB 的调用产出 PROMISE OF <返回类型>，而非直接的返回值——
+            # 取现要靠 AWAIT / SYNC 剥掉这层 PROMISE。
+            if sub.is_async:
+                return ast.TypeSpec("PROMISE", inner=sub.return_type)
             return sub.return_type
     raise SonCompileError("无法推断表达式类型", expr.line_no)
 
@@ -307,6 +329,9 @@ def c_type(type_spec: ast.TypeSpec) -> str:
     if type_spec.name == "CPTR":
         return "void*"
     if type_spec.name == "HANDLE":
+        return "SaHandle"
+    if type_spec.name == "PROMISE":
+        # PROMISE 底层就是协程实例的 SaHandle（uint64 槽位句柄）
         return "SaHandle"
     if type_spec.name == "NUM" and type_spec.subtype == "LONG":
         return "long long"
@@ -360,7 +385,14 @@ def resolve_external_sub_type(name: str, external_modules: dict[str, ModuleExpor
     if module is None:
         return None
     sub = module.subs.get(member.lower())
-    return sub.return_type if sub is not None else None
+    if sub is None:
+        return None
+    # imported async sub 的调用同样产出 PROMISE OF <返回类型>（与本地 async 对齐），
+    # 这样跨模块的 SYNC/AWAIT 语义检查（靠 is_promise 接住）和取现类型都自然成立——
+    # 否则 imported async 会被当成普通 sub、直接返回内层类型，SYNC/AWAIT 反而报错。
+    if sub.is_async:
+        return ast.TypeSpec("PROMISE", inner=sub.return_type)
+    return sub.return_type
 
 
 def resolve_c_func(name: str, c_funcs: dict[str, ast.CFunctionDecl]) -> ast.CFunctionDecl | None:
@@ -474,7 +506,20 @@ NET_FUNCTIONS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
     "UDP_CLOSE": ([UDP_SOCKET_HANDLE], BOOL),
     "LOCAL_PORT": ([TCP_LISTENER_HANDLE], LONG),
     "UDP_LOCAL_PORT": ([UDP_SOCKET_HANDLE], LONG),
+    # 异步 I/O 三件套：返回 PROMISE OF X，由 AWAIT/SYNC 剥层取现。inner 就是对应
+    # 同步版的返回类型——ACCEPT_ASYNC 产 PROMISE OF NET_STREAM，RECV_ASYNC 产
+    # PROMISE OF STRING，SEND_ASYNC 产 PROMISE OF NUM。协程运行时靠这些触发（见
+    # runtime_features_for_program），用户不必写 USE。
+    "ACCEPT_ASYNC": ([TCP_LISTENER_HANDLE], ast.TypeSpec("PROMISE", inner=NET_STREAM_HANDLE)),
+    "RECV_ASYNC": ([NET_STREAM_HANDLE, LONG], ast.TypeSpec("PROMISE", inner=STRING)),
+    "SEND_ASYNC": ([NET_STREAM_HANDLE, STRING], ast.TypeSpec("PROMISE", inner=LONG)),
+    # 异步客户端：先发起非阻塞 connect() 再 poll writable，产 PROMISE OF NET_STREAM。
+    "CONNECT_ASYNC": ([STRING, LONG], ast.TypeSpec("PROMISE", inner=NET_STREAM_HANDLE)),
 }
+
+# SYS.NET 里返回 PROMISE 的成员：程序一旦用到就要开协程运行时，哪怕没写 ASYNC SUB
+# （纯转发 promise 的场景）。与 is_async sub 一起构成 async feature 的两个触发点。
+NET_ASYNC_MEMBERS = {"ACCEPT_ASYNC", "RECV_ASYNC", "SEND_ASYNC", "CONNECT_ASYNC"}
 
 FILE_FUNCTIONS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
     "OPEN": ([STRING, STRING], FILE_HANDLE),

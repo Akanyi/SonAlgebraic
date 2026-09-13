@@ -71,14 +71,15 @@ def test_no_fragment_has_a_dangling_dependency() -> None:
 
 
 def test_feature_blocks_are_kept_whole() -> None:
-    """7 个 feature 区必须整块存在，不能被切碎。
+    """feature 区必须整块存在，不能被切碎。
 
     它们内部藏着切分器啃不动的东西——BINARY 的 pack/unpack 是宏展开的、
     FILE 的 sa_stricmp_ascii 只通过 #define _stricmp 被引用、NET/TLS 有
-    Win 和 POSIX 两份完整实现。整块取舍才安全。
+    Win 和 POSIX 两份完整实现。ASYNC 块里裹着 poll/WSAPoll 的平台双实现。
+    整块取舍才安全。
     """
     features = {name for fragment in slicer.fragments() for name in fragment.features}
-    assert features == {"net", "file", "desktop", "binary", "list", "map", "gui"}
+    assert features == {"net", "file", "desktop", "binary", "list", "map", "gui", "async"}
 
 
 def test_feature_code_is_not_pulled_in_by_symbol_reference() -> None:
