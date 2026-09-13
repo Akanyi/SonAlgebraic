@@ -82,13 +82,18 @@ def _symbols_in(text: str) -> set[str]:
 
 
 def _defined_globals(text: str) -> set[str]:
-    """一段代码里定义的顶层 static 变量。
+    """一段代码里定义的顶层全局变量。
 
     每个 feature 块都有自己的槽位数组和错误缓冲（sa_list_slots、
     sa_net_last_error…），它们只被块内引用。不算进 provides 的话，
     整块输出的片段会显示成一堆悬空依赖。
+
+    判别锚点是「第 0 列 + 类型 token + 结尾 `[`/`=`/`;`」，不靠 static 前缀——
+    分离编译的 sa_runtime.c 去了 static，源码里这些全局不再带 static，但列 0 起手
+    的类型 token 足够把它们跟缩进的局部变量、结尾是 `{`/`(` 的函数定义区分开。
+    static 保持可选，单文件模式那份仍带 static 的文本照样命中。
     """
-    return set(re.findall(r"^static\s+[\w\s\*]*?\b(sa_[a-z0-9_]+)\s*(?:\[|=|;)", _strip_comments(text), re.MULTILINE))
+    return set(re.findall(r"^(?:static\s+)?[A-Za-z_][\w\s\*]*?\b(sa_[a-z0-9_]+)\s*(?:\[|=|;)", _strip_comments(text), re.MULTILINE))
 
 
 @lru_cache(maxsize=1)

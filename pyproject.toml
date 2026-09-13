@@ -26,6 +26,11 @@ sonc = "sonalgebraic.__main__:main"
 [tool.setuptools.packages.find]
 include = ["sonalgebraic*"]
 
+[tool.setuptools.package-data]
+# C 运行时本体是包内的真 .c/.h（backend/runtime/），不是 Python 源码。setuptools 默认只收 .py，
+# 不写这条，`pip install .` 出来的 wheel 会缺这两个文件，import c_runtime 直接 FileNotFoundError。
+"sonalgebraic.backend" = ["runtime/*.c", "runtime/*.h"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

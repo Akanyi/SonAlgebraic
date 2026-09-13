@@ -14,7 +14,10 @@ analysis = Analysis(
     [str(PROJECT_ROOT / "sonc.py")],
     pathex=[str(PROJECT_ROOT)],
     binaries=[],
-    datas=[],
+    # C 运行时是 backend/runtime/ 下的真 .c/.h，不是 Python 模块，PyInstaller 的 import 分析
+    # 看不见它。以前它是 c_runtime.py 里的字符串、随字节码一起冻进去；现在不显式塞进 datas，
+    # 冻结出来的 sonc 一启动就 FileNotFoundError。
+    datas=[(str(PROJECT_ROOT / "sonalgebraic" / "backend" / "runtime"), "sonalgebraic/backend/runtime")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

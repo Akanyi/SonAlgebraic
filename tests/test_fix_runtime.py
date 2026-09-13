@@ -97,9 +97,22 @@ def test_file_offset_bits_is_defined_before_any_include() -> None:
     assert macro < first_include
 
 
+def _definition(name: str) -> tuple[int, str]:
+    """RUNTIME 里 name 的定义起点和函数体。
+
+    运行时源码已经去了 static（见 c_runtime 模块 docstring），不能再拿 `static <type> name(`
+    当锚点。定义的稳定特征是「列 0 起手的返回类型 + 名字 + `(`」，函数体切到下一个列 0 的 `}`
+    ——比以前切到「下一个 static」更准，不会把函数后面的全局变量定义一起卷进来。
+    """
+    match = re.search(rf"^[A-Za-z_][\w \*]*\b{re.escape(name)}\(", RUNTIME, re.MULTILINE)
+    assert match, f"RUNTIME 里找不到 {name} 的定义"
+    end = RUNTIME.index("\n}", match.start())
+    return match.start(), RUNTIME[match.start() : end]
+
+
 def test_stricmp_shim_precedes_first_use() -> None:
     shim = RUNTIME.index("#define _stricmp sa_stricmp_ascii")
-    first_use = RUNTIME.index("static const char* sa_file_mode(")
+    first_use, _ = _definition("sa_file_mode")
     assert shim < first_use
 
 
@@ -111,12 +124,16 @@ def test_runtime_source_exports_are_all_declared_in_header() -> None:
     assert not missing, f"RUNTIME_HEADER 声明了但实现里找不到: {sorted(missing)}"
 
 
-def test_static_replacement_only_hits_real_declarations() -> None:
-    """RUNTIME_SOURCE 靠去掉 `static ` 生成，这个文本替换不能误伤字符串或注释。"""
-    for lineno, line in enumerate(RUNTIME_IMPL.splitlines(), 1):
-        for match in re.finditer(r"static ", line):
-            head = line[: match.start()].strip()
-            assert head == "" or head.startswith("#define"), f"第 {lineno} 行的 `static ` 位置可疑: {line!r}"
+def test_runtime_impl_carries_no_static() -> None:
+    """sa_runtime.c 里不能再出现 `static `。
+
+    它既要 include 声明了同名外部符号的 sa_runtime.h、又要能单独编译，static 定义跟在非
+    static 声明后面是编译错误。RUNTIME_SOURCE 那步 .replace("static ", "") 现在是幂等 no-op；
+    一旦有人往 .c 里加回 static（哪怕是函数内的局部 static），单文件模式和分离编译拿到的就是
+    两份语义不同的代码。这条卡的就是这个分叉。
+    """
+    offenders = [f"第 {lineno} 行: {line!r}" for lineno, line in enumerate(RUNTIME_IMPL.splitlines(), 1) if "static " in line]
+    assert not offenders, "\n".join(offenders)
 
 
 def test_str_slice_uses_overflow_safe_comparison() -> None:
@@ -126,8 +143,7 @@ def test_str_slice_uses_overflow_safe_comparison() -> None:
 
 def test_posix_socket_wait_uses_poll_not_select() -> None:
     """POSIX 侧换成 poll：fd >= FD_SETSIZE 时 FD_SET 会栈越界写。"""
-    body = RUNTIME[RUNTIME.index("static int sa_net_wait_socket(") :]
-    body = body[: body.index("\nstatic ")]
+    _, body = _definition("sa_net_wait_socket")
     assert "poll(&pfd, 1, timeout)" in body
     posix_branch = body[body.index("#else") :]
     assert "FD_SET(" not in posix_branch
@@ -135,8 +151,7 @@ def test_posix_socket_wait_uses_poll_not_select() -> None:
 
 def test_windows_connect_wait_watches_exceptfds() -> None:
     """Winsock 的非阻塞 connect 失败只进 exceptfds，不看它就得干等满超时。"""
-    body = RUNTIME[RUNTIME.index("static int sa_net_wait_socket(") :]
-    body = body[: body.index("\nstatic ")]
+    _, body = _definition("sa_net_wait_socket")
     win_branch = body[: body.index("#else")]
     assert "except_set" in win_branch
     assert "FD_ISSET(socket_value, &except_set)" in win_branch
@@ -164,8 +179,7 @@ def test_posix_file_offsets_use_64bit_api() -> None:
 
 
 def test_file_write_does_not_flush_every_time() -> None:
-    write_fn = RUNTIME[RUNTIME.index("static long long sa_file_write(") :]
-    write_fn = write_fn[: write_fn.index("\nstatic ")]
+    _, write_fn = _definition("sa_file_write")
     assert "fflush(" not in write_fn
     assert "pending_write = 1" in write_fn
 
@@ -176,8 +190,7 @@ def test_gui_widget_slots_are_cleared_by_ownership() -> None:
 
 
 def test_gui_event_queue_overflow_is_visible() -> None:
-    push = RUNTIME[RUNTIME.index("static void sa_gui_push_event(") :]
-    push = push[: push.index("\nstatic ")]
+    _, push = _definition("sa_gui_push_event")
     assert "sa_gui_set_error" in push
 
 
@@ -189,8 +202,7 @@ def test_schannel_enables_revocation_check() -> None:
 
 
 def test_symbol_deriv_covers_tan_and_sqrt() -> None:
-    deriv = RUNTIME[RUNTIME.index("static SaSymbol sa_symbol_deriv(") :]
-    deriv = deriv[: deriv.index("\nstatic ")]
+    _, deriv = _definition("sa_symbol_deriv")
     assert '"TAN"' in deriv
     assert '"SQRT"' in deriv
 

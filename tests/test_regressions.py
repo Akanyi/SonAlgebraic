@@ -49,11 +49,8 @@ def test_runtime_header_declares_every_function_codegen_emits() -> None:
     emitted: set[str] = set()
     # 递归扫整个 backend 包而不是列举文件名：native 后端已经拆成多个模块，
     # 写死列表的话下次再拆就会静默漏扫，这条防线自己先失效。
-    # c_runtime.py 除外——那是 runtime 的 C 实现本身，里面大量 static helper
-    # 本来就不该出现在头文件里，扫进来只会得到一堆假阳性。
+    # 只扫 .py：C 实现本体在 backend/runtime/*.c 里，rglob 天然不会碰它。
     for path in sorted((REPO_ROOT / "sonalgebraic" / "backend").rglob("*.py")):
-        if path.name == "c_runtime.py":
-            continue
         text = path.read_text(encoding="utf-8")
         emitted |= set(re.findall(r"\bsa_[a-z0-9_]+(?=\()", text))
 
@@ -82,8 +79,9 @@ def test_stricmp_shim_precedes_first_use() -> None:
 def test_symbol_deriv_covers_every_function_eval_supports() -> None:
     """eval/simplify 支持而 deriv 不支持的函数会静默返回导数 0。"""
     source = c_runtime.RUNTIME
-    deriv_body = source[source.index("static SaSymbol sa_symbol_deriv") : source.index("static SaSymbol sa_symbol_simplify")]
-    eval_body = source[source.index("static double sa_symbol_eval") :]
+    # 前置 \n 锁定列 0 的定义行：运行时源码已去 static，不能再拿它当锚点
+    deriv_body = source[source.index("\nSaSymbol sa_symbol_deriv(") : source.index("\nSaSymbol sa_symbol_simplify(")]
+    eval_body = source[source.index("\ndouble sa_symbol_eval(") :]
     eval_body = eval_body[: eval_body.index("\n}")]
 
     eval_funcs = set(re.findall(r'strcmp\(s->text,\s*"([A-Z]+)"\)', eval_body))
