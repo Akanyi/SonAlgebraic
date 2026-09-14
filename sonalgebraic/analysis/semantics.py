@@ -7,6 +7,7 @@ from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
 from ..core.lines import LINT_OPTIONS
+from .ownership import check_ownership
 from .typesys import BUILTIN_MODULES, describe_type, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_promise, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
 
 
@@ -159,6 +160,13 @@ def collect_sub_diagnostics(
             except SonCompileError as exc:
                 if _add_diagnostic(diagnostics, exc, max_errors):
                     return
+
+    # 所有权预检是顺序敏感的状态机，一处出错后面的状态就不可信，所以整个 SUB 只收一条
+    try:
+        check_ownership(sub, symbols, subs, entities, external_modules, c_funcs)
+    except SonCompileError as exc:
+        if _add_diagnostic(diagnostics, exc, max_errors):
+            return
 
     if sub.return_type.name != "VOID" and not has_required_return_path(sub.body):
         if _add_diagnostic(diagnostics, SonCompileError("非 VOID SUB 必须保证所有明显路径 RETURN 一个值", sub.line_no), max_errors):
@@ -333,6 +341,8 @@ def check_sub(
     for stmt in sub.body:
         check_stmt(stmt, scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
         check_return(stmt, sub.return_type, scope, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+    # 所有权预检放在逐句检查之后：它假定变量都已声明、类型都能解析，只管 f=/m= 的状态机
+    check_ownership(sub, symbols, subs, entities, external_modules, c_funcs)
 
     if sub.return_type.name != "VOID" and not has_required_return_path(sub.body):
         raise SonCompileError("非 VOID SUB 必须保证所有明显路径 RETURN 一个值", sub.line_no)
@@ -463,18 +473,24 @@ def check_return(
     c_libs: dict[str, ast.UseLibrary],
     c_funcs: dict[str, ast.CFunctionDecl],
 ) -> None:
+    # 块体按 check_stmt 的口径开子作用域并沿途登记 DIM：否则 IF / FOR 里 `DIM t … RETURN t` 会在这儿
+    # 撞上「变量未声明」——恰恰是最常见的「算完就返回」写法。
+    def check_body(body: list[ast.Stmt], scope: dict[str, Symbol]) -> None:
+        scope = scope.copy()
+        for inner in body:
+            if isinstance(inner, ast.LocalDeclaration):
+                scope[inner.name.lower()] = Symbol(inner.name, inner.type_spec, inner.mutable)
+                continue
+            check_return(inner, return_type, scope, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+
     if isinstance(stmt, ast.If):
-        for inner in stmt.body:
-            check_return(inner, return_type, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        check_body(stmt.body, symbols)
         for branch in stmt.elifs:
-            for inner in branch.body:
-                check_return(inner, return_type, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
-        for inner in stmt.else_body:
-            check_return(inner, return_type, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+            check_body(branch.body, symbols)
+        check_body(stmt.else_body, symbols)
         return
     if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-        for inner in stmt.body:
-            check_return(inner, return_type, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        check_body(stmt.body, symbols)
         return
     if isinstance(stmt, ast.TryCatch):
         # CATCH 体里的 RETURN 同样要按 SUB 的返回类型校验，
@@ -482,8 +498,7 @@ def check_return(
         for branch in stmt.catches:
             branch_symbols = symbols.copy()
             branch_symbols[branch.alias.lower()] = Symbol(branch.alias, ast.TypeSpec("ERROR"), False)
-            for inner in branch.body:
-                check_return(inner, return_type, branch_symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+            check_body(branch.body, branch_symbols)
         return
     if not isinstance(stmt, ast.Return):
         return
@@ -539,6 +554,10 @@ def check_stmt(
         else:
             raise SonCompileError("赋值目标必须是变量、数组元素或 ^指针", stmt.line_no)
         check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        if stmt.mode != "copy":
+            # f=/m= 要求两侧严格同型且是托管类型，这些连同所有权状态一起由 ownership 预检负责；
+            # 这里只保留上面那几条对所有赋值都成立的检查（CONST、变量存在性）。
+            return
         expr_type = type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs)
         reject_unowned_buffer_calls(stmt.expr, uses, allow_root=owned_handle_root_ok(target_type, expr_type))
         require_assignable(target_type, expr_type, stmt.line_no)

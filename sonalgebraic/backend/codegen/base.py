@@ -109,6 +109,44 @@ class CGenBase:
         if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or (type_spec.name == "ENTITY" and self.type_has_managed_resources(type_spec)):
             self.local_resource_stack[-1].append((name, type_spec))
 
+    def unregister_local_resource(self, name: str) -> None:
+        """f= 借用的目标从清理登记里摘掉：它现在指向别人的资源，块尾不能再 free。
+        语义层保证目标与借用语句同块 DIM，所以它一定在栈顶那份登记里。"""
+        if not self.local_resource_stack:
+            return
+        self.local_resource_stack[-1] = [item for item in self.local_resource_stack[-1] if item[0] != name]
+
+    def is_frame_owned(self, c_name: str) -> bool:
+        """c_name 是否登记在当前帧任意一层块的清理表里。登记了就是本帧持有它的堆资源，RETURN 可以
+        整个移出去；借来的（f= 已摘登记）、全局、AS REF 参数、按值传入的 SYMBOL / ERROR 参数都不在
+        表里，只能拷贝。"""
+        return any(name == c_name for resources in self.local_resource_stack for name, _ in resources)
+
+    def adopt_temp_cleanup(self, value: str, type_spec: ast.TypeSpec, cleanup: list[str]) -> bool:
+        """value 若是本语句刚生成、登记了释放行的堆临时量（F-string、CONCAT、DERIV、SUB 返回值……），
+        把释放行从 cleanup 里摘掉，所有权归调用者。判定就是重新生成一遍它应有的释放行去比对：内置函数
+        和 call_expr 登记清理都以 local_resource_cleanup_lines 的文本为准，所以能对得上。"""
+        if not value or type_spec.array_size is not None:
+            return False
+        expected = self.local_resource_cleanup_lines([(value, type_spec)], 0)
+        if not expected or any(line not in cleanup for line in expected):
+            return False
+        for line in expected:
+            cleanup.remove(line)
+        return True
+
+    def moved_source_reset_lines(self, source: str, type_spec: ast.TypeSpec, indent: int) -> list[str]:
+        """移走之后把源置「空」：源保持登记，块尾对它的 free(NULL) / 清零 ERROR / 逐字段 free(NULL) /
+        release(0) 全是空操作，所以移动对控制流路径不敏感。"""
+        pad = "    " * indent
+        if is_error(type_spec):
+            return [f"{pad}{source} = (SaError){{0, \"ERR_NONE\", NULL, 0, NULL}};"]
+        if type_spec.name == "ENTITY":
+            return [f"{pad}memset(&{source}, 0, sizeof({source}));"]
+        if is_promise(type_spec):
+            return [f"{pad}{source} = 0;"]
+        return [f"{pad}{source} = NULL;"]
+
     def active_local_resource_cleanup_lines(self, indent: int) -> list[str]:
         lines: list[str] = []
         for resources in reversed(self.local_resource_stack):

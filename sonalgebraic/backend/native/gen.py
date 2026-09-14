@@ -54,6 +54,9 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         # 语句级临时清理帧：表达式求值过程中产生的临时堆值（CONCAT/SLICE/STRING() 结果）
         # 登记到栈顶帧，语句发射完主效果后逐条释放。复刻 C 后端 prelude/cleanup。
         self.temp_cleanup: list[list[str]] = []
+        # ENTITY/ERROR 聚合临时量（SUB 返回值）的释放不是一行能写完的，按 SSA 值名记下整段 IR，
+        # 接管（adopt）时才能按值找到并摘掉它。
+        self.aggregate_temp_cleanup: dict[str, str] = {}
 
     def generate(self) -> str:
         self.validate_supported_program()
@@ -341,14 +344,13 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
             self.end_stmt()
             return
         if self.is_entity_scalar(decl.type_spec) and self.type_has_managed_resources(decl.type_spec):
-            source_ptr = self.entity_source_ptr(decl.expr, decl.type_spec)
-            self.emit_entity_copy(target, source_ptr, decl.type_spec)
-        else:
-            value = self.cast_value(self.expr(decl.expr), decl.type_spec)
+            self.store_entity(target, decl.expr, decl.type_spec)
+            self.end_stmt()
+            return
+        value = self.cast_value(self.expr(decl.expr), decl.type_spec)
         if self.is_string_scalar(decl.type_spec):
-            self.use_runtime("sa_set_string")
-            self.emit(f"  call void @sa_set_string(ptr {target}, ptr {value.value})")
-        elif not (self.is_entity_scalar(decl.type_spec) and self.type_has_managed_resources(decl.type_spec)):
+            self.store_string(target, value)
+        else:
             self.emit(f"  store {self.llvm_type(decl.type_spec)} {value.value}, ptr {target}")
         self.end_stmt()
 

@@ -282,25 +282,15 @@ class CoroutinesMixin(CGenBase):
                 f"{pad}return;",
             ]
         return_type = self.current_sub_return_type()
-        prelude, value, cleanup = self.expr_with_prelude(stmt.expr)
-        lines = [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude)]
-        temp = self.next_temp()
+        # 与同步 RETURN 同一套求值：STRING 结果是移出 / 接管 / 拷贝得到的独立指针，交给 slot 后帧照常
+        # 清理（被移出的局部已置 NULL）。以前这里无脑 strdup 一份，正确但多一次拷贝。
+        value_lines, temp = self.return_value_lines(stmt.expr, indent)
+        lines = [self.source_comment(stmt.line_no, indent), *value_lines]
+        lines.extend(self.active_local_resource_cleanup_lines(indent))
+        lines.append(f"{pad}sa_try_top--;")
         if is_string(return_type):
-            # STRING 结果：strdup 到独立指针交给 slot，帧照常清理（含返回值对应的局部）。真
-            # move（交出局部指针、清理排除）留阶段 3；strdup 版正确、复用现有清理，且 strdup
-            # 发生在 free 局部之前——比同步 RETURN 那条「先 free 再 return」的 UAF 更安全。
-            lines.append(f"{pad}char* {temp} = sa_strdup({value});")
-            lines.extend(f"{pad}{line}" for line in cleanup)
-            lines.extend(self.active_local_resource_cleanup_lines(indent))
-            lines.append(f"{pad}sa_try_top--;")
             lines.append(f"{pad}sa_promise_fulfill_str(f->base.self, {temp});")
         else:
-            if is_handle(return_type) and isinstance(stmt.expr, ast.NullLiteral):
-                value = "0"
-            lines.append(f"{pad}{self.c_type(return_type)} {temp} = {value};")
-            lines.extend(f"{pad}{line}" for line in cleanup)
-            lines.extend(self.active_local_resource_cleanup_lines(indent))
-            lines.append(f"{pad}sa_try_top--;")
             lines.append(f"{pad}{self.async_fulfill_call(return_type, temp)};")
         lines.append(f"{pad}return;")
         return lines

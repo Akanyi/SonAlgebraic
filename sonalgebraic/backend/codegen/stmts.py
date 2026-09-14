@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ...analysis.semantics import Symbol
-from ...analysis.typesys import is_cptr, is_error, is_handle, is_numeric, is_ptr, is_string, is_symbol
+from ...analysis.typesys import is_cptr, is_error, is_handle, is_numeric, is_promise, is_ptr, is_string, is_symbol, same_type_spec
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import CGenBase
@@ -138,13 +138,8 @@ class StmtsMixin(CGenBase):
                         f"{pad}return;",
                     ]
                 return [self.source_comment(stmt.line_no, indent), *self.active_local_resource_cleanup_lines(indent), f"{pad}return;"]
-            prelude, value, _cleanup = self.expr_with_prelude(stmt.expr)
-            temp = self.next_temp()
-            return_type = self.current_sub_return_type()
-            if is_handle(return_type) and isinstance(stmt.expr, ast.NullLiteral):
-                value = "0"
-            return_value = f"{pad}{self.c_type(return_type)} {temp} = {value};"
-            return [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude), return_value, *self.active_local_resource_cleanup_lines(indent), f"{pad}return {temp};"]
+            value_lines, temp = self.return_value_lines(stmt.expr, indent)
+            return [self.source_comment(stmt.line_no, indent), *value_lines, *self.active_local_resource_cleanup_lines(indent), f"{pad}return {temp};"]
         if isinstance(stmt, ast.End):
             return [self.source_comment(stmt.line_no, indent), f"{pad}goto sa_program_end;"]
         if isinstance(stmt, ast.Input):
@@ -183,6 +178,83 @@ class StmtsMixin(CGenBase):
             lines.append(f"{pad}sa_print_double({value});")
         lines.extend(f"{pad}{line}" for line in cleanup)
         return lines
+
+    def return_value_lines(self, expr: ast.Expr, indent: int) -> tuple[list[str], str]:
+        """RETURN 的表达式求到临时量，返回 (语句行, 临时量名)。求值在帧清理之前；表达式自己的临时量
+        清理照常执行——以前是整个丢掉，RETURN LENGTH(F"…") 这种嵌套临时量会漏。"""
+        pad = "    " * indent
+        return_type = self.current_sub_return_type()
+        if self.type_has_managed_resources(return_type) or is_promise(return_type):
+            return self.owned_value_lines(expr, return_type, indent)
+        prelude, value, cleanup = self.expr_with_prelude(expr)
+        if is_handle(return_type) and isinstance(expr, ast.NullLiteral):
+            value = "0"
+        temp = self.next_temp()
+        lines = [*(f"{pad}{line}" for line in prelude), f"{pad}{self.c_type(return_type)} {temp} = {value};", *(f"{pad}{line}" for line in cleanup)]
+        return lines, temp
+
+    def owned_value_lines(self, expr: ast.Expr, type_spec: ast.TypeSpec, indent: int) -> tuple[list[str], str]:
+        """把托管类型的表达式求成调用方独占的值。交出去的不能是本帧稍后会 free 的指针，所以分三路：
+        - 本帧拥有的变量（登记在清理表里，字段路径看根变量）：移出——指针 / 结构体交出去、源置空，
+          随后的帧清理全是空操作。RETURN s 以前生成 `tmp = s; free(s); return tmp;`，就是这里修的。
+        - 本语句刚算出来的堆临时量（F-string、CONCAT、DERIV、别的 SUB 的返回值）：接管，摘掉释放行。
+        - 其余（字面量、全局、借来的、AS REF 参数、按值传入的 SYMBOL、数组元素）：深拷贝一份。
+        PROMISE 是单消费者句柄，没有拷贝这回事：变量移出，其余原样交出。"""
+        pad = "    " * indent
+        temp = self.next_temp()
+        c_type = self.c_type(type_spec)
+        # 类型必须严格一致才能整体移出：SYMBOL SUB 里 RETURN s（s 是 STRING）是合法的，但那是拿 s 当变量名建树
+        if isinstance(expr, ast.VarRef) and self.is_owned_var(expr.name) and same_type_spec(self.type_of(expr), type_spec):
+            source = self.c_value(expr.name)
+            return [f"{pad}{c_type} {temp} = {source};", *self.moved_source_reset_lines(source, type_spec, indent)], temp
+        if is_symbol(type_spec):
+            # symbol_expr 永远给一棵新树（变量克隆、调用结果接管），不需要再拷
+            prelude, value, cleanup = self.symbol_expr_with_prelude(expr)
+            return [*(f"{pad}{line}" for line in prelude), f"{pad}SaSymbol {temp} = {value};", *(f"{pad}{line}" for line in cleanup)], temp
+        prelude, value, cleanup = self.expr_with_prelude(expr)
+        lines = [f"{pad}{line}" for line in prelude]
+        if is_promise(type_spec) or self.adopt_temp_cleanup(value, type_spec, cleanup):
+            lines.append(f"{pad}{c_type} {temp} = {value};")
+        elif is_string(type_spec):
+            lines.append(f"{pad}char* {temp} = sa_strdup({value});")
+        elif is_error(type_spec):
+            lines.append(f"{pad}SaError {temp} = {{0, \"ERR_NONE\", NULL, 0, NULL}};")
+            lines.append(f"{pad}sa_set_error(&{temp}, &{value});")
+        else:
+            # 零初始化的结构体上直接逐字段 copy：sa_set_string / sa_set_error 对 NULL 旧值 free 是空操作
+            lines.append(f"{pad}{c_type} {temp} = {{0}};")
+            lines.extend(self.entity_copy_lines(temp, value, type_spec, indent))
+        lines.extend(f"{pad}{line}" for line in cleanup)
+        return lines, temp
+
+    def is_owned_var(self, name: str) -> bool:
+        """VarRef（可带字段路径）的根变量是否由本帧持有。"""
+        root = name.split(".", 1)[0]
+        return root.lower() in self.symbols and self.is_frame_owned(self.c_value(root))
+
+    def string_store_lines(self, target: str, value: str, cleanup: list[str], indent: int) -> list[str]:
+        """STRING 赋值。value 若是本语句刚生成的堆串（F-string、CONCAT、SUB 返回值），直接接管指针，
+        省掉 sa_set_string 那次 strdup；否则深拷贝。接管前 prelude 已全部跑完，所以 x = F"{x}!" 这类
+        自引用是先读旧值再 free，没有 UAF。"""
+        pad = "    " * indent
+        if self.adopt_temp_cleanup(value, ast.TypeSpec("STRING"), cleanup):
+            return [f"{pad}free({target});", f"{pad}{target} = {value};"]
+        return [f"{pad}sa_set_string(&{target}, {value});"]
+
+    def entity_store_lines(self, target: str, value: str, type_spec: ast.TypeSpec, cleanup: list[str], indent: int) -> list[str]:
+        """含托管字段的 ENTITY 赋值：源是刚返回的临时结构体就整体接管（先释放目标各字段），否则逐字段深拷贝。"""
+        pad = "    " * indent
+        if self.adopt_temp_cleanup(value, type_spec, cleanup):
+            return [*self.entity_free_lines(target, type_spec, indent), f"{pad}{target} = {value};"]
+        return self.entity_copy_lines(target, value, type_spec, indent)
+
+    def discarded_call_lines(self, call: str, return_type: ast.TypeSpec, indent: int) -> list[str]:
+        """丢弃返回值的调用（TRY CALL f()）：托管类型的返回值归调用方所有，不接就得当场释放。"""
+        pad = "    " * indent
+        if not self.type_has_managed_resources(return_type):
+            return [f"{pad}{call};"]
+        temp = self.next_temp()
+        return [f"{pad}{self.c_type(return_type)} {temp} = {call};", *self.local_resource_cleanup_lines([(temp, return_type)], indent)]
 
     def local_declaration_stmt(self, stmt: ast.LocalDeclaration, indent: int) -> list[str]:
         pad = "    " * indent
@@ -235,9 +307,9 @@ class StmtsMixin(CGenBase):
             prelude, value, cleanup = self.expr_with_prelude(stmt.expr)
             lines.extend(f"{pad}{line}" for line in prelude)
             if is_string(stmt.type_spec):
-                lines.append(f"{pad}sa_set_string(&{name}, {value});")
+                lines.extend(self.string_store_lines(name, value, cleanup, indent))
             elif stmt.type_spec.name == "ENTITY" and self.type_has_managed_resources(stmt.type_spec):
-                lines.extend(self.entity_copy_lines(name, value, stmt.type_spec, indent))
+                lines.extend(self.entity_store_lines(name, value, stmt.type_spec, cleanup, indent))
             else:
                 if is_handle(stmt.type_spec) and isinstance(stmt.expr, ast.NullLiteral):
                     value = "0"
@@ -245,8 +317,32 @@ class StmtsMixin(CGenBase):
             lines.extend(f"{pad}{line}" for line in cleanup)
         return lines
 
+    def ownership_assign_stmt(self, stmt: ast.Assign, indent: int) -> list[str]:
+        """`a f= b` / `a m= b`：两侧都是同型托管变量（语义层已保证），指针 / 结构体直接赋过去，
+        不走深拷贝。区别只在事后谁负责释放：
+        - move：源置空。源保持登记，块尾 free(NULL) / 清零 ERROR / 逐字段 free(NULL) 都安全，
+          所以移动对控制流路径不敏感，IF 里移走也不用改登记表。
+        - borrow：目标从登记里摘掉。登记按语句顺序处理，借用之前生成的 RETURN / landing pad
+          仍会 free 目标（那时它还持有自己的初始值），之后的不会——与运行时路径一致。"""
+        pad = "    " * indent
+        assert isinstance(stmt.target, ast.VarRef) and isinstance(stmt.expr, ast.VarRef)
+        target_type = self.type_of(stmt.target)
+        target_c = self.c_value(stmt.target.name)
+        source_c = self.c_value(stmt.expr.name)
+        lines = [self.source_comment(stmt.line_no, indent)]
+        # 目标旧值先释放，复用块尾清理的发射逻辑（按类型 free / sa_symbol_free / sa_error_clear / 逐字段）
+        lines.extend(self.local_resource_cleanup_lines([(target_c, target_type)], indent))
+        lines.append(f"{pad}{target_c} = {source_c};")
+        if stmt.mode == "move":
+            lines.extend(self.moved_source_reset_lines(source_c, target_type, indent))
+        else:
+            self.unregister_local_resource(target_c)
+        return lines
+
     def assign_stmt(self, stmt: ast.Assign, indent: int) -> list[str]:
         pad = "    " * indent
+        if stmt.mode != "copy":
+            return self.ownership_assign_stmt(stmt, indent)
         # SYMBOL 变量赋值走独立路径：symbol_expr 自带 prelude（DERIV/SUBST 产生临时量）
         if isinstance(stmt.target, ast.VarRef) and is_symbol(self.type_of(stmt.target)):
             name = stmt.target.name
@@ -290,9 +386,9 @@ class StmtsMixin(CGenBase):
         target_root = self.symbols[name.split(".", 1)[0].lower()]
         if is_string(target_type):
             target_name = self.c_value(name) if target_root.by_ref else self.c_ident_path(name)
-            lines.append(f"{pad}sa_set_string(&{target_name}, {value});")
+            lines.extend(self.string_store_lines(target_name, value, cleanup, indent))
         elif target_type.name == "ENTITY" and self.type_has_managed_resources(target_type):
-            lines.extend(self.entity_copy_lines(self.c_value(name), value, target_type, indent))
+            lines.extend(self.entity_store_lines(self.c_value(name), value, target_type, cleanup, indent))
         else:
             if is_handle(target_type) and isinstance(stmt.expr, ast.NullLiteral):
                 value = "0"
@@ -327,7 +423,8 @@ class StmtsMixin(CGenBase):
         lines = [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude)]
         lines.append(f"{pad}sa_try_top++;")
         lines.append(f"{pad}if (SA_SETJMP(sa_try_stack[sa_try_top - 1].env) == 0) {{")
-        lines.append(f"{pad}    {self.call_c_name(stmt.call_name)}({', '.join(args)});")
+        call = f"{self.call_c_name(stmt.call_name)}({', '.join(args)})"
+        lines.extend(self.discarded_call_lines(call, self.resolve_called_sub(stmt.call_name).return_type, indent + 1))
         lines.append(f"{pad}    sa_try_top--;")
         lines.append(f"{pad}}} else {{")
         lines.append(f"{pad}    sa_try_top--;")

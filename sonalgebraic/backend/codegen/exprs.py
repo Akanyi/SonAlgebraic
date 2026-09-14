@@ -158,8 +158,21 @@ class ExprsMixin(CGenBase):
                 self.add_cleanup(line)
             if sub.is_async:
                 return f"{self.call_c_name(expr.name)}_start({', '.join(args)})"
-            return f"{self.call_c_name(expr.name)}({', '.join(args)})"
+            return self.owned_call_result(f"{self.call_c_name(expr.name)}({', '.join(args)})", sub.return_type)
         raise SonCompileError(f"未知内置函数: {expr.name}", expr.line_no)
+
+    def owned_call_result(self, call: str, return_type: ast.TypeSpec) -> str:
+        """SUB 返回的 STRING / SYMBOL / 含托管字段的 ENTITY 是调用方独占的堆资源（被调方 RETURN 时已
+        移出或拷了一份）：落到临时量并登记释放，语句结束时 free。要接管的消费者（STRING / ENTITY 赋值、
+        RETURN、SYMBOL 建树）用 adopt_temp_cleanup 把释放行摘走就行，不必再拷。裸着返回调用文本的话，
+        PRINT wrap() 这类用法会把返回值直接漏掉，entity_copy_lines 逐字段展开还会把调用重复执行好几遍。"""
+        if not self.type_has_managed_resources(return_type):
+            return call
+        temp = self.next_temp()
+        self.add_prelude(f"{self.c_type(return_type)} {temp} = {call};")
+        for line in self.local_resource_cleanup_lines([(temp, return_type)], 0):
+            self.add_cleanup(line)
+        return temp
 
     def fstring(self, expr: ast.FString) -> str:
         temp = self.next_temp()
@@ -217,5 +230,10 @@ class ExprsMixin(CGenBase):
         if isinstance(expr, ast.CallExpr) and self.is_math_function(expr.name, "POW"):
             return f"sa_symbol_op('^', {self.symbol_expr(expr.args[0])}, {self.symbol_expr(expr.args[1])})"
         if isinstance(expr, ast.CallExpr) and is_symbol(self.type_of(expr)):
-            return f"sa_symbol_clone({self.expr(expr)})"
+            value = self.expr(expr)
+            # DERIV 等内置和用户 SUB 的返回值都是登记了释放的临时树：直接接管，
+            # 不必「克隆一份、原树等语句尾 free」
+            if self.cleanup_stack and self.adopt_temp_cleanup(value, ast.TypeSpec("SYMBOL"), self.cleanup_stack[-1]):
+                return value
+            return f"sa_symbol_clone({value})"
         raise SonCompileError("SYMBOL 只支持变量/数字/+ - * / ** 表达式和 DERIV/SIMPLIFY/SUBST", expr.line_no)

@@ -210,6 +210,10 @@ class ExprsMixin(NativeGenBase):
             return LLVMValue("ptr", temp, ast.TypeSpec("SYMBOL"))
         if isinstance(expr, ast.CallExpr) and is_symbol(self.type_of_expr(expr)):
             value = self.expr(expr)
+            # DERIV/SIMPLIFY/SUBST 和 SUB 返回的树都是本语句的临时量，直接接管进结果树，
+            # 省一次 clone+free；接管不了（理论上不会发生）再退回克隆。
+            if self.adopt_temp_cleanup(value.value, ast.TypeSpec("SYMBOL")):
+                return LLVMValue("ptr", value.value, ast.TypeSpec("SYMBOL"))
             self.use_runtime("sa_symbol_clone")
             temp = self.next_temp()
             self.emit(f"  {temp} = call ptr @sa_symbol_clone(ptr {value.value})")
@@ -301,13 +305,17 @@ class ExprsMixin(NativeGenBase):
             is_external = external is not None
             args = self.call_args(sub, expr.args, c_abi=is_external)
             if self.has_active_resources():
-                return self.wrap_call_expr_with_throw_cleanup(external_name, sub, args, raw_name=True, c_abi=is_external)
-            temp = self.next_temp()
-            ret_type = self.c_abi_type(sub.return_type) if is_external else self.llvm_type(sub.return_type)
-            self.emit(f"  {temp} = call {ret_type} @{external_name}({', '.join(args)})")
-            if is_external and is_bool(sub.return_type):
-                return self.i32_status(temp)
-            return LLVMValue(ret_type, temp, sub.return_type)
+                value = self.wrap_call_expr_with_throw_cleanup(external_name, sub, args, raw_name=True, c_abi=is_external)
+            else:
+                temp = self.next_temp()
+                ret_type = self.c_abi_type(sub.return_type) if is_external else self.llvm_type(sub.return_type)
+                self.emit(f"  {temp} = call {ret_type} @{external_name}({', '.join(args)})")
+                value = self.i32_status(temp) if is_external and is_bool(sub.return_type) else LLVMValue(ret_type, temp, sub.return_type)
+            # SUB 返回的托管值（STRING/SYMBOL/带串字段的 ENTITY）所有权在调用方：先当临时量登记，
+            # 语句结束没人接管（赋值、RETURN、SYMBOL 建树）就释放。以前这里既不登记也不接管，
+            # 每次 `x = CALL f()` 都漏一份。
+            self.register_temp_cleanup(value.value, sub.return_type)
+            return value
         raise SonCompileError(f"native 后端暂不支持表达式: {type(expr).__name__}", expr.line_no)
 
     def unary_expr(self, expr: ast.Unary) -> LLVMValue:

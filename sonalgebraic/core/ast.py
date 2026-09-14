@@ -129,6 +129,9 @@ class LocalDeclaration(Stmt):
 class Assign(Stmt):
     target: "Expr"
     expr: "Expr"
+    # "copy"（=，深拷贝）| "borrow"（f=，只读借用，不取所有权）| "move"（m=，所有权转移，源作废）。
+    # 带默认值是为了让唯一的构造点和所有 isinstance 分支都不用动：普通赋值看不见这个字段。
+    mode: str = "copy"
 
 
 @dataclass(frozen=True)

@@ -55,6 +55,7 @@ class NativeGenBase:
     used_external_consts: dict[str, ast.Declaration]
     scope_resources: list[list[VarSlot]]
     temp_cleanup: list[list[str]]
+    aggregate_temp_cleanup: dict[str, str]
 
     # --- 资源清理基础设施（确定性内存模型，复刻 C 后端） ---
 
@@ -65,14 +66,72 @@ class NativeGenBase:
         for line in self.temp_cleanup.pop():
             self.emit(line)
 
-    def discard_stmt(self) -> None:
-        # RETURN 携带返回值时，C 后端丢弃表达式 cleanup（返回值可能就是临时量）。
-        # 这里同样丢弃不释放，避免释放正被返回的指针。
-        self.temp_cleanup.pop()
-
     def add_temp_cleanup(self, line: str) -> None:
         if self.temp_cleanup:
             self.temp_cleanup[-1].append(line)
+
+    def temp_cleanup_line(self, value: str, type_spec: ast.TypeSpec) -> str | None:
+        """STRING / SYMBOL 临时量的释放行。登记（内置函数、SUB 返回值）和接管（adopt）都以这一个文本为准。"""
+        if self.is_string_scalar(type_spec):
+            return f"  call void @free(ptr {value})"
+        if is_symbol(type_spec):
+            return f"  call void @sa_symbol_free(ptr {value})"
+        return None
+
+    def register_temp_cleanup(self, value: str, type_spec: ast.TypeSpec) -> None:
+        """把一个刚算出来的托管堆值登记成本语句的临时量：语句结束没人接管就释放。"""
+        line = self.temp_cleanup_line(value, type_spec)
+        if line is not None:
+            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_symbol_free")
+            self.add_temp_cleanup(line)
+            return
+        ptr = self.aggregate_temp_ptr(value, type_spec)
+        if ptr is None:
+            return
+        # 释放 IR 先截下来延后发射；块里只引用 entry 里的 alloca，放到语句尾任何位置都支配得住
+        block = "\n".join(self.capture_lines(lambda: self.emit_free_slot(VarSlot("", type_spec, ptr))))
+        if block:
+            self.aggregate_temp_cleanup[value] = block
+            self.add_temp_cleanup(block)
+
+    def emit_free_value(self, value: str, type_spec: ast.TypeSpec) -> None:
+        """当场释放一个按值拿着的托管临时量（被语句丢弃的 SUB 返回值）。"""
+        line = self.temp_cleanup_line(value, type_spec)
+        if line is not None:
+            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_symbol_free")
+            self.emit(line)
+            return
+        ptr = self.aggregate_temp_ptr(value, type_spec)
+        if ptr is not None:
+            self.emit_free_slot(VarSlot("", type_spec, ptr))
+
+    def aggregate_temp_ptr(self, value: str, type_spec: ast.TypeSpec) -> str | None:
+        """ENTITY/ERROR 是按值传的聚合，free 要逐字段走指针：先把 SSA 值落到栈槽上。"""
+        if type_spec.array_size is not None or not self.type_has_managed_resources(type_spec):
+            return None
+        ptr = self.alloca(self.llvm_type(type_spec))
+        self.emit(f"  store {self.llvm_type(type_spec)} {value}, ptr {ptr}")
+        return ptr
+
+    def adopt_temp_cleanup(self, value: str, type_spec: ast.TypeSpec) -> bool:
+        """value 若是本语句刚生成、登记了释放的堆临时量（F-string、CONCAT、DERIV、SUB 返回值……），
+        摘掉释放行、所有权归调用者；与 C 后端 adopt_temp_cleanup 同一思路。"""
+        entry = self.temp_cleanup_line(value, type_spec) or self.aggregate_temp_cleanup.get(value)
+        if entry is None or not self.temp_cleanup or entry not in self.temp_cleanup[-1]:
+            return False
+        self.temp_cleanup[-1].remove(entry)
+        self.aggregate_temp_cleanup.pop(value, None)
+        return True
+
+    def capture_lines(self, emit_body) -> list[str]:
+        """把 emit_body 期间发射的 IR 行截下来（不落进函数体），给「登记到语句尾再执行」的清理用。
+        alloca 挂在 entry 块、临时量编号全局递增，所以这些行放到后面执行照样合法。"""
+        saved, self.lines = self.lines, []
+        try:
+            emit_body()
+            return self.lines
+        finally:
+            self.lines = saved
 
     def alloca(self, llvm_type: str, name: str | None = None) -> str:
         """申请一个栈槽，实际的 alloca 行统一挂到函数 entry 块。
@@ -92,6 +151,12 @@ class NativeGenBase:
     def register_owned(self, slot: VarSlot) -> None:
         if self.scope_resources:
             self.scope_resources[-1].append(slot)
+
+    def is_owned_var(self, name: str) -> bool:
+        """变量（或其字段路径的根）是否登记在本帧某层作用域里。全局、AS REF 形参、值传 SYMBOL 形参、
+        f= 借来的变量都不在表里——它们的资源不归本帧，RETURN 只能拷贝不能搬走。"""
+        key = name.split(".", 1)[0].lower()
+        return any(slot.name.lower() == key for resources in self.scope_resources for slot in resources)
 
     def emit_free_slot(self, slot: VarSlot) -> None:
         if self.is_string_array(slot.type_spec):

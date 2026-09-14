@@ -125,11 +125,3 @@ class EntitiesMixin(NativeGenBase):
                 value = self.next_temp()
                 self.emit(f"  {value} = load {field_ty}, ptr {source_field}")
                 self.emit(f"  store {field_ty} {value}, ptr {target_field}")
-
-    def entity_source_ptr(self, expr: ast.Expr, type_spec: ast.TypeSpec) -> str:
-        if isinstance(expr, ast.VarRef | ast.Deref | ast.Index):
-            return self.lvalue_ptr(expr)
-        value = self.cast_value(self.expr(expr), type_spec)
-        ptr = self.alloca(self.llvm_type(type_spec))
-        self.emit(f"  store {self.llvm_type(type_spec)} {value.value}, ptr {ptr}")
-        return ptr

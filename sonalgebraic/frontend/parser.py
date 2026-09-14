@@ -483,7 +483,8 @@ class Parser:
         pos = _find_top_level(text, "=", line_no)
         if pos == -1:
             return None
-        left_text = text[:pos].strip()
+        mode, left_end = _assign_mode(text, pos)
+        left_text = text[:left_end].strip()
         expr_text = text[pos + 1 :].strip()
         if not left_text or not expr_text:
             return None
@@ -492,7 +493,7 @@ class Parser:
             return None
         # 赋值右侧允许 AWAIT / SYNC / CALL 这些语句级关键字打头，其余走普通表达式
         right = self.try_parse_await_sync_expr(expr_text, line_no) or self.try_parse_call_expr(expr_text, line_no)
-        return ast.Assign(line_no, target, right or parse_expr(expr_text, line_no))
+        return ast.Assign(line_no, target, right or parse_expr(expr_text, line_no), mode)
 
     def try_parse_await_sync_expr(self, text: str, line_no: int) -> ast.Expr | None:
         stripped = text.strip()
@@ -626,10 +627,33 @@ def _parse_type_tokens(tokens: list[str], line_no: int) -> ast.TypeSpec:
     raise SonCompileError("无法识别的类型声明", line_no)
 
 
+_ASSIGN_MODES = {"f": "borrow", "m": "move"}
+
+
+def _assign_mode(text: str, eq_pos: int) -> tuple[str, int]:
+    """识别 `a f= b` / `a m= b` 的所有权标记，返回 (mode, 左侧文本的结束位置)。
+
+    只有「= 前紧贴一个 f/m，且这个字母前面是空白、再前面还有东西」才算标记。这样
+    `xf = 1`（字母是变量名的一部分）和 `f=1`（f 本身就是目标变量）都原样当普通赋值，
+    老代码零回归；空白是硬性分隔符，所以 `a f= b` 与 `af = b` 不会混。
+    """
+    letter = eq_pos - 1
+    if letter <= 0 or text[letter].lower() not in _ASSIGN_MODES or not text[letter - 1].isspace():
+        return "copy", eq_pos
+    if not text[:letter].strip():
+        return "copy", eq_pos
+    return _ASSIGN_MODES[text[letter].lower()], letter
+
+
 def _split_top_level_equal(text: str, line_no: int) -> tuple[str, str | None]:
     pos = _find_top_level(text, "=", line_no)
     if pos == -1:
         return text.strip(), None
+    mode, _ = _assign_mode(text, pos)
+    if mode != "copy":
+        # DIM/CONST 的初始化在 codegen 里是「先按类型初始化再拷进去」一条固定路径，
+        # 借用/移动需要的是完全不同的登记动作，与其在声明里塞第二条路径不如让用户分两行写。
+        raise SonCompileError("DIM/CONST 初始化只支持 `=`；借用 `f=` / 移动 `m=` 请先声明，再单独写一行赋值", line_no)
     return text[:pos].strip(), text[pos + 1 :].strip()
 
 

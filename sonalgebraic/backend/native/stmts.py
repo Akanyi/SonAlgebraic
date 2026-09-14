@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...analysis.typesys import is_bool, is_error, is_numeric, is_symbol
+from ...analysis.typesys import is_bool, is_error, is_numeric, is_symbol, same_type_spec
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import LLVMValue, NativeGenBase, VarSlot
@@ -112,9 +112,7 @@ class StmtsMixin(NativeGenBase):
             self.register_owned(slot)
             if stmt.expr is not None:
                 self.begin_stmt()
-                value = self.cast_value(self.expr(stmt.expr), stmt.type_spec)
-                self.use_runtime("sa_set_string")
-                self.emit(f"  call void @sa_set_string(ptr {ptr}, ptr {value.value})")
+                self.store_string(ptr, self.cast_value(self.expr(stmt.expr), stmt.type_spec))
                 self.end_stmt()
             return
         if is_symbol(stmt.type_spec):
@@ -137,8 +135,7 @@ class StmtsMixin(NativeGenBase):
             if stmt.expr is not None:
                 self.begin_stmt()
                 if self.type_has_managed_resources(stmt.type_spec):
-                    source_ptr = self.entity_source_ptr(stmt.expr, stmt.type_spec)
-                    self.emit_entity_copy(ptr, source_ptr, stmt.type_spec)
+                    self.store_entity(ptr, stmt.expr, stmt.type_spec)
                 else:
                     value = self.cast_value(self.expr(stmt.expr), stmt.type_spec)
                     self.emit(f"  store {self.llvm_type(stmt.type_spec)} {value.value}, ptr {ptr}")
@@ -151,7 +148,30 @@ class StmtsMixin(NativeGenBase):
             self.emit(f"  store {self.llvm_type(stmt.type_spec)} {value.value}, ptr {ptr}")
             self.end_stmt()
 
+    def ownership_assign_stmt(self, stmt: ast.Assign) -> None:
+        """`a f= b` / `a m= b`：与 C 后端同一套思路——按 llvm_type 整体 load/store，不深拷贝；
+        move 把源清零（源保持登记，块尾 free(null) / 清零 ERROR 都安全），borrow 把目标从本块
+        登记里摘掉（语义层保证目标与借用语句同块 DIM，所以一定在 scope_resources[-1]）。"""
+        assert isinstance(stmt.target, ast.VarRef) and isinstance(stmt.expr, ast.VarRef)
+        target_ptr, target_type = self.varref_ptr(stmt.target.name, stmt.line_no)
+        source_ptr, _ = self.varref_ptr(stmt.expr.name, stmt.line_no)
+        self.emit(self.source_comment(stmt.line_no))
+        self.emit_free_slot(VarSlot(stmt.target.name, target_type, target_ptr))
+        llvm_ty = self.llvm_type(target_type)
+        value = self.next_temp()
+        self.emit(f"  {value} = load {llvm_ty}, ptr {source_ptr}")
+        self.emit(f"  store {llvm_ty} {value}, ptr {target_ptr}")
+        if stmt.mode == "move":
+            empty = "null" if llvm_ty == "ptr" else "zeroinitializer"
+            self.emit(f"  store {llvm_ty} {empty}, ptr {source_ptr}")
+            return
+        key = stmt.target.name.lower()
+        self.scope_resources[-1] = [slot for slot in self.scope_resources[-1] if slot.name.lower() != key]
+
     def assign_stmt(self, stmt: ast.Assign) -> None:
+        if stmt.mode != "copy":
+            self.ownership_assign_stmt(stmt)
+            return
         target_type = self.type_of_expr(stmt.target)
         target_ptr = self.lvalue_ptr(stmt.target)
         self.emit(self.source_comment(stmt.line_no))
@@ -159,14 +179,11 @@ class StmtsMixin(NativeGenBase):
             self.assign_symbol(target_ptr, stmt.expr)
             return
         if self.is_entity_scalar(target_type) and self.type_has_managed_resources(target_type):
-            source_ptr = self.entity_source_ptr(stmt.expr, target_type)
-            self.emit_entity_copy(target_ptr, source_ptr, target_type)
+            self.store_entity(target_ptr, stmt.expr, target_type)
             return
         value = self.cast_value(self.expr(stmt.expr), target_type)
         if self.is_string_scalar(target_type):
-            # 先 free 旧串再 dup 新串（sa_set_string 内部处理），owned 语义
-            self.use_runtime("sa_set_string")
-            self.emit(f"  call void @sa_set_string(ptr {target_ptr}, ptr {value.value})")
+            self.store_string(target_ptr, value)
             return
         self.emit(f"  store {self.llvm_type(target_type)} {value.value}, ptr {target_ptr}")
 
@@ -269,8 +286,11 @@ class StmtsMixin(NativeGenBase):
         if sub.return_type.name == "VOID":
             self.emit(f"  call {ret_type} @{callee}({', '.join(args)})")
         else:
+            # 语句形式丢弃返回值（TRY CALL f()）：托管返回值归调用方，当场释放。不能挂到语句尾——
+            # TRY 的 end 块还有 CATCH 分支汇入，try 块里定义的 SSA 值在那里不支配。
             temp = self.next_temp()
             self.emit(f"  {temp} = call {ret_type} @{callee}({', '.join(args)})")
+            self.emit_free_value(temp, sub.return_type)
 
     def c_call_stmt(self, c_func: ast.CFunctionDecl, args: list[ast.Expr]) -> LLVMValue | None:
         self.use_c_func(c_func)
@@ -372,7 +392,7 @@ class StmtsMixin(NativeGenBase):
 
         self.emit(f"{try_label}:")
         self.terminated = False
-        self.emit(f"  call {self.llvm_type(sub.return_type)} @{self.sub_name(stmt.call_name)}({', '.join(args)})")
+        self.emit_call(self.sub_name(stmt.call_name), sub, args, raw_name=True)
         self.use_runtime("sa_try_pop")
         self.emit("  call void @sa_try_pop()")
         self.emit(f"  br label %{end_label}")
@@ -512,14 +532,94 @@ class StmtsMixin(NativeGenBase):
             self.emit("  ret void")
         else:
             assert self.current_sub is not None
-            # 返回值先求到 SSA 值再做作用域清理。丢弃临时帧：返回值本身可能是临时堆串，
-            # 不能 free（与 C 后端 return 的 _cleanup 丢弃行为一致）。
+            return_type = self.current_sub.return_type
+            # 返回值先求成 SSA 值，再照常跑语句级临时清理（返回值本身要么已经从临时表里
+            # 接管出来、要么是拷贝/搬出来的新值，不在表里），最后释放本帧局部。
             self.begin_stmt()
-            value = self.cast_value(self.expr(stmt.expr), self.current_sub.return_type)
-            self.discard_stmt()
+            if self.type_has_managed_resources(return_type):
+                value = self.owned_return_value(stmt.expr, return_type)
+            else:
+                value = self.cast_value(self.expr(stmt.expr), return_type)
+            self.end_stmt()
             self.emit_active_cleanup()
-            self.emit(f"  ret {self.llvm_type(self.current_sub.return_type)} {value.value}")
+            self.emit(f"  ret {self.llvm_type(return_type)} {value.value}")
         self.terminated = True
+
+    def owned_return_value(self, expr: ast.Expr, return_type: ast.TypeSpec) -> LLVMValue:
+        """托管类型的 RETURN 值：交给调用方的必须是一份独立所有权。
+
+        本帧登记过的局部（含其字段路径）整体搬出去、原位清零，随后的帧清理 free(null) 无害——
+        以前是 `tmp = s; free(s); return tmp`，调用方拿到的是悬空指针。搬不动的（全局、REF 形参、
+        f= 借来的、数组元素、值传 SYMBOL 形参）深拷贝；本语句刚算出的临时量（F-string、CONCAT、
+        SUB 返回值）直接接管。与 C 后端 owned_value_lines 一一对应。
+        """
+        llvm_ty = self.llvm_type(return_type)
+        # 类型必须严格一致才能整体搬走：SYMBOL SUB 里 RETURN s（s 是 STRING）合法，但那是拿 s 当变量名建树
+        if isinstance(expr, ast.VarRef) and self.is_owned_var(expr.name) and same_type_spec(self.type_of_expr(expr), return_type):
+            ptr, _ = self.varref_ptr(expr.name, expr.line_no)
+            value = self.next_temp()
+            self.emit(f"  {value} = load {llvm_ty}, ptr {ptr}")
+            self.emit(f"  store {llvm_ty} {'null' if llvm_ty == 'ptr' else 'zeroinitializer'}, ptr {ptr}")
+            return LLVMValue(llvm_ty, value, return_type)
+        if is_symbol(return_type):
+            # symbol_expr 自己分辨：变量→clone，临时树→接管，数字/串→常量节点
+            return self.symbol_expr(expr)
+        if self.is_string_scalar(return_type):
+            value = self.cast_value(self.expr(expr), return_type)
+            if self.adopt_temp_cleanup(value.value, return_type):
+                return value
+            self.use_runtime("sa_strdup")
+            dup = self.next_temp()
+            self.emit(f"  {dup} = call ptr @sa_strdup(ptr {value.value})")
+            return LLVMValue("ptr", dup, return_type)
+        # ENTITY / ERROR 聚合：能接管就接管，否则零初始化一份新的再逐字段深拷贝
+        if isinstance(expr, ast.VarRef | ast.Deref | ast.Index):
+            source_ptr = self.lvalue_ptr(expr)
+        else:
+            value = self.cast_value(self.expr(expr), return_type)
+            if self.adopt_temp_cleanup(value.value, return_type):
+                return value
+            source_ptr = self.alloca(llvm_ty)
+            self.emit(f"  store {llvm_ty} {value.value}, ptr {source_ptr}")
+        target_ptr = self.alloca(llvm_ty)
+        self.emit(f"  store {llvm_ty} zeroinitializer, ptr {target_ptr}")
+        if is_error(return_type):
+            self.use_runtime("sa_set_error")
+            self.emit(f"  call void @sa_set_error(ptr {target_ptr}, ptr {source_ptr})")
+        else:
+            self.emit_entity_copy(target_ptr, source_ptr, return_type)
+        result = self.next_temp()
+        self.emit(f"  {result} = load {llvm_ty}, ptr {target_ptr}")
+        return LLVMValue(llvm_ty, result, return_type)
+
+    def store_string(self, target_ptr: str, value: LLVMValue) -> None:
+        """STRING 存入变量/字段/元素：值若是本语句的堆临时量就直接接管（免一次 strdup+free），
+        否则 sa_set_string 拷贝。新值先算完再 free 旧值，`s = F"[{s}]"` 这种自引用才不会 UAF。"""
+        if self.adopt_temp_cleanup(value.value, ast.TypeSpec("STRING")):
+            old = self.next_temp()
+            self.emit(f"  {old} = load ptr, ptr {target_ptr}")
+            self.use_runtime("free")
+            self.emit(f"  call void @free(ptr {old})")
+            self.emit(f"  store ptr {value.value}, ptr {target_ptr}")
+            return
+        self.use_runtime("sa_set_string")
+        self.emit(f"  call void @sa_set_string(ptr {target_ptr}, ptr {value.value})")
+
+    def store_entity(self, target_ptr: str, expr: ast.Expr, type_spec: ast.TypeSpec) -> None:
+        """带托管字段的 ENTITY 赋值：左值来源逐字段深拷贝；SUB 返回的聚合临时量释放旧字段后整体接管，
+        否则先拷贝、临时量在语句尾释放。"""
+        if isinstance(expr, ast.VarRef | ast.Deref | ast.Index):
+            self.emit_entity_copy(target_ptr, self.lvalue_ptr(expr), type_spec)
+            return
+        llvm_ty = self.llvm_type(type_spec)
+        value = self.cast_value(self.expr(expr), type_spec)
+        if self.adopt_temp_cleanup(value.value, type_spec):
+            self.emit_entity_free(target_ptr, type_spec)
+            self.emit(f"  store {llvm_ty} {value.value}, ptr {target_ptr}")
+            return
+        source_ptr = self.alloca(llvm_ty)
+        self.emit(f"  store {llvm_ty} {value.value}, ptr {source_ptr}")
+        self.emit_entity_copy(target_ptr, source_ptr, type_spec)
 
     def emit_gosub_return_dispatch(self) -> None:
         assert self.gosub_stack_ptr is not None and self.gosub_top_ptr is not None

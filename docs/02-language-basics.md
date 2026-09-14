@@ -249,6 +249,72 @@ END
 - `NOT` 的操作数按比较级解析，所以 `NOT a = b` 读作 `NOT (a = b)`，和经典 BASIC、Python 一致。位取反 `BNOT` 则绑定在一元级。
 - `-x ** 2` 读作 `-(x ** 2)`，因为一元负号和幂同级。
 
+## 赋值：复制、借用、移动
+
+`STRING`、`SYMBOL`、`ERROR` 和含这类字段的 `ENTITY` 是**托管资源**：编译器在作用域结束时自动释放它们（见[实现说明](./09-implementation-notes.md#托管资源的清理)）。对这些类型，赋值有三种写法，区别在于谁拥有资源：
+
+| 写法 | 含义 | 之后 |
+|---|---|---|
+| `a = b` | 复制：深拷贝一份 | 两边各自独立，各自释放 |
+| `a f= b` | 借用：`a` 只读地看着 `b` 的资源，不拷贝 | `a` 只读，`b` 在借用期间不能改；`a` 不负责释放 |
+| `a m= b` | 移动：资源从 `b` 转给 `a`，不拷贝 | `b` 作废，再碰 `b` 是编译错误 |
+
+```basic
+10 FOR ENTITY AS Box
+20 DIM text AS STRING AS VAR
+30 .ENDENTITY
+40 SUB main AS PUBLIC AS VOID
+50 DIM built AS STRING AS VAR
+60 DIM result AS STRING AS VAR
+70 built = "a long string that would be wasteful to copy"
+80 result m= built
+90 PRINT result
+100 IF result <> "" THEN
+110 DIM view AS STRING AS VAR
+120 view f= result
+130 PRINT view
+140 END IF
+150 result = "still mine"
+160 DIM box AS ENTITY AS Box AS VAR
+170 DIM moved AS ENTITY AS Box AS VAR
+180 box.text = "payload"
+190 moved m= box
+200 PRINT moved.text
+210 .ENDSUB
+220 CALL main
+230 END
+```
+
+第 80 行之后 `built` 已经不存在了：读它、写它、取它的地址、把它传 `AS REF`，都会报 `变量已被 m= 移走`。第 120 行的 `view` 死在 `END IF`，之后 `result` 解冻，第 150 行才能正常赋值。
+
+规则清单：
+
+- **只对托管类型有效**。数值、`BOOL`、`HANDLE`、`PTR`、数组、`PROMISE` 一律拒绝。两侧类型必须完全一致，没有隐式转换。
+- **右侧必须是一个裸变量**：不能是表达式、字段路径或 `CALL`。
+- `m=` 的源必须是本 SUB 拥有的东西：局部 `DIM`，或按值传入的 `STRING` / `ENTITY` 参数。全局、`AS REF` 参数、`CONST`、按值传入的 `SYMBOL` / `ERROR` 参数都不行。
+- `m=` 的目标可以是局部、全局、`AS REF` 参数或 `ENTITY` 字段。
+- **任一分支移走就算死**：`IF` 里移走的变量，`END IF` 之后同样不能再用。**循环里不能移走循环外声明的变量**，因为下一轮迭代会读到已经空掉的值。
+- `f=` 的目标必须是**与这条语句同一个块里 `DIM` 的局部变量**；源不能是全局。借用者存活期间，源和借用者都不能被赋值、`m=`、取地址、传 `AS REF` 或 `IO.INPUT`；读、按值传参、作为 `=` 的源（深拷贝）都随意。
+- 含 `GOTO` / `GOSUB` 的 SUB 里不能用 `f=` / `m=`。
+- `DIM` / `CONST` 的初始化只支持 `=`。
+
+移走之后再碰源变量，编译器会指着那一行报错：
+
+<!-- doctest: skip 演示错误写法，故意编译不过 -->
+```basic
+10 SUB main AS PUBLIC AS VOID
+20 DIM a AS STRING AS VAR
+30 DIM b AS STRING AS VAR
+40 b = "x"
+50 a m= b
+60 PRINT b
+70 .ENDSUB
+80 CALL main
+90 END
+```
+
+第 60 行报 `变量已被 m= 移走: b`。其他常见的拦截：给数值变量写 `n m= k` 报 `m= 只适用于 STRING / SYMBOL / ERROR 和含托管字段的 ENTITY`；`v f= s` 之后再 `s = "x"` 报 `变量已被 f= 借出`；在 `IF` 里给外层 `DIM` 的变量做 `f=` 报 `f= 的目标必须是与该语句同一个块里 DIM 的局部变量`。所有权检查是顺序敏感的状态机，每个 SUB 只报第一处错，修掉再看下一处。
+
 ## 控制流
 
 ### IF / ELSE IF / ELSE
@@ -411,6 +477,7 @@ END
 | `ENUM` / `.ENDENUM` | 枚举 |
 | `HANDLE AS Kind` | 名义化资源句柄 |
 | `CPTR` / `PTR TO` / `CAST` | 指针与类型转换 |
+| `f=` / `m=` | 托管资源的借用 / 移动赋值，见[赋值：复制、借用、移动](#赋值复制借用移动) |
 
 **子程序修饰符**
 

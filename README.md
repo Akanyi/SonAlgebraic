@@ -85,6 +85,7 @@ sonc doctor
 - 位运算 `BAND` / `BOR` / `BXOR` / `BNOT` / `SHL` / `SHR`。
 - 非 `VOID` 返回值函数、参数、`AS REF` 引用传参（含基于完整 IF/ELSE 的返回路径分析）。
 - `ENTITY` 支持嵌套结构、字段访问、字符串字段深拷贝和常规生命周期清理。
+- 托管资源的三种赋值：`=` 深拷贝、`f=` 只读借用、`m=` 所有权移动，移走后再用、借用期间改源都是编译错误。
 - `ERROR` / `TRY` / `CATCH` / `THROW` 结构化异常处理。
 - `ENUM` 枚举；`SYS.MATH` / `SYS.IO` / `SYS.STRING` / `SYS.BINARY` / `SYS.LIST` / `SYS.MAP` / `SYS.NET` / `SYS.FILE` / `SYS.DESKTOP` 内置模块。
 - `SYMBOL` 完整代数：表达式树捕获、求导 `DERIV`、化简 `SIMPLIFY`、代入 `SUBST`、数值求值 `EVAL`。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 
 from conftest import build_temp, requires_native_compiler
@@ -664,8 +665,11 @@ def test_native_ir_global_initializers() -> None:
     ir = compile_native_ir(_GLOBAL_INIT_SOURCE)
     assert "@sa_x = global i64 0" in ir
     assert "@sa_greeting = global ptr @.sa_empty" in ir
-    assert "call ptr @sa_str_concat" in ir
-    assert "call void @sa_set_string(ptr @sa_greeting" in ir
+    # CONCAT 结果是本语句的堆临时量：释放旧的空串后直接接管，不再 sa_set_string 多拷一份
+    concat = re.search(r"(%sa_tmp_\d+) = call ptr @sa_str_concat\(", ir)
+    assert concat is not None
+    assert f"store ptr {concat.group(1)}, ptr @sa_greeting" in ir
+    assert "call void @sa_set_string(ptr @sa_greeting" not in ir
     assert "call ptr @sa_symbol_op" in ir
     assert "store ptr" in ir and "ptr @sa_f" in ir
 
