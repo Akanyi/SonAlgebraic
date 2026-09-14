@@ -1,10 +1,10 @@
 # SonAlgebraic 下一阶段语言设计草案
 
-> **状态：草案（DRAFT）。** 本文描述的特性**尚未实现**，是对 SA 下一阶段的整体设计梳理，不是已落地的语言参考。正式、可编译、受 CI 校验的语言规范见 [docs 第 1–11 章](./README.md)。
+> **状态：草案（DRAFT），部分已落地。** 本文是对 SA 下一阶段的整体设计梳理，不是语言参考。标了【已落地】/【部分落地】的小节已经进了编译器，正式用法以 [docs 第 1–11 章](./README.md) 为准，这里只保留设计动机和落地时改了主意的地方；其余小节仍是纯设计。哪些进了、进到哪，见[已落地的部分](#已落地的部分)。
 >
-> **示例约定：** 本文代码块一律用 ` ```sa ` 标注，**不用** ` ```basic `。原因很实在——`tests/test_docs_examples.py` 只收集 ` ```basic ` 块去做编译校验，草案里全是还没实现的语法，用 `basic` 标会让 CI 直接红。为聚焦语义，示例多为**片段**、省略了行号；实际代码仍受强制行号规则约束。
+> **示例约定：** 本文代码块一律用 ` ```sa ` 标注，**不用** ` ```basic `。原因很实在——`tests/test_docs_examples.py` 只收集 ` ```basic ` 块去做编译校验，草案里大半是还没实现的语法，用 `basic` 标会让 CI 直接红；已落地部分的可编译示例放在正式文档里受检，这里不重复。为聚焦语义，示例多为**片段**、省略了行号；实际代码仍受强制行号规则约束。
 >
-> **状态图例：**【方向已定】设计主线基本确定 ·【细节待定】方向认可、细节未敲死 ·【仅脑洞】记录在案、尚未采纳。
+> **状态图例：**【已落地】编译器已实现，有测试 ·【部分落地】一部分进了实现，剩余见小节内说明 ·【方向已定】设计主线基本确定 ·【细节待定】方向认可、细节未敲死 ·【仅脑洞】记录在案、尚未采纳。
 
 ## 这批设计要还的账
 
@@ -12,21 +12,33 @@
 
 > C struct 字段访问、**函数回调、字符串所有权转换**都还没有，需要后续扩展。SA 没有**函数指针**，所以回调式 API（包括经典的 GUI 回调注册）暂时表达不了——`SYS.GUI` 走的是轮询式事件循环，就是这个原因。
 
-本文的**函数指针（`PTR TO SUB`）、托管回调、所有权语义（`= / f= / m=`）、托管 HANDLE、异步模型、以及 Context Manager 上下文治理体系**，就是来平这几笔账的。它们不是各自独立的语法糖，而是围绕一个共同哲学长出来的七个面：
+本文的**函数指针（`PTR TO SUB`）、托管回调、所有权语义（`= / f= / m=`）、托管 HANDLE、异步模型、以及 Context Manager 上下文治理体系**，就是来平这几笔账的（所有权语义和异步模型已经先落地了）。它们不是各自独立的语法糖，而是围绕一个共同哲学长出来的七个面：
 
 > **边界不允许隐式穿透。** 作用域、扩展链、所有权、执行上下文、异步实例，每一处都有明确的屏障；跨越屏障必须显式，且身份与权限会随之改变。
 
 ## 七大方向总览
 
-| 方向 | 关键构造 | 解决的问题 |
+| 方向 | 关键构造 | 解决的问题 | 进度 |
+|---|---|---|---|
+| [一、函数模型](#一函数模型) | `REAL`/`VIRTUAL SUB`、`PTR TO SUB`、`NEW SUB`、Lambda、托管回调、`CALLRET`、实体函数 | 函数有了正式的身份、指针、生命周期和回调出口 | 未动 |
+| [二、扩展模型](#二扩展模型) | `EXTEND`、`BEFORE`/`AFTER`/`FINALLY`、`TAG`、`::tag` | 不改签名地向执行结构注入，且注入能力可显式转发、可截断 | 未动 |
+| [三、作用域模型](#三作用域模型) | Runtime / Instance / Internal+Public Scope、Scope Barrier | 函数身份随作用域边界改变，是整套设计的地基 | 未动 |
+| [四、资源模型](#四资源模型) | `= / f= / m=`、托管 HANDLE、callable ownership | 复制/借用/移动三分，作用域绑定的 RAII | `= / f= / m=` 与 `RETURN` 所有权 ✅；托管 HANDLE、callable ownership 未动 |
+| [五、异步模型](#五异步模型) | `ASYNC SUB`、`PROMISE OF`、`CALL`/`AWAIT`/`SYNC` | 真正的异步函数与三种取值方式 | ✅ C 后端；native 后端拒绝 `ASYNC SUB` |
+| [六、上下文治理模型（Context Manager）](#六上下文治理模型context-manager) | Handle Switcher、Scope Exchanger、`SYS.MULTIPROCESS[WORKER/FORK]` | 资源操作权交接、跨域函数能力转换、多进程并发治理 | 未动 |
+| [七、开发体验](#七开发体验) | SA lint、自动行号、SA Traceback | 行号不再靠手维护，崩溃回映射到 SA 世界 | 行号 ✅；Traceback 只有编译期 |
+
+### 已落地的部分
+
+截至 2026-09 进了编译器的东西，正式说明都在 docs 正文里，这里只做索引：
+
+| 条目 | 落地范围 | 正式文档 / 测试 |
 |---|---|---|
-| [一、函数模型](#一函数模型) | `REAL`/`VIRTUAL SUB`、`PTR TO SUB`、`NEW SUB`、Lambda、托管回调、`CALLRET`、实体函数 | 函数有了正式的身份、指针、生命周期和回调出口 |
-| [二、扩展模型](#二扩展模型) | `EXTEND`、`BEFORE`/`AFTER`/`FINALLY`、`TAG`、`::tag` | 不改签名地向执行结构注入，且注入能力可显式转发、可截断 |
-| [三、作用域模型](#三作用域模型) | Runtime / Instance / Internal+Public Scope、Scope Barrier | 函数身份随作用域边界改变，是整套设计的地基 |
-| [四、资源模型](#四资源模型) | `= / f= / m=`、托管 HANDLE、callable ownership | 复制/借用/移动三分，作用域绑定的 RAII |
-| [五、异步模型](#五异步模型) | `ASYNC SUB`、`PROMISE`、`CALL`/`AWAIT`/`SYNC` | 真正的异步函数与三种取值方式 |
-| [六、上下文治理模型（Context Manager）](#六上下文治理模型context-manager) | Handle Switcher、Scope Exchanger、`SYS.MULTIPROCESS[WORKER/FORK]` | 资源操作权交接、跨域函数能力转换、多进程并发治理 |
-| [七、开发体验](#七开发体验) | SA lint、自动行号、SA Traceback | 行号不再靠手维护，崩溃回映射到 SA 世界 |
+| `= / f= / m=` 复制 / 借用 / 移动（[4.1](#41-复制--借用--移动--f--m已落地)） | `STRING` / `SYMBOL` / `ERROR` / 含托管字段的 `ENTITY`；C 与 native 两个后端；借用存续期间源在**编译期冻结** | [第 2 章 · 赋值：复制、借用、移动](./02-language-basics.md#赋值复制借用移动)、[第 9 章 · 借用与移动如何接进清理登记](./09-implementation-notes.md#借用与移动如何接进清理登记)、`tests/test_ownership.py` |
+| `RETURN` 的所有权交接（[4.1](#41-复制--借用--移动--f--m已落地)） | 本帧局部整体搬出、搬不动的深拷贝、临时量直接接管；调用方接管或语句尾释放；两个后端 | [第 9 章 · RETURN 交出去的是一份独立所有权](./09-implementation-notes.md#return-交出去的是一份独立所有权)、`tests/test_return_ownership.py` |
+| `ASYNC SUB` / `PROMISE OF <T>` / `CALL` / `AWAIT` / `SYNC`（[5.1](#51-async-sub--promise--call--await--sync已落地)） | 三种取值方式、独立 `AWAIT` / `SYNC` 语句、`SYS.NET` 的 `*_ASYNC` 原语、跨模块调用；**仅 C 后端** | `tests/test_coroutines.py`；**用户章节还没写**，语法速览暂在 5.1 |
+| 自动行号（[7.1](#71-sa-lint-与自动行号部分落地)，部分） | `sonc fmt --renumber`、`USE SYS.LINT AS NONE_NUMBER` | [第 1 章](./01-getting-started.md) |
+| SA Traceback（[7.2](#72-sa-traceback部分落地)，部分） | 只有 C **编译期**报错反查 SA 行；运行期 traceback 未动 | [第 9 章 · 行号溯源注释](./09-implementation-notes.md#行号溯源注释) |
 
 ---
 
@@ -278,7 +290,7 @@ D
 
 ### 2.4 一处记号撞车，需要拍板
 
-现有语法里 `::label` 已经被 [`GOSUB ::helper`](./03-subroutines.md#gosub-与标签) 占用（块内标签）。这里 `::foo` 又用作 TAG 转发。两个语境不同（跳转标签 vs 扩展点转发），但记号相同——见[未决问题](#八未决问题)。
+现有语法里 `::label` 已经被 [`GOSUB ::helper`](./03-subroutines.md#gosub-与标签) 占用（块内标签）。这里 `::foo` 又用作 TAG 转发。两个语境不同（跳转标签 vs 扩展点转发），但记号相同——见[未决问题](#九未决问题)。
 
 ---
 
@@ -346,9 +358,9 @@ B.extFoo [REAL]
 
 对象开始明确区分几种所有权关系。这一层给 SA 带来接近**作用域绑定 RAII / 线性资源管理**的能力。
 
-### 4.1 复制 / 借用 / 移动：`= / f= / m=`【方向已定】
+### 4.1 复制 / 借用 / 移动：`= / f= / m=`【已落地】
 
-> 笔记原始代号 "font Copy"，含义存疑，本文按功能命名，代号是否保留见[未决问题](#八未决问题)。
+> 用户文档：[第 2 章 · 赋值：复制、借用、移动](./02-language-basics.md#赋值复制借用移动)；实现：[第 9 章 · 借用与移动如何接进清理登记](./09-implementation-notes.md#借用与移动如何接进清理登记)。本节保留设计动机，以及落地时和原稿不一样的地方。
 
 ```text
 =    copy     普通复制
@@ -358,18 +370,19 @@ m=   move     所有权转移
 
 **普通复制** `a = b`：正常 copy。
 
-**只读借用** `a f= b`：
-
-- 不取得 ownership；
-- 不能修改目标；
-- 生命周期依赖 `b`；
-- `FREE b` 之后 `a` 立即失效。
+**只读借用** `a f= b`：不取得 ownership；不能修改目标；生命周期依赖 `b`。
 
 **所有权转移** `a m= b`：ownership 从 `b` 转移给 `a`，之后 `a = owner`、`b = moved / invalid`，再用 `b` 属于非法访问。
 
 > 与现有 `AS REF` 的分工：[`AS REF`](./03-subroutines.md#引用传参-as-ref) 描述的是**参数传递方式**（调用时如何入栈），`f= / m=` 描述的是**赋值 / 绑定时的所有权关系**。两者不冲突，但语义检查要能把“借用来的值又被 `AS REF` 传出去”这类逃逸路径管起来。
 
-> 实现衔接：`f=` / `m=` 已落地，覆盖 `STRING` / `SYMBOL` / `ERROR` 和含托管字段的 `ENTITY`，两个后端都支持，用户文档见[赋值：复制、借用、移动](./02-language-basics.md#赋值复制借用移动)，与清理登记的关系见[实现说明](./09-implementation-notes.md#借用与移动如何接进清理登记)。落地时把上面「`FREE b` 之后 `a` 立即失效、悬空是用户责任」的写法收紧成了**编译期冻结**：借用存续期间源不能被赋值、移动、取址、传 `AS REF`，借用者本身只读，逃逸路径在语义层全部拦死。当前三条限制：含 `GOTO` / `GOSUB` 的 SUB 里禁用（标签跳转让顺序分析不可靠）；借用目标必须与借用语句同块 `DIM`（借用靠摘清理登记实现，登记按块静态生成）；移动的源不能是全局、`AS REF` 参数或按值传入的 `SYMBOL` / `ERROR` 参数（本帧不持有它们）。`PTR TO SUB` 与 callable 实体的所有权规则待那两项落地后接入同一套检查。`RETURN` 走的是同一套思路：本帧拥有的局部整体搬给调用方（源清零），搬不动的深拷贝，调用方把返回值当自己的资源接管或在语句尾释放——见[实现说明](./09-implementation-notes.md#return-交出去的是一份独立所有权)。
+**落地时定下来的：**
+
+- 原稿写的是「`FREE b` 之后 `a` 立即失效」，悬空算用户责任。落地收紧成**编译期冻结**：借用存续期间源不能被赋值、移动、取址、传 `AS REF`，借用者本身只读——上面说的逃逸路径在语义层全部拦死。
+- 覆盖 `STRING` / `SYMBOL` / `ERROR` 和含托管字段的 `ENTITY`，两个后端都支持。
+- 三条限制：含 `GOTO` / `GOSUB` 的 SUB 里禁用（标签跳转让顺序分析不可靠）；借用目标必须与借用语句同块 `DIM`（借用靠摘清理登记实现，登记按块静态生成）；移动的源不能是全局、`AS REF` 参数或按值传入的 `SYMBOL` / `ERROR` 参数（本帧不持有它们）。
+- `RETURN` 走同一套思路：本帧拥有的局部整体搬给调用方（源清零），搬不动的深拷贝，本语句刚算出的临时量直接接管；调用方把返回值当自己的资源接管或在语句尾释放——见[第 9 章 · RETURN 交出去的是一份独立所有权](./09-implementation-notes.md#return-交出去的是一份独立所有权)。
+- 还没接进来的：[`PTR TO SUB`](#12-函数指针-ptr-to-sub方向已定) 与 [callable 实体](#43-callable-ownership)的所有权规则，等那两项落地后并入同一套检查。
 
 ### 4.2 托管 HANDLE【方向已定】
 
@@ -383,7 +396,7 @@ m=   move     所有权转移
 
 这实际上就是 **SA 自己的 scope-bound RAII / 线性资源管理**。`FILE`、`SOCKET`、`BUFFER`、GUI HANDLE 等都会从这里受益。
 
-> 实现衔接：现有编译器已经做局部 `STRING` / `SYMBOL` / `ERROR` 的[释放策略](./03-subroutines.md#返回值)（TODO P0 已落地），并在返回前先算返回值、再清本帧资源。托管 HANDLE 是把这套自动清理**从内置类型扩展到用户资源**，清理时机要和 `AFTER AS FINALLY`、异常退出统一到同一条退出路径上。
+> 实现衔接：现有编译器已经做局部 `STRING` / `SYMBOL` / `ERROR` 的[释放策略](./03-subroutines.md#返回值)（TODO P0 已落地），返回前先算返回值、再清本帧资源，返回值的所有权也已明确交给调用方（见 [4.1](#41-复制--借用--移动--f--m已落地)）。托管 HANDLE 是把这套自动清理**从内置类型扩展到用户资源**，清理时机要和 `AFTER AS FINALLY`、异常退出统一到同一条退出路径上。
 
 ### 4.3 callable ownership
 
@@ -393,33 +406,36 @@ m=   move     所有权转移
 
 ## 五、异步模型
 
-### 5.1 `ASYNC SUB` / `PROMISE` / `CALL` / `AWAIT` / `SYNC`【方向已定】
+### 5.1 `ASYNC SUB` / `PROMISE` / `CALL` / `AWAIT` / `SYNC`【已落地】
 
-新增真正的异步函数：
+> 落地范围：C 后端全量（无栈状态机协程 + 单线程事件循环），native 后端遇到 `ASYNC SUB` 直接报错、让用户改走 C 后端。测试在 `tests/test_coroutines.py`。**用户章节还没写**——docs 第 1–11 章目前没有异步这一章，本节暂时兼作语法速览，下面的写法都是实际编译得过的。
 
 ```sa
-ASYNC SUB asyncfoo() ...
+ASYNC SUB asyncfoo(n AS NUM AS LONG) AS STRING
+    ...
+    RETURN s
+.ENDSUB
 ```
 
-`AWAIT` 是**语句级关键字**，不是能随便嵌进任意表达式的运算符——这条和 [`CALL`](./03-subroutines.md#call-能出现在哪里) 的定位完全一致。
+`AWAIT` / `SYNC` 是**语句级关键字**，归入和 [`CALL`](./03-subroutines.md#call-能出现在哪里) 一样的家族：只能独立成句或占据整条赋值右侧，不能嵌进 `CAST`、实参、F-string 里。
 
 异步函数调用有**三种取值方式**：
 
 **① 先启动、后取现（Promise）**
 
 ```sa
-DIM p AS PROMISE AS VAR
+DIM p AS PROMISE OF STRING AS VAR
 
-p = CALL asyncfoo()
+p = CALL asyncfoo(1)
 x = AWAIT p
 ```
 
-先启动异步实例、拿到 `PROMISE`，以后再取现。
+`p = CALL asyncfoo(1)` 只启动异步实例、拿回 `PROMISE`，以后再 `AWAIT p` 取现。`PROMISE` **带结果类型**，写法 `PROMISE OF <类型>` 与 `PTR TO <类型>` 同构；一个 `PROMISE` 只能取现一次，结果按移动语义交出（不拷贝）。
 
 **② 标准异步调用**
 
 ```sa
-x = AWAIT asyncfoo()
+x = AWAIT asyncfoo(1)
 ```
 
 启动后等待结果。
@@ -427,16 +443,23 @@ x = AWAIT asyncfoo()
 **③ 同步调用**
 
 ```sa
-x = SYNC asyncfoo()
+x = SYNC asyncfoo(1)
 ```
 
-把异步函数按同步方式调用，当前执行流**阻塞**到结果出来。
+把异步函数按同步方式驱动到结束，当前执行流**阻塞**。这也是普通 `SUB`（比如 `main`）进入异步世界的唯一入口——`AWAIT` 只允许出现在 `ASYNC SUB` 里。
+
+不要返回值就独立成句：`AWAIT p`、`SYNC asyncfoo(1)`。
 
 **`PROMISE` 的本质**：它关联某个**异步函数实例对象**，`AWAIT` 根据 Promise 找回对应实例、取得返回值。
 
-> 语法位衔接：`x = AWAIT p` 和 `x = SYNC asyncfoo()` 都是“赋值右侧”，与现有 `v = CALL make` 同构。这说明 `AWAIT` / `SYNC` 应归入和 `CALL` 一样的**语句级关键字家族**：只能独立成句或占据整条赋值右侧，不能嵌进 `CAST`、实参、F-string 里。
+**落地时定下的边界：**
 
-**【仅脑洞】不透明 Promise。** 曾考虑过“Promise 完全不透明、返回类型靠用户猜”的邪道版本。目前更像脑洞，不算正式规则——主线方向应是**带结果类型的 Promise**（见[未决问题](#八未决问题)里的类型写法）。
+- `ASYNC SUB` 不能用独立 `CALL` 语句调用（只能 `AWAIT` / `SYNC` / `p = CALL`），也不能作为 `TRY CALL` 的目标；
+- `AWAIT` 不能出现在 `TRY` 块内（挂起会破坏 setjmp 异常栈），`SYNC` 不挂起当前帧、不受此限；
+- `ASYNC SUB` 不支持 `AS REF` 参数（协程帧需独占参数所有权）；
+- `SYS.NET` 提供 `ACCEPT_ASYNC` / `RECV_ASYNC` / `SEND_ASYNC` / `CONNECT_ASYNC`，分别返回 `PROMISE OF NET_STREAM` / `STRING` / `NUM` / `NET_STREAM`，是真正会挂起让出的 I/O 点；
+- 跨模块调用 `ASYNC SUB` 走同一套 ABI。
+- 原稿里「Promise 完全不透明、返回类型靠用户猜」的脑洞版**没有采纳**，落地的就是带类型的 `PROMISE OF <T>`。
 
 ---
 
@@ -551,7 +574,7 @@ Current Process Context
 
 ## 七、开发体验
 
-### 7.1 SA lint 与自动行号【方向已定】
+### 7.1 SA lint 与自动行号【部分落地】
 
 对强制行号开发体验的改造：源码可以**不手写全部行号**，由 SA lint / formatter 管理；同时仍兼容人工行号。
 
@@ -561,13 +584,13 @@ Current Process Context
 
 这相当于——保留“行号属于语言语义”这条根，但不再逼程序员人工维护所有编号。
 
-> 衔接：这套东西已经有落地基础。现有 [`sonc fmt --renumber`](./01-getting-started.md) 能重排行号，且 `sonc fmt` 已支持 `USE SYS.LINT AS NONE_NUMBER` 的无行号源码（见 TODO P2 已完成项）。本节是把它规范化进语言设计。
+> 已落地：[`sonc fmt --renumber`](./01-getting-started.md) 重排行号；`USE SYS.LINT AS NONE_NUMBER` 让编译器给无行号源码自动补号。剩下的是把「人工行号与自动行号混写时的撞号规则」规范化进语言设计——现在 `NONE_NUMBER` 模式下手写的行号会被整体覆盖，两种写法是二选一，还没有混写。
 
-### 7.2 SA Traceback【方向已定】
+### 7.2 SA Traceback【部分落地】
 
 运行时 crash / error 后，尽量把底层错误**重新映射回 SA 世界**：SA 调用栈、`SUB`、源代码位置 / 行号、错误代码——而不是把用户扔到 `generated.c:19428` 去考古。
 
-> 衔接：现有驱动已经用生成 C 里的 `/* SA nnn: ... */` 注释把 **C 编译期**报错反查回 SA 行（第 6 章、第 9 章都提到）。SA Traceback 是把这个能力**从编译期延伸到运行期**——难点在于运行期没有编译期的静态注释可依赖，需要运行时侧的行号 / 调用栈元数据。
+> 已落地：**C 编译期**报错反查 SA 行——驱动拿生成 C 里的 `/* SA nnn: ... */` 注释定位（见[第 9 章 · 行号溯源注释](./09-implementation-notes.md#行号溯源注释)）。未动：**运行期** traceback，难点在于运行期没有编译期的静态注释可依赖，需要运行时侧的行号 / 调用栈元数据。
 
 ---
 
@@ -620,22 +643,26 @@ CALLRET responseCallback(response)
 
 1. **`::` 记号撞车。** `::label` 已被 [`GOSUB`](./03-subroutines.md#gosub-与标签) 占用（块内标签），`::foo` 又要做 TAG 转发。是有意复用（都表达“这是个可被跳转/转发的具名点”），还是需要换记号？——语法层必须能区分。
 2. **`USE C` / `USE LIB` vs 现有 `USEC` / `USELIB`。** 笔记里写 `USE C` / `USE LIB`（带空格），现有实现是 [`USEC` / `USELIB`](./06-pointers-and-ffi.md#c-ffi-声明)（连写）。需要统一，否则文档和实现两张皮。
-3. **`PROMISE` 要不要带结果类型。** `DIM p AS PROMISE AS VAR` 目前不带返回类型信息。主线倾向带类型（如 `PROMISE OF NUM AS LONG` 之类的写法待定），“完全不透明”版是[仅脑洞](#51-async-sub--promise--call--await--sync方向已定)。
-4. **Lambda 闭包捕获。** 捕获值还是捕获引用？闭包逃逸后被捕获变量的生命周期如何延续？和[托管 HANDLE](#42-托管-handle方向已定) 的逃逸规则要一起定。
-5. **`font Copy` 代号。** `= / f= / m=` 的这组语义，笔记代号 "font Copy" 含义存疑，是否保留、正名成什么。
-6. **ENTITY 方法的边界。** 实体函数与 `SUB EXTEND` 的分工要划死，防止滑向 OOP 类继承。
-7. **`CALLRET` 与返回路径分析的合流。** 含 `CALLRET` 的路径视为“已终结”，其后不可达——需要接进现有的非 `VOID SUB` 返回路径检查。
-8. **FORK 继承与状态清理细节。** Fork 动作后 Context Manager 如何同步继承 Handle 树、Scope Exchanger 状态与 Promise 状态，需要独立规约。
+3. **Lambda 闭包捕获。** 捕获值还是捕获引用？闭包逃逸后被捕获变量的生命周期如何延续？和[托管 HANDLE](#42-托管-handle方向已定) 的逃逸规则要一起定。
+4. **ENTITY 方法的边界。** 实体函数与 `SUB EXTEND` 的分工要划死，防止滑向 OOP 类继承。
+5. **`CALLRET` 与返回路径分析的合流。** 含 `CALLRET` 的路径视为“已终结”，其后不可达——需要接进现有的非 `VOID SUB` 返回路径检查。
+6. **FORK 继承与状态清理细节。** Fork 动作后 Context Manager 如何同步继承 Handle 树、Scope Exchanger 状态与 Promise 状态，需要独立规约。
+
+**随落地拍板、不再悬着的：**
+
+- **`PROMISE` 带不带结果类型** → 带，写法 `PROMISE OF <类型>`，与 `PTR TO <类型>` 同构；「完全不透明」版弃用（见 [5.1](#51-async-sub--promise--call--await--sync已落地)）。
+- **"font Copy" 代号** → 没有沿用。正式名就叫复制 / 借用 / 移动（`= / f= / m=`），用户文档和实现里都不出现这个代号。
+- **借用悬空是谁的责任** → 原稿「`FREE b` 之后 `a` 立即失效」由用户自己兜，落地改成编译期冻结源（见 [4.1](#41-复制--借用--移动--f--m已落地)）。
 
 ---
 
 ## 十、和现有实现的衔接与建议落地顺序
 
-粗排落地顺序（沿用 TODO 的 P 级习惯）：
+粗排落地顺序（沿用 TODO 的 P 级习惯），✅ 表示已进编译器：
 
 - **P0（地基，别的都依赖它）**：[作用域模型](#三作用域模型) 与 [Scope Exchanger](#62-sa-scope-exchanger跨域能力转换引擎方向已定)（REAL/VIRTUAL 二分 + Scope Barrier + 转换规则）。它决定了函数身份，是扩展模型和函数指针的前提。
-- **P1（函数与资源）**：[`PTR TO SUB`](#12-函数指针-ptr-to-sub方向已定) → [`NEW SUB FROM`](#13-new-sub--from-ptr生成局部-callable-实体方向已定) → [`= / f= / m=`](#41-复制--借用--移动--f-m方向已定) → [托管 HANDLE 与 Handle Switcher](#61-sa-handle-switcher资源权属调度与死锁恢复方向已定)。直接平掉第 6 章“没有函数指针 / 回调 / 所有权转换”三笔账。
+- **P1（函数与资源）**：✅ [`= / f= / m=`](#41-复制--借用--移动--f--m已落地)（连同 `RETURN` 的所有权交接）先于这条链落地了。剩下 [`PTR TO SUB`](#12-函数指针-ptr-to-sub方向已定) → [`NEW SUB FROM`](#13-new-sub--from-ptr生成局部-callable-实体方向已定) → [托管 HANDLE 与 Handle Switcher](#61-sa-handle-switcher资源权属调度与死锁恢复方向已定)，前两项落地时要接进 4.1 已有的所有权检查。第 6 章的三笔账里，“没有函数指针 / 回调”两笔还在；“所有权转换”SA 侧有了，C FFI 的字符串所有权转换是另一回事，未动。
 - **P1（扩展）**：[`EXTEND` + `BEFORE`/`AFTER`/`FINALLY`](#21-extend函数执行结构继承方向已定) → [`TAG` / `::tag`](#22-tag-扩展点与禁止隔代打祖宗方向已定)。
-- **P2（并发与异步）**：[托管回调](#15-托管回调方向已定) → [`ASYNC`/`AWAIT`/`SYNC`/`PROMISE`](#五异步模型) → [`SYS.MULTIPROCESS[WORKER]`](#63-sysmultiprocess进程执行上下文扩展方向已定) → [`CALLRET`](#16-callret以回调替代-return-的控制流出口方向已定)。
-- **P2（体验）**：[SA lint / 自动行号](#71-sa-lint-与自动行号方向已定)、[SA Traceback](#72-sa-traceback方向已定)。可与主线并行推进。
+- **P2（并发与异步）**：✅ [`ASYNC`/`AWAIT`/`SYNC`/`PROMISE`](#五异步模型)（C 后端）。顺序和原计划反了——异步先于托管回调落地，事件循环已经在 runtime 里；剩下 [托管回调](#15-托管回调方向已定) → [`SYS.MULTIPROCESS[WORKER]`](#63-sysmultiprocess进程执行上下文扩展方向已定) → [`CALLRET`](#16-callret以回调替代-return-的控制流出口方向已定)，托管回调接进来时应复用这个循环而不是另起一套。native 后端补 `ASYNC` 也挂在这条线上。
+- **P2（体验）**：[SA lint / 自动行号](#71-sa-lint-与自动行号部分落地)（✅ 工具已有，混写规则未定）、[SA Traceback](#72-sa-traceback部分落地)（✅ 编译期，运行期未动）。可与主线并行推进。
 - **P3（深度探索）**：[`SYS.MULTIPROCESS[FORK]`](#2-multiprocessfork进程上下文分裂细节待定) 规范化。
