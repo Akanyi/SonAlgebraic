@@ -35,6 +35,9 @@ def _exe_path(temp_dir: Path, stem: str) -> Path:
 # 与 test_e2e.py 的泄漏测试同款，MinGW gcc 上稳定。协程帧走 calloc（零初始化，让挂起中
 # 被 drop 时的 cleanup 能安全 free 未到达的局部），所以 calloc 也要计数，否则净值会偏负。
 _LEAK_SHIM = (
+    # 计数桩先于 runtime 前导包含系统头，POSIX 特性宏必须抢在它们之前生效。
+    "#ifndef _WIN32\n#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200112L\n#endif\n"
+    "#ifndef _FILE_OFFSET_BITS\n#define _FILE_OFFSET_BITS 64\n#endif\n#endif\n"
     "#include <stdio.h>\n#include <stdlib.h>\n"
     "static long sa__live=0;\n"
     "static void* sa__m(size_t n){void* p=malloc(n); if(p)sa__live++; return p;}\n"
