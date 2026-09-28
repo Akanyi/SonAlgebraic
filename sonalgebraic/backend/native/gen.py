@@ -1,25 +1,23 @@
 from __future__ import annotations
 
 from ...analysis.semantics import CheckedProgram
-from ...analysis.typesys import BUILTIN_MODULES, is_error, is_string, is_symbol
+from ...analysis.typesys import BUILTIN_MODULES, is_error, is_string, is_sub_ptr, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import module_symbol_prefix, split_module_member
 from .base import NativeGenBase, VarSlot, sub_gosub_lines
 from .builtins import BuiltinsMixin
+from .coroutines import CoroutinesMixin
 from .entities import EntitiesMixin
 from .exprs import ExprsMixin
+from .promises import PromiseMixin
 from .runtime_decls import RUNTIME_SIGNATURES
 from .stmts import StmtsMixin
 from .types import TypesMixin
 
 
-class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesMixin, NativeGenBase):
-    """Experimental textual LLVM IR backend.
-
-    This backend intentionally starts small. It is a parallel path to the C backend,
-    not a replacement yet.
-    """
+class NativeLLVMGen(CoroutinesMixin, PromiseMixin, BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesMixin, NativeGenBase):
+    """直接生成 LLVM IR；仍按特性分阶段追齐 C 后端。"""
 
     def __init__(self, checked: CheckedProgram, main_init_calls: list[str] | None = None, main_free_calls: list[str] | None = None) -> None:
         self.checked = checked
@@ -57,6 +55,8 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         # ENTITY/ERROR 聚合临时量（SUB 返回值）的释放不是一行能写完的，按 SSA 值名记下整段 IR，
         # 接管（adopt）时才能按值找到并摘掉它。
         self.aggregate_temp_cleanup: dict[str, str] = {}
+        self.async_context = None
+        self.async_type_declarations: list[str] = []
 
     def generate(self) -> str:
         self.validate_supported_program()
@@ -71,8 +71,10 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
             "source_filename = \"sonalgebraic-native\"",
             "",
             "%SaError = type { i32, ptr, ptr, i32, ptr }",
+            "%SaCoroBase = type { i32, ptr, ptr, i64, i64 }",
         ]
         header.extend(self.entity_type_declarations())
+        header.extend(self.async_type_declarations)
         header.extend(["", "declare i32 @printf(ptr, ...)"])
         for name in sorted(self.used_runtime):
             header.append(RUNTIME_SIGNATURES[name])
@@ -109,11 +111,10 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         for decl in self.checked.program.declarations:
             self.require_supported_type(decl.type_spec, decl.line_no)
         for sub in self.checked.program.subs:
-            # ASYNC SUB 要编译成无栈状态机协程 + 事件循环，native 后端首期不接，退回 C 后端
-            if sub.is_async:
-                raise SonCompileError("native 后端暂不支持 ASYNC SUB，请改用 C 后端", sub.line_no)
             self.require_supported_type(sub.return_type, sub.line_no, allow_void=True)
             for param in sub.params:
+                if sub.is_async and param.type_spec.array_size is not None:
+                    raise SonCompileError("native ASYNC SUB 暂不支持数组按值参数", param.line_no)
                 self.require_supported_type(param.type_spec, param.line_no)
             for stmt in sub.body:
                 self.require_supported_stmt(stmt)
@@ -125,9 +126,16 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         if allow_void and type_spec.name == "VOID":
             return
         if type_spec.array_size is not None:
+            if type_spec.name == "PROMISE":
+                raise SonCompileError("native 后端暂不支持 PROMISE 数组的逐元素所有权", line_no)
             self.require_supported_type(self.array_element_type(type_spec), line_no)
             return
         if type_spec.name in {"NUM", "BOOL", "STRING", "CPTR", "SYMBOL", "ERROR", "ENTITY", "HANDLE"}:
+            return
+        if type_spec.name == "PROMISE" and type_spec.inner is not None:
+            self.require_supported_type(type_spec.inner, line_no, allow_void=True)
+            return
+        if is_sub_type(type_spec) or is_sub_ptr(type_spec):
             return
         if type_spec.name == "PTR" and type_spec.inner is not None:
             self.require_supported_type(type_spec.inner, line_no)
@@ -135,12 +143,14 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         raise SonCompileError(f"native 后端暂不支持类型: {type_spec.name}", line_no)
 
     def require_supported_stmt(self, stmt: ast.Stmt) -> None:
+        if isinstance(stmt, ast.NewSub | ast.CallRet):
+            return
         if isinstance(stmt, ast.TryCatch):
             for branch in stmt.catches:
                 for inner in branch.body:
                     self.require_supported_stmt(inner)
             return
-        if isinstance(stmt, ast.NoOp | ast.Print | ast.Assign | ast.Call | ast.ThrowNew | ast.ThrowVar | ast.Return | ast.Goto | ast.Gosub | ast.Label | ast.Input | ast.Cls):
+        if isinstance(stmt, ast.NoOp | ast.Print | ast.Assign | ast.Call | ast.AwaitStmt | ast.ThrowNew | ast.ThrowVar | ast.Return | ast.Goto | ast.Gosub | ast.Label | ast.Input | ast.Cls):
             return
         if isinstance(stmt, ast.LocalDeclaration):
             self.require_supported_type(stmt.type_spec, stmt.line_no)
@@ -174,10 +184,15 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
             lines.append(f"@{symbol} = external global {self.c_abi_type(const.type_spec)}")
         for symbol, sub in sorted(self.used_external_subs.items()):
             params = ", ".join(self.c_abi_param_decl(param) for param in sub.params)
-            lines.append(f"declare {self.c_abi_type(sub.return_type)} @{symbol}({params})")
+            if sub.is_async:
+                lines.append(f"declare i64 @{symbol}_start({params})")
+            else:
+                lines.append(f"declare {self.c_abi_type(sub.return_type)} @{symbol}({params})")
         return lines
 
     def subroutine(self, sub: ast.Subroutine) -> str:
+        if sub.is_async:
+            return self.async_subroutine(sub)
         self.current_sub = sub
         self.lines = []
         self.entry_allocas = []
@@ -212,6 +227,12 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
                 dup = self.next_temp()
                 self.emit(f"  {dup} = call ptr @sa_strdup(ptr %{name})")
                 self.emit(f"  store ptr {dup}, ptr {ptr}")
+                self.register_owned(slot)
+            elif is_sub_type(param.type_spec):
+                self.use_runtime("sa_callable_retain")
+                retained = self.next_temp()
+                self.emit(f"  {retained} = call ptr @sa_callable_retain(ptr %{name})")
+                self.emit(f"  store ptr {retained}, ptr {ptr}")
                 self.register_owned(slot)
             elif self.is_entity_scalar(param.type_spec) and self.type_has_managed_resources(param.type_spec):
                 source = f"%{name}.param"
@@ -257,7 +278,9 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         # 全局 STRING 初始化为 owned 空串（复刻 C 后端 init_string_globals）
         global_strings = [decl for decl in self.checked.program.declarations if is_string(decl.type_spec)]
         global_symbols = [decl for decl in self.checked.program.declarations if is_symbol(decl.type_spec)]
+        global_callables = [decl for decl in self.checked.program.declarations if is_sub_type(decl.type_spec)]
         global_errors = [decl for decl in self.checked.program.declarations if is_error(decl.type_spec)]
+        global_promises = [decl for decl in self.checked.program.declarations if decl.type_spec.name == "PROMISE"]
         global_entities = [decl for decl in self.checked.program.declarations if self.is_entity_scalar(decl.type_spec) and self.type_has_managed_resources(decl.type_spec)]
         for decl in global_strings:
             self.init_global_string(decl)
@@ -278,8 +301,12 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
             self.free_global_string(decl)
         for decl in global_symbols:
             self.free_global_symbol(decl)
+        for decl in global_callables:
+            self.emit_free_slot(VarSlot(decl.name, decl.type_spec, f"@{self.c_ident(decl.name)}"))
         for decl in global_errors:
             self.free_global_error(decl)
+        for decl in global_promises:
+            self.emit_free_slot(VarSlot(decl.name, decl.type_spec, f"@{self.c_ident(decl.name)}"))
         for decl in global_entities:
             self.emit_entity_free(f"@{self.c_ident(decl.name)}", decl.type_spec)
         # 捕获过的最后一个运行时全局错误也持有 message 副本，C 后端 main 末尾同样清理。
@@ -343,11 +370,17 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
             self.assign_symbol(target, decl.expr)
             self.end_stmt()
             return
+        if is_sub_type(decl.type_spec):
+            self.store_callable(target, self.expr(decl.expr))
+            self.end_stmt()
+            return
         if self.is_entity_scalar(decl.type_spec) and self.type_has_managed_resources(decl.type_spec):
             self.store_entity(target, decl.expr, decl.type_spec)
             self.end_stmt()
             return
         value = self.cast_value(self.expr(decl.expr), decl.type_spec)
+        if decl.type_spec.name == "PROMISE":
+            self.adopt_temp_cleanup(value.value, decl.type_spec)
         if self.is_string_scalar(decl.type_spec):
             self.store_string(target, value)
         else:
@@ -372,6 +405,8 @@ class NativeLLVMGen(BuiltinsMixin, StmtsMixin, ExprsMixin, EntitiesMixin, TypesM
         sub = module.subs.get(member.lower())
         if sub is None:
             return None
+        if sub.is_async and any(not p.by_ref and p.type_spec.name in {"ENTITY", "ERROR"} for p in sub.params):
+            raise SonCompileError("native 后端暂不支持跨 C ABI 的 ASYNC ENTITY/ERROR 按值参数", sub.line_no)
         symbol = f"{module_symbol_prefix(module.module)}_sub_{sub.name.lower()}"
         self.used_external_subs[symbol] = sub
         return symbol, sub

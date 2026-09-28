@@ -2,8 +2,6 @@
 20 REM 演示 SYMBOL 的求导、化简、代入等操作
 30 REM 正确处理符号变量和参数代入
 40 REM
-50 USE SYS.IO AS IO
-60 USE SYS.MATH AS MATH
 70 REM
 80 REM ============================================
 90 REM 基础参数
@@ -80,7 +78,7 @@
 800 PRINT F"  化简后 = {expr2_simplified}"
 810 PRINT ""
 820 REM 代入所有符号变量并计算
-830 expr2_eval = EVAL(SUBST(SUBST(SUBST(expr2, "rho", 1000), "v", 3), "v", 3))
+830 expr2_eval = EVAL(SUBST(SUBST(expr2, "rho", 1000), "v", 3))
 840 PRINT F"当 v = 3 m/s 时: K(3) = {expr2_eval} J/m³"
 850 PRINT ""
 860 PRINT ""

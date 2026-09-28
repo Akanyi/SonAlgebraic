@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import subprocess
 
@@ -114,7 +115,7 @@ def test_hello_world_does_not_carry_symbol_algebra() -> None:
 
     这正是做按需注入的直接动机。
     """
-    c = _example_c("hello")
+    c = _example_c("basics/hello")
     assert "sa_symbol_deriv" not in c
     assert "sa_symbol_simplify" not in c
     assert "sa_net_" not in c
@@ -124,7 +125,7 @@ def test_hello_world_does_not_carry_symbol_algebra() -> None:
 
 def test_symbol_program_still_gets_the_algebra() -> None:
     """反过来：真用 SYMBOL 求导时那套必须在，且连带它依赖的东西一起。"""
-    c = _example_c("fluid_symbolic")
+    c = _example_c("symbolic/fluid_derivatives")
     assert "sa_symbol_deriv" in c
     # deriv 引用了定义在它后面的这两个，靠前置声明兜底——闭包必须把它们带上
     assert "sa_symbol_free" in c
@@ -132,7 +133,7 @@ def test_symbol_program_still_gets_the_algebra() -> None:
 
 
 def test_list_program_gets_list_but_not_net() -> None:
-    c = _example_c("lists")
+    c = _example_c("data/lists")
     assert "SA_LIST_SLOT_COUNT" in c
     assert "sa_net_http_fetch" not in c
     assert "sa_symbol_deriv" not in c
@@ -140,14 +141,14 @@ def test_list_program_gets_list_but_not_net() -> None:
 
 def test_prelude_is_always_kept_whole() -> None:
     """PRELUDE 整块保留：类型定义和 setjmp 宏没法按需，拆了只会自找麻烦。"""
-    c = _example_c("hello")
+    c = _example_c("basics/hello")
     for needle in ("typedef struct", "SA_SETJMP", "SaError", "SaTryFrame"):
         assert needle in c
 
 
 def test_runtime_shrinks_a_lot() -> None:
     """效果断言。改造前 hello 生成 4193 行，其中 98.6% 是运行时。"""
-    assert len(_example_c("hello").split("\n")) < 600
+    assert len(_example_c("basics/hello").split("\n")) < 600
 
 
 # --------------------------------------------------------------------------
@@ -157,14 +158,10 @@ def test_runtime_shrinks_a_lot() -> None:
 
 def _single_file_examples() -> list[str]:
     """能走单文件模式的示例。用户模块类的走另一条路径，由模块模式那条测试覆盖。"""
-    names = []
-    for path in sorted(EXAMPLES.glob("*.sa")):
-        try:
-            generate_c(check_program(parse_program(path.read_text(encoding="utf-8-sig"))))
-        except Exception:
-            continue
-        names.append(path.stem)
-    return names
+    # 按目录明确分离用户模块；解析/语义错误必须变成测试失败，不能被当成非示例悄悄跳过。
+    entries = json.loads((EXAMPLES / "catalog.json").read_text(encoding="utf-8"))["examples"]
+    return [str(Path(entry["path"]).with_suffix("")).replace("\\", "/") for entry in entries
+            if entry["kind"] == "program" and not entry["path"].startswith("modules/")]
 
 
 @requires_c_compiler
@@ -180,7 +177,7 @@ def test_every_example_still_compiles(name: str, tmp_path: Path) -> None:
     if compiler == "cl":
         pytest.skip("MSVC 的命令行形状不同，这条只覆盖 gcc/clang 系")
 
-    c_file = tmp_path / f"{name}.c"
+    c_file = tmp_path / "example.c"
     c_file.write_text(_example_c(name), encoding="utf-8")
     proc = subprocess.run(
         [compiler, "-c", "-O2", "-std=c11", "-o", os.devnull, str(c_file)],

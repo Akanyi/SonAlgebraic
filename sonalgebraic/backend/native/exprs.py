@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from ...analysis.typesys import classify_number_literal, is_bool, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, resolve_builtin_const
+import re
+
+from ...analysis.typesys import callable_symbol_type, classify_number_literal, is_bool, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_sub_ptr, is_sub_type, is_symbol, resolve_builtin_const, sub_ref_type, sub_signature
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import LLVMValue, NativeGenBase, llvm_double_literal, llvm_int_literal
@@ -8,6 +10,13 @@ from .base import LLVMValue, NativeGenBase, llvm_double_literal, llvm_int_litera
 
 class ExprsMixin(NativeGenBase):
     """表达式求值：左值求址、运算、F-string、SYMBOL 建树。"""
+
+    def emit_pending_temp_cleanup(self, cleanup: list[str]) -> None:
+        # 聚合临时的 cleanup 含 load/GEP 定义。异常边复制它时必须重命名 SSA，
+        # 否则与正常语句尾的同一段清理定义重名，LLVM 会拒绝整个函数。
+        for block in cleanup:
+            names = {name: self.next_temp() for name in re.findall(r"(?m)^\s*(%[A-Za-z_][A-Za-z_0-9.]*)\s*=", block)}
+            self.emit(re.sub(r"%[A-Za-z_][A-Za-z_0-9.]*", lambda match: names.get(match[0], match[0]), block))
 
     def lvalue_ptr(self, expr: ast.Expr) -> str:
         if isinstance(expr, ast.VarRef):
@@ -123,6 +132,7 @@ class ExprsMixin(NativeGenBase):
         return values
 
     def wrap_call_expr_with_throw_cleanup(self, name: str, sub: ast.Subroutine, args: list[str], raw_name: bool = False, c_abi: bool = False) -> LLVMValue:
+        pending_cleanup = list(self.temp_cleanup[-1]) if self.temp_cleanup else []
         ret_type = self.c_abi_type(sub.return_type) if c_abi else self.llvm_type(sub.return_type)
         result_ptr = self.alloca(ret_type)
         env = self.next_temp()
@@ -157,6 +167,7 @@ class ExprsMixin(NativeGenBase):
         self.terminated = False
         self.use_runtime("sa_try_pop")
         self.emit("  call void @sa_try_pop()")
+        self.emit_pending_temp_cleanup(pending_cleanup)
         self.emit_active_cleanup()
         self.use_runtime("sa_throw_dispatch")
         self.emit("  call void @sa_throw_dispatch()")
@@ -221,6 +232,10 @@ class ExprsMixin(NativeGenBase):
         raise SonCompileError("SYMBOL 只支持变量/数字/+ - * / ** 表达式和 DERIV/SIMPLIFY/SUBST", expr.line_no)
 
     def expr(self, expr: ast.Expr) -> LLVMValue:
+        if isinstance(expr, ast.AwaitExpr):
+            return self.await_expr(expr)
+        if isinstance(expr, ast.SyncExpr):
+            return self.sync_expr(expr)
         if is_symbol(self.type_of_expr(expr)) and not isinstance(expr, ast.VarRef | ast.CallExpr):
             return self.symbol_expr(expr)
         if isinstance(expr, ast.NumberLiteral):
@@ -298,25 +313,103 @@ class ExprsMixin(NativeGenBase):
             if sub is None:
                 external = self.resolve_external_sub(expr.name)
                 if external is None:
+                    callable_type = callable_symbol_type(expr.name, self.current_symbols(), self.checked.entities, expr.line_no)
+                    if callable_type is not None:
+                        return self.call_indirect(expr.name, expr.args, expr.line_no, callable_type)
                     raise SonCompileError(f"native 后端暂不支持表达式调用: {expr.name}", expr.line_no)
                 external_name, sub = external
             else:
                 external_name = self.sub_name(expr.name)
             is_external = external is not None
+            if sub.is_async:
+                return self.async_call_expr(sub, expr.args, external_name, c_abi=is_external)
             args = self.call_args(sub, expr.args, c_abi=is_external)
-            if self.has_active_resources():
+            if getattr(self, "async_context", None) is None and (self.has_active_resources() or (self.temp_cleanup and self.temp_cleanup[-1])):
                 value = self.wrap_call_expr_with_throw_cleanup(external_name, sub, args, raw_name=True, c_abi=is_external)
             else:
                 temp = self.next_temp()
                 ret_type = self.c_abi_type(sub.return_type) if is_external else self.llvm_type(sub.return_type)
                 self.emit(f"  {temp} = call {ret_type} @{external_name}({', '.join(args)})")
                 value = self.i32_status(temp) if is_external and is_bool(sub.return_type) else LLVMValue(ret_type, temp, sub.return_type)
+            self.adopt_promise_arguments(sub.params, args, value)
             # SUB 返回的托管值（STRING/SYMBOL/带串字段的 ENTITY）所有权在调用方：先当临时量登记，
             # 语句结束没人接管（赋值、RETURN、SYMBOL 建树）就释放。以前这里既不登记也不接管，
             # 每次 `x = CALL f()` 都漏一份。
             self.register_temp_cleanup(value.value, sub.return_type)
             return value
+        if isinstance(expr, ast.SubRef):
+            ref_type = sub_ref_type(expr.name, self.checked.subs, self.checked.external_modules, self.checked.c_funcs, expr.line_no)
+            c_func = self.resolve_c_func(expr.name)
+            if c_func is not None:
+                self.use_c_func(c_func)
+                return LLVMValue("ptr", f"@{c_func.name}", ref_type)
+            external = self.resolve_external_sub(expr.name)
+            return LLVMValue("ptr", f"@{external[0]}" if external else f"@{self.sub_name(expr.name)}", ref_type)
         raise SonCompileError(f"native 后端暂不支持表达式: {type(expr).__name__}", expr.line_no)
+
+    def call_indirect(self, name: str, args: list[ast.Expr], line_no: int, callable_type: ast.TypeSpec) -> LLVMValue:
+        signature = sub_signature(callable_type)
+        check = "sa_callable_fn" if is_sub_type(callable_type) else "sa_sub_check"
+        self.use_runtime(check)
+        # 先求实参；这些临时量可能是本语句产生的堆串。落地垫包住读取函数引用与实际调用。
+        params = []
+        for param, arg in zip(signature.params or (), args):
+            if param.by_ref:
+                params.append(f"ptr {self.lvalue_ptr(arg)}")
+            else:
+                value = self.cast_value(self.expr(arg), param.type_spec)
+                params.append(f"{self.llvm_type(param.type_spec)} {value.value}")
+        guard = getattr(self, "async_context", None) is None and (self.has_active_resources() or bool(self.temp_cleanup and self.temp_cleanup[-1]))
+        pending_cleanup = list(self.temp_cleanup[-1]) if self.temp_cleanup else []
+        if guard:
+            env = self.next_temp()
+            frame = self.next_temp()
+            status = self.next_temp()
+            normal = self.unique_label("indirect_call")
+            catch = self.unique_label("indirect_cleanup")
+            done = self.unique_label("indirect_done")
+            for symbol in ("sa_try_push_env", "llvm.frameaddress", "_setjmp", "sa_try_pop", "sa_throw_dispatch"):
+                self.use_runtime(symbol)
+            self.emit(f"  {env} = call ptr @sa_try_push_env()")
+            self.emit(f"  {frame} = call ptr @llvm.frameaddress.p0(i32 0)")
+            self.emit(f"  {status} = call i32 @_setjmp(ptr {env}, ptr {frame})")
+            test = self.next_temp()
+            self.emit(f"  {test} = icmp eq i32 {status}, 0")
+            self.emit(f"  br i1 {test}, label %{normal}, label %{catch}")
+            self.emit(f"{normal}:")
+        result_type = signature.inner or ast.TypeSpec("VOID")
+        abi_type = self.llvm_type(result_type)
+        result_ptr = self.alloca(abi_type) if result_type.name != "VOID" and guard else None
+        # 检查和间接调用在落地垫内；异常时重新从 entry 槽位读资源并清理。
+        fn = self.expr(ast.VarRef(line_no, name))
+        sub_name = self.string_ptr(self.current_sub.name if self.current_sub else "main")
+        checked = self.next_temp()
+        self.emit(f"  {checked} = call ptr @{check}(ptr {fn.value}, i32 {line_no}, ptr {sub_name})")
+        result = ""
+        if result_type.name == "VOID":
+            self.emit(f"  call void {checked}({', '.join(params)})")
+        else:
+            result = self.next_temp()
+            self.emit(f"  {result} = call {abi_type} {checked}({', '.join(params)})")
+            if result_ptr is not None:
+                self.emit(f"  store {abi_type} {result}, ptr {result_ptr}")
+        if guard:
+            self.emit("  call void @sa_try_pop()")
+            self.emit(f"  br label %{done}")
+            self.emit(f"{catch}:")
+            self.emit("  call void @sa_try_pop()")
+            self.emit_pending_temp_cleanup(pending_cleanup)
+            self.emit_active_cleanup()
+            self.emit("  call void @sa_throw_dispatch()")
+            self.emit("  unreachable")
+            self.emit(f"{done}:")
+            if result_ptr is not None:
+                result = self.next_temp()
+                self.emit(f"  {result} = load {abi_type}, ptr {result_ptr}")
+        value = LLVMValue(abi_type, result, result_type)
+        self.adopt_promise_arguments(signature.params or (), params, value)
+        self.register_temp_cleanup(value.value, result_type)
+        return value
 
     def unary_expr(self, expr: ast.Unary) -> LLVMValue:
         value = self.expr(expr.expr)

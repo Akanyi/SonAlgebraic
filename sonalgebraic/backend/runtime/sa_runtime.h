@@ -135,6 +135,15 @@ typedef SaSymbolNode* SaSymbol;
 
 typedef uint64_t SaHandle;
 
+/* 函数引用在 C 里统一擦成 SaSubFn，调用点按 SA 签名强转回真实类型；callable 实体是带
+ * 引用计数的堆对象，将来 Lambda 要捕获的环境也挂在这个结构上，函数引用本身保持瘦指针。 */
+typedef void (*SaSubFn)(void);
+
+typedef struct {
+    SaSubFn fn;
+    long refs;
+} SaCallable;
+
 typedef struct {
     int err_code;
     const char* type;
@@ -170,6 +179,12 @@ void sa_throw_error(const SaError* error);
 void sa_raise_new(const char* type, const char* message, int line_number, const char* sub_name);
 void sa_raise_error(const SaError* error);
 void sa_throw_dispatch(void);
+SaSubFn sa_sub_check(SaSubFn fn, int line_number, const char* sub_name);
+SaCallable* sa_callable_new(SaSubFn fn);
+SaCallable* sa_callable_retain(SaCallable* callable);
+void sa_callable_release(SaCallable* callable);
+void sa_callable_set(SaCallable** target, SaCallable* value);
+SaSubFn sa_callable_fn(SaCallable* callable, int line_number, const char* sub_name);
 double sa_number(const char* value);
 char* sa_to_string_long(long long value);
 char* sa_to_string_double(double value);
@@ -317,6 +332,8 @@ int sa_gui_set_text(SaHandle widget, const char* text);
 char* sa_gui_get_text(SaHandle widget);
 long long sa_gui_wait_event(void);
 int sa_gui_close(SaHandle window);
+int sa_gui_on_click(SaHandle widget, SaCallable* handler);
+int sa_gui_run(void);
 char* sa_gui_last_error_copy(void);
 void sa_print_string(const char* value);
 void sa_print_long(long long value);
@@ -346,6 +363,7 @@ void sa_coro_await(SaCoroBase* base, SaHandle awaited);
 void sa_event_loop_run_until(SaHandle target);
 void sa_promise_release(SaHandle promise);
 void sa_promise_reject(SaHandle promise, const char* message);
+void sa_promise_reject_error(SaHandle promise, const SaError* error);
 void sa_promise_fulfill_long(SaHandle promise, long long value);
 void sa_promise_fulfill_double(SaHandle promise, double value);
 void sa_promise_fulfill_handle(SaHandle promise, SaHandle value);

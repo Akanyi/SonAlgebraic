@@ -128,9 +128,9 @@ def test_slib_binary_dependency_reports_target_mismatch() -> None:
 
 
 def _seed_source_slib(temp_dir: Path) -> Path:
-    (temp_dir / "mathlib.sa").write_text(Path("examples/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
+    (temp_dir / "mathlib.sa").write_text(Path("examples/modules/basic/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
     (temp_dir / "main.sa").write_text(
-        Path("examples/use_user_module.sa").read_text(encoding="utf-8"), encoding="utf-8"
+        Path("examples/modules/basic/main.sa").read_text(encoding="utf-8"), encoding="utf-8"
     )
     build_slib(temp_dir / "mathlib.sa", temp_dir / "mathlib.slib")
     (temp_dir / "mathlib.sa").unlink()

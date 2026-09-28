@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...analysis.typesys import is_bool, is_error, is_numeric, is_symbol, same_type_spec
+from ...analysis.typesys import callable_symbol_type, is_bool, is_error, is_numeric, is_sub_ptr, is_sub_type, is_symbol, same_type_spec, sub_signature
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import LLVMValue, NativeGenBase, VarSlot
@@ -24,6 +24,12 @@ class StmtsMixin(NativeGenBase):
             self.assign_stmt(stmt)
             self.end_stmt()
             return
+        if isinstance(stmt, ast.AwaitStmt):
+            self.begin_stmt()
+            self.emit(self.source_comment(stmt.line_no))
+            self.expr(stmt.expr)
+            self.end_stmt()
+            return
         if isinstance(stmt, ast.Print):
             self.begin_stmt()
             self.print_stmt(stmt)
@@ -33,6 +39,12 @@ class StmtsMixin(NativeGenBase):
             self.begin_stmt()
             self.call_stmt(stmt)
             self.end_stmt()
+            return
+        if isinstance(stmt, ast.NewSub):
+            self.new_sub_stmt(stmt)
+            return
+        if isinstance(stmt, ast.CallRet):
+            self.callret_stmt(stmt)
             return
         if isinstance(stmt, ast.TryCatch):
             self.begin_stmt()
@@ -123,6 +135,14 @@ class StmtsMixin(NativeGenBase):
                 self.assign_symbol(slot.ptr, stmt.expr)
                 self.end_stmt()
             return
+        if is_sub_type(stmt.type_spec):
+            self.emit(f"  store ptr null, ptr {ptr}")
+            self.register_owned(slot)
+            if stmt.expr is not None:
+                self.begin_stmt()
+                self.store_callable(ptr, self.expr(stmt.expr))
+                self.end_stmt()
+            return
         if is_error(stmt.type_spec):
             self.emit(f"  store {self.llvm_type(stmt.type_spec)} zeroinitializer, ptr {ptr}")
             self.register_owned(slot)
@@ -142,9 +162,13 @@ class StmtsMixin(NativeGenBase):
                 self.end_stmt()
             return
         self.emit(f"  store {self.llvm_type(stmt.type_spec)} {self.default_value(stmt.type_spec)}, ptr {ptr}")
+        if stmt.type_spec.name == "PROMISE":
+            self.register_owned(slot)
         if stmt.expr is not None:
             self.begin_stmt()
             value = self.cast_value(self.expr(stmt.expr), stmt.type_spec)
+            if stmt.type_spec.name == "PROMISE":
+                self.adopt_temp_cleanup(value.value, stmt.type_spec)
             self.emit(f"  store {self.llvm_type(stmt.type_spec)} {value.value}, ptr {ptr}")
             self.end_stmt()
 
@@ -169,19 +193,56 @@ class StmtsMixin(NativeGenBase):
         self.scope_resources[-1] = [slot for slot in self.scope_resources[-1] if slot.name.lower() != key]
 
     def assign_stmt(self, stmt: ast.Assign) -> None:
-        if stmt.mode != "copy":
+        # 函数引用是瘦指针，不持有资源；f= 和普通赋值等价。
+        fn_ref = isinstance(stmt.expr, ast.SubRef) or (
+            isinstance(stmt.target, ast.VarRef) and is_sub_ptr(self.type_of_expr(stmt.target))
+        )
+        if stmt.mode != "copy" and not fn_ref:
             self.ownership_assign_stmt(stmt)
             return
         target_type = self.type_of_expr(stmt.target)
         target_ptr = self.lvalue_ptr(stmt.target)
         self.emit(self.source_comment(stmt.line_no))
+        if isinstance(stmt.expr, ast.AwaitExpr):
+            # 保留左值只求一次的顺序；恢复入口不能使用挂起前定义的字段/下标 GEP。
+            saved_target = self.alloca("ptr")
+            self.emit(f"  store ptr {target_ptr}, ptr {saved_target}")
+            value = self.cast_value(self.expr(stmt.expr), target_type)
+            target_ptr = self.next_temp()
+            self.emit(f"  {target_ptr} = load ptr, ptr {saved_target}")
+            if self.is_string_scalar(target_type):
+                self.store_string(target_ptr, value)
+            else:
+                self.emit(f"  store {self.llvm_type(target_type)} {value.value}, ptr {target_ptr}")
+            return
         if is_symbol(target_type):
             self.assign_symbol(target_ptr, stmt.expr)
+            return
+        if is_sub_type(target_type):
+            self.store_callable(target_ptr, self.expr(stmt.expr))
+            return
+        if is_error(target_type):
+            value = self.cast_value(self.expr(stmt.expr), target_type)
+            source = self.alloca("%SaError")
+            self.emit(f"  store %SaError {value.value}, ptr {source}")
+            # sa_set_error 先 free 旧消息，不可直接拿别名源；先复制独立快照。
+            copy = self.alloca("%SaError")
+            self.emit(f"  store %SaError zeroinitializer, ptr {copy}")
+            self.use_runtime("sa_set_error")
+            self.use_runtime("sa_error_clear")
+            self.emit(f"  call void @sa_set_error(ptr {copy}, ptr {source})")
+            self.emit(f"  call void @sa_error_clear(ptr {target_ptr})")
+            result = self.next_temp()
+            self.emit(f"  {result} = load %SaError, ptr {copy}")
+            self.emit(f"  store %SaError {result}, ptr {target_ptr}")
+            self.emit(f"  store %SaError zeroinitializer, ptr {copy}")
             return
         if self.is_entity_scalar(target_type) and self.type_has_managed_resources(target_type):
             self.store_entity(target_ptr, stmt.expr, target_type)
             return
         value = self.cast_value(self.expr(stmt.expr), target_type)
+        if target_type.name == "PROMISE":
+            self.adopt_temp_cleanup(value.value, target_type)
         if self.is_string_scalar(target_type):
             self.store_string(target_ptr, value)
             return
@@ -195,7 +256,41 @@ class StmtsMixin(NativeGenBase):
         self.emit(f"  {old_tree} = load ptr, ptr {target_ptr}")
         self.use_runtime("sa_symbol_free")
         self.emit(f"  call void @sa_symbol_free(ptr {old_tree})")
+        if getattr(self, "async_context", None) is not None:
+            self.adopt_temp_cleanup(new_tree.value, ast.TypeSpec("SYMBOL"))
         self.emit(f"  store ptr {new_tree.value}, ptr {target_ptr}")
+
+    def store_callable(self, target_ptr: str, value: LLVMValue) -> None:
+        self.use_runtime("sa_callable_set")
+        self.emit(f"  call void @sa_callable_set(ptr {target_ptr}, ptr {value.value})")
+
+    def new_sub_stmt(self, stmt: ast.NewSub) -> None:
+        self.emit(self.source_comment(stmt.line_no))
+        source = self.expr(stmt.source)
+        self.use_runtime("sa_callable_new")
+        value = self.next_temp()
+        self.emit(f"  {value} = call ptr @sa_callable_new(ptr {source.value})")
+        type_spec = sub_signature(source.type_spec or ast.TypeSpec("SUB"))
+        slot = VarSlot(stmt.name, type_spec, self.alloca("ptr", f"%{self.c_ident(stmt.name)}.addr"))
+        self.slots[stmt.name.lower()] = slot
+        self.emit(f"  store ptr {value}, ptr {slot.ptr}")
+        self.register_owned(slot)
+
+    def callret_stmt(self, stmt: ast.CallRet) -> None:
+        self.emit(self.source_comment(stmt.line_no))
+        type_spec = callable_symbol_type(stmt.name, self.current_symbols(), self.checked.entities, stmt.line_no)
+        assert type_spec is not None
+        self.begin_stmt()
+        result = self.call_indirect(stmt.name, stmt.args, stmt.line_no, type_spec)
+        if self.current_sub is not None and self.current_sub.return_type.name != "VOID":
+            self.adopt_temp_cleanup(result.value, self.current_sub.return_type)
+        self.end_stmt()
+        self.emit_active_cleanup()
+        if self.current_sub is None or self.current_sub.return_type.name == "VOID":
+            self.emit("  ret void")
+        else:
+            self.emit(f"  ret {self.llvm_type(self.current_sub.return_type)} {result.value}")
+        self.terminated = True
 
     def print_stmt(self, stmt: ast.Print) -> None:
         self.emit(self.source_comment(stmt.line_no))
@@ -269,13 +364,17 @@ class StmtsMixin(NativeGenBase):
         if sub is None:
             external = self.resolve_external_sub(stmt.name)
             if external is None:
+                callable_type = callable_symbol_type(stmt.name, self.current_symbols(), self.checked.entities, stmt.line_no)
+                if callable_type is not None:
+                    self.call_indirect(stmt.name, stmt.args, stmt.line_no, callable_type)
+                    return
                 raise SonCompileError(f"native 后端暂不支持外部 CALL: {stmt.name}", stmt.line_no)
             external_name, sub = external
         else:
             external_name = self.sub_name(stmt.name)
         is_external = external is not None
         args = self.call_args(sub, stmt.args, c_abi=is_external)
-        if self.has_active_resources():
+        if self.has_active_resources() or (self.temp_cleanup and self.temp_cleanup[-1]):
             self.wrap_call_with_throw_cleanup(external_name, sub, args, raw_name=True, c_abi=is_external)
             return
         self.emit_call(external_name, sub, args, raw_name=True, c_abi=is_external)
@@ -306,6 +405,7 @@ class StmtsMixin(NativeGenBase):
         return LLVMValue(ret_type, temp, c_func.return_type)
 
     def wrap_call_with_throw_cleanup(self, name: str, sub: ast.Subroutine, args: list[str], raw_name: bool = False, c_abi: bool = False) -> None:
+        pending_cleanup = list(self.temp_cleanup[-1]) if self.temp_cleanup else []
         env = self.next_temp()
         frame = self.next_temp()
         sj = self.next_temp()
@@ -335,6 +435,8 @@ class StmtsMixin(NativeGenBase):
         self.terminated = False
         self.use_runtime("sa_try_pop")
         self.emit("  call void @sa_try_pop()")
+        for line in pending_cleanup:
+            self.emit(line)
         self.emit_active_cleanup()
         self.use_runtime("sa_throw_dispatch")
         self.emit("  call void @sa_throw_dispatch()")
@@ -440,9 +542,13 @@ class StmtsMixin(NativeGenBase):
         self.emit(f"{body_label}:")
         self.terminated = False
         self.emit(self.source_comment(branch.line_no))
-        alias_ptr = f"%{self.c_ident(branch.alias)}.catch"
+        # 同一 SUB 可以有多个 CATCH 使用相同别名；LLVM 局部 SSA 名必须唯一。
+        alias_ptr = self.next_temp()
         alias_slot = VarSlot(branch.alias, ast.TypeSpec("ERROR"), alias_ptr)
         self.alloca("%SaError", alias_ptr)
+        if getattr(self, "async_context", None) is not None:
+            resource = self.coro_resource(alias_slot)
+            self.emit(f"  call void @{resource.cleanup_name}(ptr %sa_frame)")
         self.emit(f"  store %SaError zeroinitializer, ptr {alias_ptr}")
         self.use_runtime("sa_set_error")
         self.emit(f"  call void @sa_set_error(ptr {alias_ptr}, ptr @sa_current_error)")
@@ -540,6 +646,11 @@ class StmtsMixin(NativeGenBase):
                 value = self.owned_return_value(stmt.expr, return_type)
             else:
                 value = self.cast_value(self.expr(stmt.expr), return_type)
+                if return_type.name == "PROMISE":
+                    self.adopt_temp_cleanup(value.value, return_type)
+                    if isinstance(stmt.expr, ast.VarRef) and self.is_owned_var(stmt.expr.name):
+                        ptr, _ = self.varref_ptr(stmt.expr.name, stmt.expr.line_no)
+                        self.emit(f"  store i64 0, ptr {ptr}")
             self.end_stmt()
             self.emit_active_cleanup()
             self.emit(f"  ret {self.llvm_type(return_type)} {value.value}")
@@ -572,6 +683,14 @@ class StmtsMixin(NativeGenBase):
             dup = self.next_temp()
             self.emit(f"  {dup} = call ptr @sa_strdup(ptr {value.value})")
             return LLVMValue("ptr", dup, return_type)
+        if is_sub_type(return_type):
+            value = self.expr(expr)
+            if self.adopt_temp_cleanup(value.value, return_type):
+                return value
+            self.use_runtime("sa_callable_retain")
+            retained = self.next_temp()
+            self.emit(f"  {retained} = call ptr @sa_callable_retain(ptr {value.value})")
+            return LLVMValue("ptr", retained, return_type)
         # ENTITY / ERROR 聚合：能接管就接管，否则零初始化一份新的再逐字段深拷贝
         if isinstance(expr, ast.VarRef | ast.Deref | ast.Index):
             source_ptr = self.lvalue_ptr(expr)
@@ -694,8 +813,8 @@ class StmtsMixin(NativeGenBase):
         if var_ty not in {"i64", "double", "float"}:
             raise SonCompileError("native 后端 FOR 循环变量必须是数值类型", stmt.line_no)
         self.emit(self.source_comment(stmt.line_no))
-        # 边界与步长进循环前只求值一次（BASIC 语义）。native 是 SSA 直接发射，
-        # 这些值算在前置块里，天然支配后续 cond/body 块，不需要额外存储。
+        # 边界与步长只求一次；协程恢复可能绕过这里，额外保存到堆帧。
+        self.begin_stmt()
         start = self.for_cast(self.expr(stmt.start), var_ty)
         self.emit(f"  store {var_ty} {start.value}, ptr {slot.ptr}")
         end = self.for_cast(self.expr(stmt.end), var_ty)
@@ -703,6 +822,12 @@ class StmtsMixin(NativeGenBase):
             step = self.for_cast(self.expr(stmt.step), var_ty)
         else:
             step = LLVMValue(var_ty, "1" if var_ty == "i64" else "1.0")
+        end_ptr = step_ptr = None
+        if getattr(self, "async_context", None) is not None:
+            end_ptr, step_ptr = self.alloca(var_ty), self.alloca(var_ty)
+            self.emit(f"  store {var_ty} {end.value}, ptr {end_ptr}")
+            self.emit(f"  store {var_ty} {step.value}, ptr {step_ptr}")
+        self.end_stmt()
         cond_label = self.unique_label("for_cond")
         body_label = self.unique_label("for_body")
         end_label = self.unique_label("for_end")
@@ -710,6 +835,11 @@ class StmtsMixin(NativeGenBase):
 
         self.emit(f"{cond_label}:")
         self.terminated = False
+        if end_ptr is not None:
+            end_value, step_value = self.next_temp(), self.next_temp()
+            self.emit(f"  {end_value} = load {var_ty}, ptr {end_ptr}")
+            self.emit(f"  {step_value} = load {var_ty}, ptr {step_ptr}")
+            end, step = LLVMValue(var_ty, end_value), LLVMValue(var_ty, step_value)
         cur = self.next_temp()
         self.emit(f"  {cur} = load {var_ty}, ptr {slot.ptr}")
         # 步长正负都支持：正步长用 <=，负步长用 >=，运行时用 select 选择。
@@ -734,6 +864,10 @@ class StmtsMixin(NativeGenBase):
         self.terminated = False
         self.run_block(stmt.body)
         if not self.terminated:
+            if step_ptr is not None:
+                step_value = self.next_temp()
+                self.emit(f"  {step_value} = load {var_ty}, ptr {step_ptr}")
+                step = LLVMValue(var_ty, step_value)
             nv = self.next_temp()
             inc = self.next_temp()
             self.emit(f"  {nv} = load {var_ty}, ptr {slot.ptr}")

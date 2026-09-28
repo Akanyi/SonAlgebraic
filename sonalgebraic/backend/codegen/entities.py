@@ -1,14 +1,14 @@
 """实体类型。"""
 from __future__ import annotations
 
-from ...analysis.typesys import is_error, is_string, is_symbol
+from ...analysis.typesys import is_error, is_string, is_sub_type, is_symbol
 from ...core import ast
 from ...core.names import split_module_member
 from .base import CGenBase
 
 
 class EntitiesMixin(CGenBase):
-    """ENTITY：typedef 发射，以及含托管资源（STRING / ERROR 字段）实体的 init / free / copy 展开。"""
+    """ENTITY：typedef 发射，以及含托管资源（STRING / SYMBOL / ERROR / SUB 字段）实体的 init / free / copy 展开。"""
 
     def generate_entities(self) -> str:
         chunks: list[str] = []
@@ -26,8 +26,8 @@ class EntitiesMixin(CGenBase):
         return "\n".join(chunks).rstrip()
 
     def type_has_managed_resources(self, type_spec: ast.TypeSpec, inside_entity: bool = False) -> bool:
-        if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec):
-            return not (inside_entity and is_symbol(type_spec))
+        if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_sub_type(type_spec):
+            return True
         if type_spec.name != "ENTITY":
             return False
         entity = self.resolve_entity_def(type_spec)
@@ -58,6 +58,8 @@ class EntitiesMixin(CGenBase):
                 lines.append(f"{pad}{field_target} = sa_strdup(\"\");")
             elif is_error(field.type_spec):
                 lines.append(f"{pad}{field_target} = (SaError){{0, \"ERR_NONE\", NULL, 0, NULL}};")
+            elif is_symbol(field.type_spec) or is_sub_type(field.type_spec):
+                lines.append(f"{pad}{field_target} = NULL;")
             elif field.type_spec.name == "ENTITY":
                 lines.extend(self.entity_init_lines(field_target, field.type_spec, indent))
         return lines
@@ -72,8 +74,12 @@ class EntitiesMixin(CGenBase):
             field_target = f"{target}.{field.name}"
             if is_string(field.type_spec):
                 lines.append(f"{pad}free({field_target});")
+            elif is_symbol(field.type_spec):
+                lines.append(f"{pad}sa_symbol_free({field_target});")
             elif is_error(field.type_spec):
                 lines.append(f"{pad}sa_error_clear(&{field_target});")
+            elif is_sub_type(field.type_spec):
+                lines.append(f"{pad}sa_callable_release({field_target});")
             elif field.type_spec.name == "ENTITY":
                 lines.extend(self.entity_free_lines(field_target, field.type_spec, indent))
         return lines
@@ -89,8 +95,16 @@ class EntitiesMixin(CGenBase):
             field_source = f"{source}.{field.name}"
             if is_string(field.type_spec):
                 lines.append(f"{pad}sa_set_string(&{field_target}, {field_source});")
+            elif is_symbol(field.type_spec):
+                # REF 别名和自赋值可能读写同一棵树，必须在释放旧值之前完成克隆。
+                temp = self.next_temp()
+                lines.append(f"{pad}SaSymbol {temp} = sa_symbol_clone({field_source});")
+                lines.append(f"{pad}sa_symbol_free({field_target});")
+                lines.append(f"{pad}{field_target} = {temp};")
             elif is_error(field.type_spec):
                 lines.append(f"{pad}sa_set_error(&{field_target}, &{field_source});")
+            elif is_sub_type(field.type_spec):
+                lines.append(f"{pad}sa_callable_set(&{field_target}, {field_source});")
             elif field.type_spec.name == "ENTITY":
                 lines.extend(self.entity_copy_lines(field_target, field_source, field.type_spec, indent))
             else:

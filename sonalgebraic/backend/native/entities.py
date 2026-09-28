@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...analysis.typesys import is_error, is_string, is_symbol
+from ...analysis.typesys import is_error, is_string, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import entity_c_name, module_symbol_prefix, split_module_member
@@ -52,10 +52,10 @@ class EntitiesMixin(NativeGenBase):
         raise SonCompileError(f"ENTITY {entity.name} 没有字段: {field_name}", line_no)
 
     def type_has_managed_resources(self, type_spec: ast.TypeSpec, inside_entity: bool = False) -> bool:
-        if is_string(type_spec) or is_error(type_spec):
+        if is_string(type_spec) or is_error(type_spec) or is_sub_type(type_spec):
             return True
         if is_symbol(type_spec):
-            return not inside_entity
+            return True
         if type_spec.name != "ENTITY":
             return False
         entity = self.resolve_entity_def(type_spec)
@@ -75,6 +75,8 @@ class EntitiesMixin(NativeGenBase):
                 dup = self.next_temp()
                 self.emit(f"  {dup} = call ptr @sa_strdup(ptr @.sa_empty)")
                 self.emit(f"  store ptr {dup}, ptr {field_ptr}")
+            elif is_symbol(field.type_spec) or is_sub_type(field.type_spec):
+                self.emit(f"  store ptr null, ptr {field_ptr}")
             elif is_error(field.type_spec):
                 self.emit(f"  store %SaError zeroinitializer, ptr {field_ptr}")
             elif self.is_entity_scalar(field.type_spec):
@@ -92,6 +94,16 @@ class EntitiesMixin(NativeGenBase):
                 self.use_runtime("free")
                 self.emit(f"  {tmp} = load ptr, ptr {field_ptr}")
                 self.emit(f"  call void @free(ptr {tmp})")
+            elif is_symbol(field.type_spec):
+                tmp = self.next_temp()
+                self.use_runtime("sa_symbol_free")
+                self.emit(f"  {tmp} = load ptr, ptr {field_ptr}")
+                self.emit(f"  call void @sa_symbol_free(ptr {tmp})")
+            elif is_sub_type(field.type_spec):
+                tmp = self.next_temp()
+                self.use_runtime("sa_callable_release")
+                self.emit(f"  {tmp} = load ptr, ptr {field_ptr}")
+                self.emit(f"  call void @sa_callable_release(ptr {tmp})")
             elif is_error(field.type_spec):
                 self.use_runtime("sa_error_clear")
                 self.emit(f"  call void @sa_error_clear(ptr {field_ptr})")
@@ -116,6 +128,23 @@ class EntitiesMixin(NativeGenBase):
                 self.use_runtime("sa_set_string")
                 self.emit(f"  {value} = load ptr, ptr {source_field}")
                 self.emit(f"  call void @sa_set_string(ptr {target_field}, ptr {value})")
+            elif is_symbol(field.type_spec):
+                # 先克隆再释放，使相同地址的 REF 参数和自赋值都保持独立所有权。
+                value = self.next_temp()
+                clone = self.next_temp()
+                old = self.next_temp()
+                self.use_runtime("sa_symbol_clone")
+                self.use_runtime("sa_symbol_free")
+                self.emit(f"  {value} = load ptr, ptr {source_field}")
+                self.emit(f"  {clone} = call ptr @sa_symbol_clone(ptr {value})")
+                self.emit(f"  {old} = load ptr, ptr {target_field}")
+                self.emit(f"  call void @sa_symbol_free(ptr {old})")
+                self.emit(f"  store ptr {clone}, ptr {target_field}")
+            elif is_sub_type(field.type_spec):
+                value = self.next_temp()
+                self.use_runtime("sa_callable_set")
+                self.emit(f"  {value} = load ptr, ptr {source_field}")
+                self.emit(f"  call void @sa_callable_set(ptr {target_field}, ptr {value})")
             elif is_error(field.type_spec):
                 self.use_runtime("sa_set_error")
                 self.emit(f"  call void @sa_set_error(ptr {target_field}, ptr {source_field})")

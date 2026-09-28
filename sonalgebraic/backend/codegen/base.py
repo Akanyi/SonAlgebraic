@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ...analysis.semantics import CheckedProgram, Symbol
-from ...analysis.typesys import c_type, is_error, is_handle, is_numeric, is_promise, is_string, is_symbol, runtime_features_for_program, type_of
+from ...analysis.typesys import c_type, callable_symbol_type, is_error, is_handle, is_numeric, is_promise, is_string, is_sub_ptr, is_sub_type, is_symbol, runtime_features_for_program, sub_signature, type_of
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import entity_c_name, c_ident as make_c_ident, module_symbol_prefix, split_module_member
@@ -30,6 +30,8 @@ class AsyncFrameCtx:
     # 跳进体中间，会跳过栈上的上界/步长初始化，留下垃圾值让循环失控。提升进帧才能在挂起—
     # 恢复之间保持有效，和循环变量本身一个道理。
     for_frame_lines: set[int] = field(default_factory=set)
+    # 临时量是否拥有资源由表达式清理登记决定，不能从 C 指针类型推断（中间别名不拥有）。
+    temp_resources: dict[str, ast.TypeSpec] = field(default_factory=dict)
 
     def next_resume_point(self) -> int:
         point = len(self.resume_points) + 1
@@ -106,7 +108,7 @@ class CGenBase:
             if is_string(type_spec):
                 self.local_resource_stack[-1].append((name, type_spec))
             return
-        if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or (type_spec.name == "ENTITY" and self.type_has_managed_resources(type_spec)):
+        if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or is_sub_type(type_spec) or (type_spec.name == "ENTITY" and self.type_has_managed_resources(type_spec)):
             self.local_resource_stack[-1].append((name, type_spec))
 
     def unregister_local_resource(self, name: str) -> None:
@@ -171,6 +173,8 @@ class CGenBase:
                 lines.append(f"{pad}sa_symbol_free({name});")
             elif is_promise(type_spec):
                 lines.append(f"{pad}sa_promise_release({name});")
+            elif is_sub_type(type_spec):
+                lines.append(f"{pad}sa_callable_release({name});")
             elif is_error(type_spec):
                 lines.append(f"{pad}sa_error_clear(&{name});")
             elif type_spec.name == "ENTITY":
@@ -192,6 +196,10 @@ class CGenBase:
                 lines.extend(self.entity_init_lines(name, param.type_spec, indent))
                 lines.extend(self.entity_copy_lines(name, temp, param.type_spec, indent))
                 self.register_local_resource(name, param.type_spec)
+            elif is_sub_type(param.type_spec):
+                # callable 是引用计数对象，按值传入只需多持一份计数，不必像 STRING 那样深拷贝
+                lines.append(f"{'    ' * indent}{name} = sa_callable_retain({name});")
+                self.register_local_resource(name, param.type_spec)
         return lines
 
     def next_temp(self) -> str:
@@ -209,12 +217,13 @@ class CGenBase:
             return f"{ctype}* {self.c_ident(param.name)}"
         return f"{ctype} {self.c_ident(param.name)}"
 
-    def call_args_with_prelude(self, name: str, args: list[ast.Expr]) -> tuple[list[str], list[str], list[str]]:
-        sub = self.resolve_called_sub(name)
+    def call_args_with_prelude(self, name: str, args: list[ast.Expr], params: list[ast.Param] | None = None) -> tuple[list[str], list[str], list[str]]:
+        if params is None:
+            params = self.resolve_called_sub(name).params
         prelude_all: list[str] = []
         cleanup_all: list[str] = []
         values: list[str] = []
-        for arg, param in zip(args, sub.params):
+        for arg, param in zip(args, params):
             if param.by_ref:
                 if not isinstance(arg, ast.VarRef):
                     raise SonCompileError(f"REF 参数 {param.name} 必须传入变量", arg.line_no)
@@ -227,6 +236,32 @@ class CGenBase:
                 value = "0"
             values.append(value)
         return prelude_all, values, cleanup_all
+
+    def callable_var_type(self, name: str) -> ast.TypeSpec | None:
+        """name 是 callable / 函数引用变量时返回其类型。具名 SUB 和 C 函数优先，与语义层的解析顺序一致。"""
+        if self.checked.subs.get(name.lower()) is not None or self.resolve_external_sub(name) is not None or self.resolve_c_func(name) is not None:
+            return None
+        return callable_symbol_type(name, self.symbols, self.checked.entities, 0)
+
+    def sub_fn_cast(self, signature: ast.TypeSpec) -> str:
+        """SaSubFn 是擦掉签名的函数指针，调用前按 SA 签名强转回真实类型；按 C 标准，函数指针之间
+        互转再转回原类型调用是合法的，擦除只为让所有函数引用共用一个 C 类型。"""
+        ret = self.c_type(signature.inner) if signature.inner is not None else "void"
+        params = ", ".join(self.c_type(p.type_spec) + ("*" if p.by_ref else "") for p in signature.params or ()) or "void"
+        return f"{ret} (*)({params})"
+
+    def callable_call(self, name: str, args: list[ast.Expr], line_no: int) -> tuple[list[str], str, list[str], ast.TypeSpec] | None:
+        """经 callable / 函数引用变量调用：返回 (prelude, 调用文本, cleanup, 返回类型)；不是 callable 返回 None。
+        取函数指针走运行时检查，空引用给出带行号的错误而不是直接段错误。"""
+        callee_type = self.callable_var_type(name)
+        if callee_type is None:
+            return None
+        signature = sub_signature(callee_type)
+        prelude, values, cleanup = self.call_args_with_prelude(name, args, list(signature.params or ()))
+        getter = "sa_callable_fn" if is_sub_type(callee_type) else "sa_sub_check"
+        fn = f"{getter}({self.c_value(name)}, {line_no}, \"{self.current_sub_name()}\")"
+        call = f"(({self.sub_fn_cast(signature)}){fn})({', '.join(values)})"
+        return prelude, call, cleanup, signature.inner or ast.TypeSpec("VOID")
 
     def resolve_called_sub(self, name: str) -> ast.Subroutine:
         local = self.checked.subs.get(name.lower())
@@ -265,7 +300,9 @@ class CGenBase:
             if param.by_ref:
                 if not isinstance(arg, ast.VarRef):
                     raise SonCompileError(f"REF 参数 {param.name} 必须传入变量", arg.line_no)
-                values.append(f"&({self.c_value(arg.name)})")
+                # SaSubFn* 与 C 头文件里具体的函数指针的指针类型不兼容，新版 gcc 会直接报错，所以统一经 void* 转换
+                address = f"&({self.c_value(arg.name)})"
+                values.append(f"(void*){address}" if is_sub_ptr(param.type_spec) else address)
                 continue
             prelude, value, cleanup = self.expr_with_prelude(arg)
             prelude_all.extend(prelude)
@@ -280,6 +317,11 @@ class CGenBase:
             return f"(void*)({value})"
         if is_numeric(param_type) and arg_type.name == "CPTR":
             return f"(long long)({value})"
+        # FFI 边界上 PTR TO SUB 就是 C 函数指针。SaSubFn 与头文件里具体的回调类型不兼容，
+        # 经 void* 中转后 gcc / clang / zig cc 都会隐式转换；函数引用过边界只有这一个转换点，
+        # 将来内部表示加胖（带环境）也只需改这里。
+        if is_sub_ptr(param_type):
+            return f"(void*)({value})"
         return value
 
     def call_c_name(self, name: str) -> str:

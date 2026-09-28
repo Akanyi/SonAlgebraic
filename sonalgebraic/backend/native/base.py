@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import struct
 
 from ...analysis.semantics import CheckedProgram, Symbol
-from ...analysis.typesys import is_error, is_symbol
+from ...analysis.typesys import is_error, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import c_ident as make_c_ident
@@ -76,13 +76,15 @@ class NativeGenBase:
             return f"  call void @free(ptr {value})"
         if is_symbol(type_spec):
             return f"  call void @sa_symbol_free(ptr {value})"
+        if is_sub_type(type_spec):
+            return f"  call void @sa_callable_release(ptr {value})"
         return None
 
     def register_temp_cleanup(self, value: str, type_spec: ast.TypeSpec) -> None:
         """把一个刚算出来的托管堆值登记成本语句的临时量：语句结束没人接管就释放。"""
         line = self.temp_cleanup_line(value, type_spec)
         if line is not None:
-            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_symbol_free")
+            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_callable_release" if is_sub_type(type_spec) else "sa_symbol_free")
             self.add_temp_cleanup(line)
             return
         ptr = self.aggregate_temp_ptr(value, type_spec)
@@ -98,7 +100,7 @@ class NativeGenBase:
         """当场释放一个按值拿着的托管临时量（被语句丢弃的 SUB 返回值）。"""
         line = self.temp_cleanup_line(value, type_spec)
         if line is not None:
-            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_symbol_free")
+            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_callable_release" if is_sub_type(type_spec) else "sa_symbol_free")
             self.emit(line)
             return
         ptr = self.aggregate_temp_ptr(value, type_spec)
@@ -159,6 +161,13 @@ class NativeGenBase:
         return any(slot.name.lower() == key for resources in self.scope_resources for slot in resources)
 
     def emit_free_slot(self, slot: VarSlot) -> None:
+        if slot.type_spec.name == "PROMISE":
+            tmp = self.next_temp()
+            self.use_runtime("sa_promise_release")
+            self.emit(f"  {tmp} = load i64, ptr {slot.ptr}")
+            self.emit(f"  call void @sa_promise_release(i64 {tmp})")
+            self.emit(f"  store i64 0, ptr {slot.ptr}")
+            return
         if self.is_string_array(slot.type_spec):
             elem_ty = self.array_element_type(slot.type_spec)
             for index in range(slot.type_spec.array_size):
@@ -180,6 +189,12 @@ class NativeGenBase:
             self.emit(f"  {tmp} = load ptr, ptr {slot.ptr}")
             self.use_runtime("sa_symbol_free")
             self.emit(f"  call void @sa_symbol_free(ptr {tmp})")
+            return
+        if is_sub_type(slot.type_spec):
+            tmp = self.next_temp()
+            self.emit(f"  {tmp} = load ptr, ptr {slot.ptr}")
+            self.use_runtime("sa_callable_release")
+            self.emit(f"  call void @sa_callable_release(ptr {tmp})")
             return
         if is_error(slot.type_spec):
             self.use_runtime("sa_error_clear")
@@ -234,10 +249,13 @@ class NativeGenBase:
         return self.slots[key]
 
     def current_symbols(self) -> dict[str, Symbol]:
-        return {
+        # 枚举成员没有运行时槽位，但复合表达式判型仍需要前端注入的完整点名。
+        symbols = {key: self.checked.symbols[key] for key in self.checked.enum_members}
+        symbols.update({
             key: Symbol(slot.name, slot.type_spec, True, slot.by_ref)
             for key, slot in self.slots.items()
-        }
+        })
+        return symbols
 
     def error_message_ptr(self, error_ptr: str) -> str:
         field = self.next_temp()

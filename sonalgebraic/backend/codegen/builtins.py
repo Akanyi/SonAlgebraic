@@ -357,6 +357,8 @@ class BuiltinsMixin(CGenBase):
             "SET_TEXT": "sa_gui_set_text",
             "WAIT_EVENT": "sa_gui_wait_event",
             "CLOSE": "sa_gui_close",
+            "ON_CLICK": "sa_gui_on_click",
+            "RUN": "sa_gui_run",
         }
         if member in direct:
             return f"{direct[member]}({', '.join(args)})"

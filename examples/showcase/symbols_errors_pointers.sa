@@ -1,5 +1,4 @@
-10 REM === SonAlgebraic 特性演示 (无 NULL/ELSE/求值) ===
-20 USE SYS.MATH AS M
+10 REM 符号表达式、异常捕获、指针修改与标签子段的组合示例
 30 USEC "stdio.h" AS STDIO
 40 DECLARE C SUB STDIO.puts(s AS STRING) AS NUM AS LONG
 
@@ -39,7 +38,7 @@
 360 x = 100
 370 p = @x
 380 ^p = ^p + 200
-390 PRINT F"指针修改后的 x = {x}"    
+390 PRINT F"指针修改后的 x = {x}"
 400
 410 REM GOSUB 演示
 420 GOSUB ::sub_label

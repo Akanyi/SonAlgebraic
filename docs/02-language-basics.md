@@ -142,11 +142,13 @@ END
 | `HANDLE AS Kind` | kind 名 | 名义化资源句柄，见[第 4 章](./04-composite-types.md) |
 | `CPTR` | — | 不透明指针，见[第 6 章](./06-pointers-and-ffi.md) |
 | `PTR TO T` | 目标类型 | 类型化指针，见[第 6 章](./06-pointers-and-ffi.md) |
+| `PTR TO SUB(参数) AS T` | 函数签名 | 函数引用，`@foo()` 取得，见[第 3 章](./03-subroutines.md#函数引用callable-与-callret) |
+| `SUB(参数) AS T` | 函数签名 | callable 实体，`NEW SUB` 生成，托管、引用计数 |
 | `VOID` | — | 只用于 `SUB` 返回类型 |
 
 比较运算和逻辑运算的结果类型是 `BOOL`。`BOOL` 与数值可互相赋值——比较结果赋给 `LONG`、整数当条件用，都合法。
 
-`NULL` 可赋给任意 `PTR TO T`、`CPTR` 或 `HANDLE AS Kind`，也可与它们做等值比较：
+`NULL` 可赋给任意 `PTR TO T`（含函数引用）、`CPTR`、`HANDLE AS Kind` 或 callable，也可与指针、函数引用、句柄做等值比较：
 
 ```basic
 10 DIM done AS BOOL AS VAR
@@ -251,7 +253,7 @@ END
 
 ## 赋值：复制、借用、移动
 
-`STRING`、`SYMBOL`、`ERROR` 和含这类字段的 `ENTITY` 是**托管资源**：编译器在作用域结束时自动释放它们（见[实现说明](./09-implementation-notes.md#托管资源的清理)）。对这些类型，赋值有三种写法，区别在于谁拥有资源：
+`STRING`、`SYMBOL`、`ERROR`、callable 实体（`SUB` 类型）和含这类字段的 `ENTITY` 是**托管资源**：编译器在作用域结束时自动释放它们（见[实现说明](./09-implementation-notes.md#托管资源的清理)）。对这些类型，赋值有三种写法，区别在于谁拥有资源：
 
 | 写法 | 含义 | 之后 |
 |---|---|---|
@@ -313,7 +315,7 @@ END
 90 END
 ```
 
-第 60 行报 `变量已被 m= 移走: b`。其他常见的拦截：给数值变量写 `n m= k` 报 `m= 只适用于 STRING / SYMBOL / ERROR 和含托管字段的 ENTITY`；`v f= s` 之后再 `s = "x"` 报 `变量已被 f= 借出`；在 `IF` 里给外层 `DIM` 的变量做 `f=` 报 `f= 的目标必须是与该语句同一个块里 DIM 的局部变量`。所有权检查是顺序敏感的状态机，每个 SUB 只报第一处错，修掉再看下一处。
+第 60 行报 `变量已被 m= 移走: b`。其他常见的拦截：给数值变量写 `n m= k` 报 `m= 只适用于 STRING / SYMBOL / ERROR、callable 实体和含托管字段的 ENTITY`；`v f= s` 之后再 `s = "x"` 报 `变量已被 f= 借出`；在 `IF` 里给外层 `DIM` 的变量做 `f=` 报 `f= 的目标必须是与该语句同一个块里 DIM 的局部变量`。所有权检查是顺序敏感的状态机，每个 SUB 只报第一处错，修掉再看下一处。
 
 ## 控制流
 
@@ -456,6 +458,7 @@ END
 | `SUB` / `.ENDSUB` | 定义子程序 |
 | `CALL` | 调用子程序。只能作为独立语句，或整条赋值的右侧 |
 | `RETURN` | 从函数返回值；无参形式配合 `GOSUB` |
+| `CALLRET` | 经 callable / 函数引用调用，并以其结果结束当前 `SUB` |
 | `IF` / `THEN` / `ELSE IF` / `ELSE` / `END IF` / `.ENDIF` | 条件分支 |
 | `FOR` / `TO` / `STEP` / `.ENDFOR` | 计数循环 |
 | `WHILE` / `.ENDWHILE` | 条件循环 |
@@ -478,6 +481,8 @@ END
 | `HANDLE AS Kind` | 名义化资源句柄 |
 | `CPTR` / `PTR TO` / `CAST` | 指针与类型转换 |
 | `f=` / `m=` | 托管资源的借用 / 移动赋值，见[赋值：复制、借用、移动](#赋值复制借用移动) |
+| `@name()` / `PTR TO SUB` | 取函数引用 / 函数引用类型，见[第 3 章](./03-subroutines.md#函数引用callable-与-callret) |
+| `NEW SUB` / `FROM` | 由函数引用生成 callable 实体 |
 
 **子程序修饰符**
 

@@ -1,7 +1,7 @@
 """程序级发射：generate() 的顶层编排与全局变量的初始化 / 释放。"""
 from __future__ import annotations
 
-from ...analysis.typesys import is_cptr, is_error, is_handle, is_ptr, is_string, is_symbol
+from ...analysis.typesys import is_cptr, is_error, is_handle, is_ptr, is_string, is_sub_type, is_symbol
 from ...core import ast
 from ...core.names import module_header_name, module_symbol_prefix
 from ..c_runtime import RUNTIME_PRELUDE
@@ -73,7 +73,7 @@ class ProgramMixin(CGenBase):
                 init = "{0}"
             if is_error(decl.type_spec):
                 init = '{0, "ERR_NONE", NULL, 0, NULL}'
-            if is_symbol(decl.type_spec):
+            if is_symbol(decl.type_spec) or is_sub_type(decl.type_spec):
                 init = "NULL"
             lines.append(self.source_comment(decl.line_no, 0))
             storage = "" if self.is_exported_const(decl) else "static "
@@ -185,6 +185,8 @@ class ProgramMixin(CGenBase):
             lines.extend(f"    {line}" for line in prelude)
             if is_string(decl.type_spec):
                 lines.append(f"    sa_set_string(&{self.global_c_name(decl)}, {value});")
+            elif is_sub_type(decl.type_spec):
+                lines.append(f"    sa_callable_set(&{self.global_c_name(decl)}, {value});")
             elif decl.type_spec.name == "ENTITY" and self.type_has_managed_resources(decl.type_spec):
                 lines.extend(self.entity_copy_lines(self.global_c_name(decl), value, decl.type_spec, 1))
             else:
@@ -221,6 +223,8 @@ class ProgramMixin(CGenBase):
                 lines.append(f"    sa_error_clear(&{self.global_c_name(decl)});")
             elif is_symbol(decl.type_spec):
                 lines.append(f"    sa_symbol_free({self.global_c_name(decl)});")
+            elif is_sub_type(decl.type_spec):
+                lines.append(f"    sa_callable_release({self.global_c_name(decl)});")
             elif decl.type_spec.name == "ENTITY" and self.type_has_managed_resources(decl.type_spec):
                 lines.extend(self.entity_free_lines(self.global_c_name(decl), decl.type_spec, 1))
         return lines

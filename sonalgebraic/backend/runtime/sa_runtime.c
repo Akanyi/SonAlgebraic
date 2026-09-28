@@ -1012,6 +1012,50 @@ void sa_throw_error(const SaError* error) {
     sa_throw_dispatch();
 }
 
+/* 空函数引用被调用时抛 SA 异常而不是在野指针上段错误：TRY 接得住，接不住也有行号。 */
+SaSubFn sa_sub_check(SaSubFn fn, int line_number, const char* sub_name) {
+    if (!fn) {
+        sa_throw_new("ERR_NULL_CALL", "call through a NULL function reference", line_number, sub_name);
+    }
+    return fn;
+}
+
+/* 从空引用生成 callable 不在这里报错，推迟到调用时由 sa_callable_fn 报：NEW SUB 是普通
+ * 语句，没有异常落地垫，在这里抛会漏掉当前帧的局部资源。 */
+SaCallable* sa_callable_new(SaSubFn fn) {
+    SaCallable* callable = (SaCallable*)malloc(sizeof(SaCallable));
+    if (!callable) {
+        fputs("SonAlgebraic runtime: out of memory\n", stderr);
+        exit(1);
+    }
+    callable->fn = fn;
+    callable->refs = 1;
+    return callable;
+}
+
+SaCallable* sa_callable_retain(SaCallable* callable) {
+    if (callable) callable->refs++;
+    return callable;
+}
+
+void sa_callable_release(SaCallable* callable) {
+    if (callable && --callable->refs == 0) free(callable);
+}
+
+void sa_callable_set(SaCallable** target, SaCallable* value) {
+    /* 先 retain 再 release：自赋值 h = h 时计数不会先掉到 0 */
+    sa_callable_retain(value);
+    sa_callable_release(*target);
+    *target = value;
+}
+
+SaSubFn sa_callable_fn(SaCallable* callable, int line_number, const char* sub_name) {
+    if (!callable) {
+        sa_throw_new("ERR_NULL_CALL", "call through a NULL callable", line_number, sub_name);
+    }
+    return sa_sub_check(callable->fn, line_number, sub_name);
+}
+
 double sa_number(const char* value) {
     return strtod(value ? value : "0", NULL);
 }
@@ -3504,9 +3548,9 @@ char* sa_desktop_clipboard_get(void) {
 #endif
 
 #ifdef SA_ENABLE_GUI
-/* 轮询式窗口 GUI：SA 没有函数指针，所以不走回调注册，而是 Win32 原生的
-   control id 路线——按钮点击进事件队列，WAIT_EVENT 阻塞取 id，SA 侧用
-   WHILE + IF 分发。窗口/控件句柄沿用槽位 + generation 机制。 */
+/* 窗口 GUI 走 Win32 原生的 control id 路线：按钮点击进事件队列。两种事件模型共用这个
+   队列——WAIT_EVENT 阻塞取 id、SA 侧用 WHILE + IF 分发；或者 ON_CLICK 给按钮挂 callable，
+   RUN 取 id 后替你派发。窗口/控件句柄沿用槽位 + generation 机制。 */
 char sa_gui_last_error[512] = "";
 void sa_gui_clear_error(void) { sa_gui_last_error[0] = '\0'; }
 void sa_gui_set_error(const char* message) { snprintf(sa_gui_last_error, sizeof(sa_gui_last_error), "%s", message ? message : "gui error"); }
@@ -3552,6 +3596,8 @@ typedef struct {
 typedef struct {
     HWND hwnd;
     uint32_t generation;
+    long long control_id;
+    SaCallable* on_click;
 } SaGuiWidgetSlot;
 
 SaGuiWindowSlot sa_gui_windows[SA_GUI_WINDOW_COUNT];
@@ -3585,6 +3631,7 @@ LRESULT CALLBACK sa_gui_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             if (sa_gui_widgets[i].hwnd && (IsChild(hwnd, sa_gui_widgets[i].hwnd) || !IsWindow(sa_gui_widgets[i].hwnd))) {
                 sa_gui_widgets[i].hwnd = NULL;
                 sa_gui_widgets[i].generation++;
+                sa_callable_set(&sa_gui_widgets[i].on_click, NULL);
             }
         }
         if (sa_gui_live_windows > 0 && --sa_gui_live_windows == 0) {
@@ -3644,6 +3691,8 @@ typedef struct {
 typedef struct {
     GtkWidget* widget;
     uint32_t generation;
+    long long control_id;
+    SaCallable* on_click;
 } SaGuiWidgetSlot;
 
 SaGuiWindowSlot sa_gui_windows[SA_GUI_WINDOW_COUNT];
@@ -3667,6 +3716,7 @@ void sa_gui_on_widget_destroy(GtkWidget* source, gpointer user_data) {
     SaGuiWidgetSlot* slot = (SaGuiWidgetSlot*)user_data;
     slot->widget = NULL;
     slot->generation++;
+    sa_callable_set(&slot->on_click, NULL);
 }
 
 void sa_gui_on_window_destroy(GtkWidget* source, gpointer user_data) {
@@ -3696,7 +3746,7 @@ GtkWidget* sa_gui_widget_ptr(SaHandle handle) {
     return slot->widget && slot->generation == generation ? slot->widget : NULL;
 }
 
-SaHandle sa_gui_register_widget(SaGuiWindowSlot* owner, GtkWidget* widget, long long x, long long y, long long width, long long height) {
+SaHandle sa_gui_register_widget(SaGuiWindowSlot* owner, GtkWidget* widget, long long control_id, long long x, long long y, long long width, long long height) {
     for (size_t i = 0; i < SA_GUI_WIDGET_COUNT; i++) {
         SaGuiWidgetSlot* slot = &sa_gui_widgets[i];
         if (slot->widget) continue;
@@ -3705,6 +3755,7 @@ SaHandle sa_gui_register_widget(SaGuiWindowSlot* owner, GtkWidget* widget, long 
         gtk_widget_show(widget);
         if (++slot->generation == 0) slot->generation = 1;
         slot->widget = widget;
+        slot->control_id = control_id;
         g_signal_connect(widget, "destroy", G_CALLBACK(sa_gui_on_widget_destroy), slot);
         return sa_handle_make(SA_HANDLE_GUI_WIDGET, slot->generation, i);
     }
@@ -3786,6 +3837,7 @@ SaHandle sa_gui_create_widget(SaHandle window, const wchar_t* wclass, DWORD styl
         sa_gui_apply_font(hwnd);
         if (++slot->generation == 0) slot->generation = 1;
         slot->hwnd = hwnd;
+        slot->control_id = control_id;
         return sa_handle_make(SA_HANDLE_GUI_WIDGET, slot->generation, i);
     }
     sa_gui_set_error("too many live widgets");
@@ -3805,7 +3857,7 @@ SaHandle sa_gui_button(SaHandle window, long long control_id, const char* text, 
     if (!owner) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
     GtkWidget* created = gtk_button_new_with_label(text ? text : "");
     g_signal_connect(created, "clicked", G_CALLBACK(sa_gui_on_button_clicked), (gpointer)(intptr_t)control_id);
-    return sa_gui_register_widget(owner, created, x, y, width, height);
+    return sa_gui_register_widget(owner, created, control_id, x, y, width, height);
 #else
     (void)window; (void)control_id; (void)text; (void)x; (void)y; (void)width; (void)height;
     sa_gui_set_error("SYS.GUI is only available on Windows");
@@ -3824,7 +3876,7 @@ SaHandle sa_gui_label(SaHandle window, const char* text, long long x, long long 
     /* GtkLabel 默认居中，Win32 STATIC 是左上对齐，行为对齐后 SA 程序跨平台观感一致 */
     gtk_widget_set_halign(created, GTK_ALIGN_START);
     gtk_widget_set_valign(created, GTK_ALIGN_START);
-    return sa_gui_register_widget(owner, created, x, y, width, height);
+    return sa_gui_register_widget(owner, created, 0, x, y, width, height);
 #else
     (void)window; (void)text; (void)x; (void)y; (void)width; (void)height;
     sa_gui_set_error("SYS.GUI is only available on Windows");
@@ -3840,7 +3892,7 @@ SaHandle sa_gui_textbox(SaHandle window, long long x, long long y, long long wid
     SaGuiWindowSlot* owner = sa_gui_window_slot(window);
     if (!owner) { sa_gui_set_error("invalid or closed WINDOW handle"); return 0; }
     GtkWidget* created = gtk_entry_new();
-    return sa_gui_register_widget(owner, created, x, y, width, height);
+    return sa_gui_register_widget(owner, created, 0, x, y, width, height);
 #else
     (void)window; (void)x; (void)y; (void)width; (void)height;
     sa_gui_set_error("SYS.GUI is only available on Windows");
@@ -3956,6 +4008,68 @@ int sa_gui_close(SaHandle window) {
     return 0;
 #endif
 }
+
+#if defined(_WIN32) || defined(SA_ENABLE_GUI_GTK)
+SaGuiWidgetSlot* sa_gui_live_widget_slot(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_GUI_WIDGET, SA_GUI_WIDGET_COUNT, &index, &generation)) return NULL;
+    SaGuiWidgetSlot* slot = &sa_gui_widgets[index];
+#ifdef _WIN32
+    return slot->hwnd && slot->generation == generation ? slot : NULL;
+#else
+    return slot->widget && slot->generation == generation ? slot : NULL;
+#endif
+}
+#endif
+
+/* 回调挂在控件槽位上，控件销毁时随槽位一起 release；传 NULL 就是摘掉回调。 */
+int sa_gui_on_click(SaHandle widget, SaCallable* handler) {
+    sa_gui_clear_error();
+#if defined(_WIN32) || defined(SA_ENABLE_GUI_GTK)
+    SaGuiWidgetSlot* slot = sa_gui_live_widget_slot(widget);
+    if (!slot) { sa_gui_set_error("invalid or closed WIDGET handle"); return 0; }
+    if (slot->control_id <= 0) { sa_gui_set_error("ON_CLICK only applies to BUTTON widgets"); return 0; }
+    sa_callable_set(&slot->on_click, handler);
+    return 1;
+#else
+    (void)widget; (void)handler;
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
+
+/* 回调不在 WndProc / GTK 信号处理函数里直接调，而是等事件进队列、从这里的栈帧派发：
+   SA 的异常靠 longjmp 往外跳，跳过 DispatchMessage 或 GTK 主循环的帧是未定义行为，
+   从 RUN 自己的帧跳出去就只是跳过一个普通 C 函数。 */
+int sa_gui_run(void) {
+#if defined(_WIN32) || defined(SA_ENABLE_GUI_GTK)
+    long long id;
+    while ((id = sa_gui_wait_event()) != 0) {
+        for (size_t i = 0; i < SA_GUI_WIDGET_COUNT; i++) {
+            SaGuiWidgetSlot* slot = &sa_gui_widgets[i];
+            if (!slot->on_click || slot->control_id != id) continue;
+            /* 回调可能关窗并释放槽位，派发期间必须独立保活。handler 在 setjmp 前保存且
+               此后不改写，longjmp 后仍有效；清理时不能再从可能已被复用的槽位取引用。 */
+            SaCallable* handler = sa_callable_retain(slot->on_click);
+            sa_try_push_env();
+            if (SA_SETJMP(sa_try_stack[sa_try_top - 1].env) != 0) {
+                sa_try_pop();
+                sa_callable_release(handler);
+                /* 先退清理帧再原样重抛，保留错误信息且避免跳回自己的落地垫。 */
+                sa_throw_dispatch();
+            }
+            ((void (*)(long long))sa_callable_fn(handler, 0, "SYS.GUI.RUN"))(id);
+            sa_try_pop();
+            sa_callable_release(handler);
+        }
+    }
+    return 1;
+#else
+    sa_gui_set_error("SYS.GUI is only available on Windows");
+    return 0;
+#endif
+}
 #endif
 
 void sa_print_string(const char* value) {
@@ -4049,7 +4163,7 @@ typedef struct {
         char* s;
         SaHandle h;
     } result;
-    char* error;              /* REJECTED 时的消息 */
+    SaError error;            /* 保留原错误；消息由槽位独占 */
     SaCoroBase* coro;         /* 关联协程帧；纯值 promise 为 NULL */
     SaHandle waiter;          /* 等它完成的协程（single-waiter，是 single-consumer 的推论）*/
     /* I/O promise 专用：这类 promise 的 coro 为 NULL，不靠 resume 推进，而是登记一个
@@ -4072,6 +4186,7 @@ int sa_async_cleanup_registered = 0;
  * 尚未归属任何 stream 句柄，取消/丢弃时必须关掉），NET 未启用时是空操作。dispose 在无
  * 条件区、abandon 定义在 NET 块之后，故这里前向声明。 */
 void sa_net_io_abandon(SaAsyncSlot* slot);
+void sa_promise_release(SaHandle promise);
 
 /* 就绪队列：可立即 resume 的协程句柄。环形缓冲，容量与槽位数相同——每个协程同一时刻
  * 至多入队一次（挂起时不在队列里），故绝不溢出。 */
@@ -4090,14 +4205,11 @@ SaAsyncSlot* sa_async_slot(SaHandle handle) {
 /* 释放槽位持有的资源。已 CONSUMED 的字符串结果所有权已交出，这里不能再碰。 */
 void sa_async_slot_dispose(SaAsyncSlot* slot) {
     if (slot->has_string_result && slot->status == SA_PROMISE_FULFILLED) free(slot->result.s);
-    free(slot->error);
+    sa_error_clear(&slot->error);
     free(slot->io_data);
     sa_net_io_abandon(slot);   /* CONNECT 的游离 fd 在这里关掉；其他 op 的 fd 归句柄所有，不碰 */
     if (slot->coro) {
-        /* 协程还挂着（pending 中被 drop、或程序退出时未跑完）：帧里 strdup 的参数与 DIM
-         * 的局部尚未经过 resume 终结点清理，靠 codegen 生成的 cleanup 逐个释放。帧 calloc
-         * 零初始化，还没执行到的局部是 NULL，cleanup free(NULL) 安全。已正常 settle 的协程
-         * 其 coro 已在 settle 里置 NULL，走不到这里，故不会 double-free。 */
+        /* 终结路径已摘下帧；这里只处理取消或退出时仍存活的帧。 */
         if (slot->coro->cleanup) slot->coro->cleanup(slot->coro);
         free(slot->coro);
         slot->coro = NULL;
@@ -4106,7 +4218,7 @@ void sa_async_slot_dispose(SaAsyncSlot* slot) {
     slot->status = SA_PROMISE_PENDING;
     slot->has_string_result = 0;
     slot->result.s = NULL;
-    slot->error = NULL;
+    slot->error = (SaError){0};
     slot->waiter = 0;
     slot->io_op = 0;
     slot->io_data = NULL;
@@ -4129,7 +4241,7 @@ SaHandle sa_promise_alloc(SaCoroBase* coro) {
         slot->status = SA_PROMISE_PENDING;
         slot->has_string_result = 0;
         slot->result.i = 0;
-        slot->error = NULL;
+        slot->error = (SaError){0};
         slot->coro = coro;
         slot->waiter = 0;
         slot->io_op = 0;
@@ -4154,7 +4266,13 @@ void sa_coro_schedule(SaHandle promise) {
  * free 帧，故 RETURN 发射的 C 必须保证 fulfill 之后立即 return、不再触碰帧字段。 */
 void sa_promise_settle(SaAsyncSlot* slot, int status) {
     slot->status = status;
-    if (slot->coro) { free(slot->coro); slot->coro = NULL; }
+    if (slot->coro) {
+        SaCoroBase* coro = slot->coro;
+        slot->coro = NULL;
+        if (coro->awaited) sa_promise_release(coro->awaited);
+        if (coro->cleanup) coro->cleanup(coro);
+        free(coro);
+    }
     if (slot->waiter) {
         SaHandle waiter = slot->waiter;
         slot->waiter = 0;
@@ -4164,21 +4282,21 @@ void sa_promise_settle(SaAsyncSlot* slot, int status) {
 
 void sa_promise_fulfill_long(SaHandle promise, long long value) {
     SaAsyncSlot* slot = sa_async_slot(promise);
-    if (!slot) return;
+    if (!slot || slot->status != SA_PROMISE_PENDING) return;
     slot->result.i = value;
     sa_promise_settle(slot, SA_PROMISE_FULFILLED);
 }
 
 void sa_promise_fulfill_double(SaHandle promise, double value) {
     SaAsyncSlot* slot = sa_async_slot(promise);
-    if (!slot) return;
+    if (!slot || slot->status != SA_PROMISE_PENDING) return;
     slot->result.d = value;
     sa_promise_settle(slot, SA_PROMISE_FULFILLED);
 }
 
 void sa_promise_fulfill_handle(SaHandle promise, SaHandle value) {
     SaAsyncSlot* slot = sa_async_slot(promise);
-    if (!slot) return;
+    if (!slot || slot->status != SA_PROMISE_PENDING) return;
     slot->result.h = value;
     sa_promise_settle(slot, SA_PROMISE_FULFILLED);
 }
@@ -4187,7 +4305,7 @@ void sa_promise_fulfill_handle(SaHandle promise, SaHandle value) {
  * double-free；slot 持有它直到被 take 走或 promise 销毁。 */
 void sa_promise_fulfill_str(SaHandle promise, char* value) {
     SaAsyncSlot* slot = sa_async_slot(promise);
-    if (!slot) { free(value); return; }
+    if (!slot || slot->status != SA_PROMISE_PENDING) { free(value); return; }
     slot->result.s = value;
     slot->has_string_result = 1;
     sa_promise_settle(slot, SA_PROMISE_FULFILLED);
@@ -4195,15 +4313,21 @@ void sa_promise_fulfill_str(SaHandle promise, char* value) {
 
 void sa_promise_fulfill_void(SaHandle promise) {
     SaAsyncSlot* slot = sa_async_slot(promise);
-    if (!slot) return;
+    if (!slot || slot->status != SA_PROMISE_PENDING) return;
     sa_promise_settle(slot, SA_PROMISE_FULFILLED);
 }
 
-void sa_promise_reject(SaHandle promise, const char* message) {
+void sa_promise_reject_error(SaHandle promise, const SaError* error) {
     SaAsyncSlot* slot = sa_async_slot(promise);
-    if (!slot) return;
-    slot->error = sa_strdup(message ? message : "async error");
+    if (!slot || slot->status != SA_PROMISE_PENDING) return;
+    sa_set_error(&slot->error, error);
     sa_promise_settle(slot, SA_PROMISE_REJECTED);
+}
+
+/* 网络原语只有消息，保留原接口；用户协程使用完整错误接口。 */
+void sa_promise_reject(SaHandle promise, const char* message) {
+    SaError error = {sa_error_code("ERR_ASYNC"), "ERR_ASYNC", (char*)(message ? message : "async error"), 0, "<coroutine>"};
+    sa_promise_reject_error(promise, &error);
 }
 
 /* take 前的公共校验。single-consumer 违规、取到未完成或已失效句柄都在这里拦死；取到被
@@ -4219,7 +4343,9 @@ SaAsyncSlot* sa_promise_require(SaHandle promise) {
         exit(1);
     }
     if (slot->status == SA_PROMISE_REJECTED) {
-        sa_raise_new("ERR_ASYNC", slot->error ? slot->error : "async error", 0, "<coroutine>");
+        sa_raise_error(&slot->error);
+        /* take 失败也消费句柄：longjmp 会跳过调用方语句尾的 release。 */
+        sa_promise_release(promise);
         sa_throw_dispatch();   /* 不返回 */
     }
     if (slot->status != SA_PROMISE_FULFILLED) {

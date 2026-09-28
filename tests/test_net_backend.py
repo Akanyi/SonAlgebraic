@@ -409,9 +409,9 @@ def test_native_backend_tls_stream_links() -> None:
         build_exe(src, Path(temp) / "tls_native.exe", keep_c=False, backend="native")
 
 
-# --- examples/web_server.sa 端到端 ----------------------------------------
+# --- examples/network/http_server.sa 端到端 ----------------------------------------
 
-_WEB_SERVER_EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "web_server.sa"
+_WEB_SERVER_EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "network" / "http_server.sa"
 _WEB_SERVER_LISTEN = 'N.TCP_LISTEN("127.0.0.1", 8080, 16)'
 
 

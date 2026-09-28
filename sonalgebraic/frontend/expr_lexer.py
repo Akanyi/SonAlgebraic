@@ -205,7 +205,7 @@ def _scan_interp_string(text: str, start: int) -> tuple[str, int] | None:
     """扫描插值里的一段字符串字面量，返回 (规范化后的文本, 结束后下标)；没闭合返回 None。
 
     两种写法都得认：`"a"`，以及历史遗留的 `\\"a\\"`——旧版整个 F-string 走的是普通字符串
-    读取器，插值里用同款引号必须先转义（examples/net_tls.sa 就是这么写的）。这里统一把
+    读取器，插值里用同款引号必须先转义（examples/network/tls_client.sa 就是这么写的）。这里统一把
     那层多余的反斜杠摘掉，下游的 parse_fstring 和 parse_expr 只需要面对一种形态。
     """
     escaped = text[start] == "\\"

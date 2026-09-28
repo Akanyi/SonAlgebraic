@@ -11,6 +11,7 @@
 - [模块的两条不同路径](#模块的两条不同路径)
 - [托管资源的清理](#托管资源的清理)
 - [异常：setjmp 跳转与三步 THROW](#异常setjmp-跳转与三步-throw)
+- [函数引用与 callable](#函数引用与-callable)
 - [GOSUB：整数返回栈与 switch 分发](#gosub整数返回栈与-switch-分发)
 - [SYMBOL 重赋值的自引用安全](#symbol-重赋值的自引用安全)
 
@@ -60,6 +61,8 @@ static void sa_main(void) {
 | `SYMBOL` | `SaSymbol`（即 `SaSymbolNode*`） | |
 | `ERROR` | `SaError` | 结构体，非指针 |
 | `ENTITY AS Name` | `SaEntity_<小写名>` | |
+| `PTR TO SUB(...) AS T` | `SaSubFn`（即 `void (*)(void)`） | 签名擦除，调用点强转回真实类型 |
+| `SUB(...) AS T` | `SaCallable*` | 引用计数对象，托管 |
 | `DIM xs[N] AS T` | `T name[N]` | 聚合初始化 `= {0}` |
 
 `ENTITY` 的 typedef 和实例化：
@@ -154,6 +157,26 @@ codegen 为每个块维护一张「本块要在块尾释放的变量」登记表
 
 协程帧里的变量走同一套：登记里存的名字本来就是 `f->sa_a`，挂起中被 drop 时的清理体也是从同一张表抓出来的。
 
+### 协程参数拥有独立资源
+
+`ASYNC SUB` 的启动器先把参数复制进堆上的协程帧，再加入调度队列。调用方可能在协程运行前就修改或释放原值，因此不能沿用同步 `SUB` 的借用式参数生命周期：
+
+- `SYMBOL` 使用 `sa_symbol_clone` 递归复制整棵树；协程清理自己的副本，不释放调用方的原树。
+- `ERROR` 使用 `sa_set_error` 复制消息，保留错误码、类型、行号和 SUB 名称。
+- `STRING` 使用 `sa_strdup`，callable 使用 `sa_callable_retain`；含托管字段的 `ENTITY` 沿用现有逐字段复制规则。
+
+正常完成、失败、未启动即 drop、挂起中取消，都要释放帧持有的参数资源。`tests/test_coroutines.py` 和 `tests/test_async_errors.py` 在 `-O0` / `-O2` 下验证副本独立性、调用方改值并释放后的跨 AWAIT 使用，以及回收路径的零净分配。ENTITY 内 SYMBOL 字段同样递归克隆和释放。
+
+协程终结时执行帧 cleanup；THROW、块尾和 RETURN 已清理的字段归零，兜底不重复释放。临时资源通过类型化登记提升到帧，接管后清空原存储，借用字段不参与拥有者清理。Promise 保存完整 `SaError`，失败取值先复制错误、释放 Promise，再向调用方重抛。详见[第 12 章](./12-async.md)。
+
+### native 无栈状态机
+
+`backend/native/coroutines.py` 直接生成 `_start`、`_resume` 和 `_cleanup` LLVM 函数。堆帧的第一个成员是 `%SaCoroBase = { i32, ptr, ptr, i64, i64 }`，与共享运行时中的状态、resume/cleanup 指针、self/awaited 句柄对齐。局部和临时槽提升为帧字段；每次 resume 在入口重算全部字段 GEP，保证这些地址支配任意 switch 恢复入口。
+
+挂起前保存恢复编号及 awaited，清理实参临时，弹出异常垫，然后调用 `sa_coro_await` 并 `ret void`。恢复时先从帧读取并清零 awaited，再取值和释放子 Promise。FOR 的上界/步长、间接赋值的目标地址也要落帧，不能沿用上一次 resume 的 SSA 值。
+
+每次 resume 都重新压入异常垫，未捕获异常通过 `sa_promise_reject_error` 保存原错误。帧资源的释放使用独立 IR helper，释放后归零并检查借用标志；运行时 settle 和取消调用统一 cleanup。`backend/native/promises.py` 负责启动调用、同步驱动、按结果类型 take/release，以及同步边界异常清理。测试在 runtime 的退出兜底执行前同时断言存活 Promise 槽、异常栈和净分配为零。
+
 ### ENTITY 的字符串字段
 
 `ENTITY` 里的 `STRING` 字段按值语义管理：
@@ -187,7 +210,7 @@ codegen 为每个块维护一张「本块要在块尾释放的变量」登记表
 
 输出 `LANS` 和 `SA`——深拷贝生效，改 `second` 不会动到 `first`。
 
-`ENTITY` 内的 `SYMBOL` 字段目前**不做**深层 clone/free 托管。runtime 的 `sa_symbol_clone` 能力是有的，但还没接进实体的拷贝/析构路径，所以暂时按浅拷贝处理以避免双重释放。
+`ENTITY` 内的 `SYMBOL` 字段在 C/native 两个后端均纳入深层托管：初始化为 NULL，复制时先 `sa_symbol_clone`、再释放目标旧树，析构时递归 `sa_symbol_free`。先克隆再释放保证自赋值和同址 REF 别名安全；嵌套实体、指针解引用整体赋值、按值传参和返回都沿用这套所有权规则。含 SYMBOL 字段的实体也可使用 `f=` / `m=`，由同一套借用冻结与移动失效检查约束。
 
 ## 异常：setjmp 跳转与三步 THROW
 
@@ -279,6 +302,75 @@ static void sa_middle(void) {
 - `GOTO` 可能从 `CATCH` 块内部直接跳出 `.ENDTRY`，跳过块尾的 `sa_error_clear(&e)`，让最后一次捕获的 message 泄漏
 
 提升后由 `SUB` 末尾兜底收尾。`sa_error_clear` 是幂等的，和正常路径的块尾清理叠加不会双重 free。
+
+## 函数引用与 callable
+
+### 签名擦除
+
+所有函数引用在 C 里都是同一个类型 `SaSubFn`，也就是 `void (*)(void)`。签名只在 SA 语义检查阶段比对，C 里不为每种签名单独 `typedef`。代价是调用点要按 SA 签名强转回真实的函数指针类型：
+
+```c
+SaSubFn sa_op = NULL;
+sa_op = ((SaSubFn)sa_square);
+sa_print_long(((long long (*)(long long))sa_sub_check(sa_op, 110, "main"))(3));
+```
+
+C 标准允许函数指针之间来回转换，只要最终按原类型调用就是良定义的。`sa_sub_check` 在指针为空时抛 `ERR_NULL_CALL`，否则原样返回，所以空引用调用得到的是可捕获的 SA 异常，不是段错误。
+
+### callable：引用计数的盒子
+
+```c
+typedef struct { SaSubFn fn; long refs; } SaCallable;
+```
+
+`NEW SUB sq FROM @square()` 生成 `SaCallable* sa_sq = sa_callable_new(((SaSubFn)sa_square));`，登记进本帧的托管资源，块结束时 `sa_callable_release`。其余规则和 `STRING` 一致，只是把「复制内容」换成「加一份计数」：
+
+- 按值传参：被调方入口处 `sa_callable_retain`，出口处 release，和字符串参数的入口复制对称。
+- `=` 赋值走 `sa_callable_set(&dst, src)`：先 retain 新值再 release 旧值，自赋值安全。
+- `m=` 和能接管的临时量（比如函数返回值）直接转移指针，不动计数。
+- `ENTITY` 字段、全局变量、`ASYNC SUB` 的协程帧字段都按同样的方式登记和释放。
+
+`sa_callable_new` 收到空指针**不报错**：`NEW SUB` 语句本身没有异常落地垫，在这里抛异常会漏掉本帧资源。空指针推迟到 `sa_callable_fn` 取函数指针时再报。
+
+### FFI 边界：唯一的转换点
+
+在 FFI 边界上 `PTR TO SUB` 就是 C 函数指针。codegen 在 `c_cast_arg` 里把它统一写成 `(void*)(value)` 传给 C 函数（`AS REF` 时是 `(void*)&(x)`），让 C 编译器按原型把它隐式转成声明的函数指针类型。`@CB.cfunc()` 直接取 C 函数的地址，不生成中转函数；C 返回的函数指针用 `((SaSubFn)cfunc(...))` 接住。
+
+现在的函数引用是瘦指针，只存一个地址。将来要支持 Lambda 捕获上下文时，内部表示可以换成胖指针 `{fn, env}`，FFI 这一侧只需要改 `c_cast_arg` 这一个地方：在那里剥掉 `env`，或者拒绝带捕获的值出境。callable 从一开始就不许过 FFI，就是为了给这种扩展留出余地。
+
+### CALLRET：先落地，再返回
+
+`CALLRET f(v)` 的调用可能抛异常，所以要套 [per-call landing pad](#异常穿透的-per-call-landing-pad)；但 `return` 不能写在落地垫里，否则 `sa_try_top--` 会被跳过。做法是把结果先存进落地垫外面声明的临时量，出了落地垫再做正常的帧清理，最后返回：
+
+```c
+long long sa_tmp_1;
+sa_try_top++;
+if (SA_SETJMP(sa_try_stack[sa_try_top - 1].env) == 0) {
+    long long sa_tmp_2 = ((long long (*)(long long))sa_callable_fn(sa_f, 30, "apply"))(sa_v);
+    sa_tmp_1 = sa_tmp_2;
+    sa_try_top--;
+} else {
+    sa_try_top--;
+    free(sa_tag);
+    sa_callable_release(sa_f);
+    sa_throw_dispatch();
+}
+free(sa_tag);
+sa_callable_release(sa_f);
+return sa_tmp_1;
+```
+
+`VOID` 的 `SUB` 里被调方的返回值写成 `(void)value;` 丢掉。含 `GOSUB` 的 `SUB` 不允许 `CALLRET`，因为那里的 `return` 要先经过返回栈分发。
+
+### GUI 回调在 RUN 的栈帧里派发
+
+`SYS.GUI.ON_CLICK` 把 callable 存进按钮的控件槽位，控件销毁时（Win32 的 `WM_DESTROY`、GTK 的 `destroy` 信号）release。WndProc 和 GTK 信号处理函数**不直接调用**回调，只把 control id 放进事件队列，和轮询模式用的是同一个队列。`sa_gui_run` 循环调用 `sa_gui_wait_event`，在自己的栈帧里查槽位并调用回调。
+
+这样安排是为了异常：SA 的 `THROW` 靠 `longjmp` 往外跳，跳过 `DispatchMessage` 或 GTK 主循环的帧属于未定义行为；从 `sa_gui_run` 的帧跳出去，跳过的只是一个普通 C 函数。
+
+回调可能在执行中关掉自己所在的窗口，这会让槽位 release 掉正在运行的 callable，所以派发期间 `sa_gui_run` 自己多持一份计数。每次派发建立一个 `SA_SETJMP` 清理帧：正常返回时退栈并 release；回调或空函数引用检查抛异常时，同样先退栈、release，再原样重抛。清理使用派发前保存的 handler，不依赖可能已经销毁或复用的控件槽位。
+
+这样即使回调释放注册引用后再抛错，也不会丢失派发器的那份引用或改写原错误。`tests/test_function_model.py` 在 `-O0` / `-O2` 下验证正常、异常、释放注册引用和空函数引用路径，检查异常栈平衡、原错误信息及零净分配。
 
 ## GOSUB：整数返回栈与 switch 分发
 

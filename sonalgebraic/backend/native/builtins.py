@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ...analysis.typesys import is_error, is_null, is_symbol
 from ...core import ast
+from ...core.errors import SonCompileError
 from ...core.names import split_module_member
 from .base import LLVMValue, NativeGenBase
 
@@ -158,7 +159,7 @@ class BuiltinsMixin(NativeGenBase):
         return None
 
     def net_function_call(self, expr: ast.CallExpr) -> LLVMValue | None:
-        """SYS.NET 内置函数 -> runtime 调用。当前支持阻塞 HTTP GET/STATUS。"""
+        """SYS.NET 内置函数 -> runtime 调用，异步 socket 操作返回单消费者 Promise。"""
         split = split_module_member(expr.name)
         if split is None:
             return None
@@ -167,6 +168,23 @@ class BuiltinsMixin(NativeGenBase):
             return None
         member = member.upper()
         args = [LLVMValue("i64", "0", ast.TypeSpec("HANDLE")) if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
+        if member in {"ACCEPT_ASYNC", "RECV_ASYNC", "SEND_ASYNC", "CONNECT_ASYNC"}:
+            if member == "ACCEPT_ASYNC":
+                fn, values = "sa_net_accept_promise", f"i64 {args[0].value}"
+            elif member == "RECV_ASYNC":
+                limit = self.cast_to_i64(args[1])
+                fn, values = "sa_net_recv_promise", f"i64 {args[0].value}, i64 {limit.value}"
+            elif member == "SEND_ASYNC":
+                fn, values = "sa_net_send_promise", f"i64 {args[0].value}, ptr {args[1].value}"
+            else:
+                port = self.cast_to_i64(args[1])
+                fn, values = "sa_net_connect_promise", f"ptr {args[0].value}, i64 {port.value}"
+            self.use_runtime(fn)
+            result = self.next_temp()
+            self.emit(f"  {result} = call i64 @{fn}({values})")
+            promise_type = self.type_of_expr(expr)
+            self.register_temp_cleanup(result, promise_type)
+            return LLVMValue("i64", result, promise_type)
         if member == "GET":
             self.use_runtime("sa_net_http_get")
             temp = self.next_temp()
@@ -696,6 +714,18 @@ class BuiltinsMixin(NativeGenBase):
         if split is None or self.checked.uses.get(split[0]) != "SYS.GUI":
             return None
         member = split[1].upper()
+        if member == "RUN":
+            self.use_runtime("sa_gui_run")
+            result = self.next_temp()
+            self.emit(f"  {result} = call i32 @sa_gui_run()")
+            return self.i32_status(result)
+        if member == "ON_CLICK":
+            widget = self.expr(expr.args[0])
+            handler = LLVMValue("ptr", "null", ast.TypeSpec("SUB")) if isinstance(expr.args[1], ast.NullLiteral) else self.expr(expr.args[1])
+            self.use_runtime("sa_gui_on_click")
+            result = self.next_temp()
+            self.emit(f"  {result} = call i32 @sa_gui_on_click(i64 {widget.value}, ptr {handler.value})")
+            return self.i32_status(result)
         args = [LLVMValue("i64", "0", ast.TypeSpec("HANDLE")) if isinstance(arg, ast.NullLiteral) else self.expr(arg) for arg in expr.args]
         if member == "WINDOW":
             self.use_runtime("sa_gui_window")

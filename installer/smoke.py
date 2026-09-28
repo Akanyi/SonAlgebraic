@@ -31,29 +31,6 @@ import zipfile
 
 INSTALLER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = INSTALLER_DIR.parent
-EXAMPLES_IN_REPO = PROJECT_ROOT / "examples"
-
-# 不能无人值守跑的示例。这些不是坏掉了，是天生需要人或外部环境。
-UNATTENDED_BLOCKLIST = {
-    "gui_hello": "开真窗口并进事件循环，没人点就不退出",
-    "use_io": "SYS.IO 的 INPUT 阻塞等 stdin",
-    "net_tls": "要连外网，网络不通的失败跟 SDK 无关",
-    "desktop": "弹系统消息框，需要人点掉",
-    "web_server": "占端口 8080 等请求，没人访问就要空转到 accept 超时",
-}
-
-# 输出里出现这些字样才算特性真的跑通了，而不只是"没崩"。
-# 内容取自实际运行结果：符号树打印、LIST JOIN、MAP 取值、GOSUB 返回、异常捕获。
-# 这里只放语义稳定的示例——它们的输出是语言语义的体现，不会被随手改动。
-EXPECTED_OUTPUT = {
-    "entity_strings": ["LANS: 99", "SA: 100"],
-    "allexample": ["derivative f'", "caught error", "ffi puts ok"],
-    "symbol": ["(a + (2 * b))"],
-    "lists": ["len=3", "alpha,middle,beta"],
-    "maps": ["alice", "nihao"],
-    "gosub": ["In helper", "Back!"],
-    "errors": ["caught: boom"],
-}
 
 # 验证"编译链路本身是对的"用自带探针，不借 examples 里的东西。
 # hello.sa 就正好在一次构建和一次 smoke 之间被简化过——拿入门示例的具体文案当
@@ -95,15 +72,26 @@ def force_utf8_output() -> None:
             pass
 
 
-def is_library_module(path: Path) -> bool:
-    """判断一个 .sa 是库模块还是可执行程序。
-
-    examples/ 里混着两类东西：mathlib、statslib 这些是给别人 USE 的库，压根没有
-    `SUB main`，拿去 check/run 必然报"程序必须定义 SUB main"。它们的覆盖在
-    slib / spkg 那几项，以及引用它们的 use_*.sa 里。
-    """
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
-    return re.search(r"\bSUB\s+main\b", text, re.IGNORECASE) is None
+def example_catalog(app: Path) -> list[dict]:
+    """读取安装产物中的清单；使用相对路径，多个 main.sa 不会互相覆盖。"""
+    root = app / "examples"
+    catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
+    assert catalog["version"] == 1, "不支持的示例清单版本"
+    entries = catalog["examples"]
+    assert entries, "示例清单为空"
+    paths = set()
+    for entry in entries:
+        path = Path(entry["path"])
+        assert not path.is_absolute() and ".." not in path.parts, entry["path"]
+        assert entry["path"] not in paths, f"重复示例: {path}"
+        paths.add(entry["path"])
+        assert (root / path).is_file(), f"示例或模块漏装: {path}"
+        assert entry["kind"] in {"program", "module"}, path
+        modes = {"none"} if entry["kind"] == "module" else {"auto", "manual"}
+        assert entry["run"] in modes, f"示例运行方式错误: {path}"
+        if entry["run"] == "manual":
+            assert entry.get("reason"), f"手动示例缺少运行条件: {path}"
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +252,17 @@ def check_layout(report: Report, app: Path) -> None:
             assert path.is_dir(), f"缺少目录 {relative}"
             assert any(path.iterdir()), f"{relative} 是空的"
 
-    with check(report, "examples 里的模块依赖齐全"):
-        # use_user_module 这类示例要求同目录有被引用的模块源码，漏装就是编译失败
-        for name in ("mathlib", "statslib", "samath", "mathlib_enhanced"):
-            assert (app / "examples" / f"{name}.sa").is_file(), f"examples 缺少 {name}.sa"
+    with check(report, "示例导航、清单及模块依赖齐全"):
+        assert (app / "examples" / "README.md").is_file(), "示例导航漏装"
+        example_catalog(app)
+
+    with check(report, "VSCode 扩展版本与语法是本次构建内容"):
+        extension = Path("editors/vscode/sonalgebraic")
+        for name in ("package.json", "syntaxes/sonalgebraic.tmLanguage.json"):
+            source = PROJECT_ROOT / extension / name
+            installed = app / extension / name
+            assert installed.is_file(), f"VSCode 扩展漏装 {name}"
+            assert installed.read_bytes() == source.read_bytes(), f"VSCode 扩展不是当前源码: {name}"
 
     with check(report, "sadk-env.cmd 是纯 ASCII"):
         # 踩过的坑：cmd.exe 按控制台原始代码页解析开头几行，那是在 chcp 65001 生效之前。
@@ -312,14 +307,14 @@ def check_cli_surface(report: Report, sonc: Path, app: Path) -> None:
 def check_frontend(report: Report, sonc: Path, app: Path, work: Path) -> None:
     section("前端与诊断")
 
-    examples = sorted(p for p in (app / "examples").glob("*.sa") if not is_library_module(p))
-    with check(report, f"check 全部 {len(examples)} 个可执行示例"):
+    with check(report, "check 清单内全部可执行示例"):
+        examples = [app / "examples" / entry["path"] for entry in example_catalog(app) if entry["kind"] == "program"]
         assert examples, "examples 目录里没有可执行的 .sa"
         broken = []
         for path in examples:
             proc = run([str(sonc), "check", str(path)], timeout=180)
             if proc.returncode != 0:
-                broken.append(f"{path.name}: {tail(proc, 4)}")
+                broken.append(f"{path.relative_to(app / 'examples').as_posix()}: {tail(proc, 4)}")
         assert not broken, "以下示例 check 失败:\n" + "\n".join(broken)
 
     bad = work / "broken.sa"
@@ -346,7 +341,7 @@ def check_frontend(report: Report, sonc: Path, app: Path, work: Path) -> None:
     with check(report, "fmt 重排行号"):
         target = work / "fmt_out.sa"
         assert_ok(
-            run([str(sonc), "fmt", str(app / "examples" / "hello.sa"), "-o", str(target), "--renumber", "20"], timeout=120),
+            run([str(sonc), "fmt", str(app / "examples" / "basics/hello.sa"), "-o", str(target), "--renumber", "20"], timeout=120),
             "fmt",
         )
         numbers = [
@@ -364,7 +359,7 @@ def check_codegen(report: Report, sonc: Path, app: Path, work: Path) -> None:
 
     with check(report, "c 生成单文件 C 且保留 SA 注释"):
         out_c = work / "hello.c"
-        assert_ok(run([str(sonc), "c", str(app / "examples" / "hello.sa"), "-o", str(out_c)], timeout=180), "c")
+        assert_ok(run([str(sonc), "c", str(app / "examples" / "basics/hello.sa"), "-o", str(out_c)], timeout=180), "c")
         text = out_c.read_text(encoding="utf-8")
         assert "/* SA " in text, "生成的 C 里没有 SA 源码行注释"
         assert "int main" in text, "生成的 C 里没有 main"
@@ -373,7 +368,7 @@ def check_codegen(report: Report, sonc: Path, app: Path, work: Path) -> None:
         # 冻结产物漏掉 jinja2 时，只有走到模块头文件生成这一步才会炸——单文件路径根本不碰它
         project = work / "module_project"
         assert_ok(
-            run([str(sonc), "c", str(app / "examples" / "use_user_module.sa"), "-o", str(project)], timeout=180),
+            run([str(sonc), "c", str(app / "examples" / "modules/basic/main.sa"), "-o", str(project)], timeout=180),
             "c 模块项目",
         )
         names = {p.name for p in project.rglob("*") if p.is_file()}
@@ -382,7 +377,7 @@ def check_codegen(report: Report, sonc: Path, app: Path, work: Path) -> None:
 
     with check(report, "native-ir 生成 LLVM IR"):
         out_ll = work / "hello.ll"
-        assert_ok(run([str(sonc), "native-ir", str(app / "examples" / "hello.sa"), "-o", str(out_ll)], timeout=180), "native-ir")
+        assert_ok(run([str(sonc), "native-ir", str(app / "examples" / "basics/hello.sa"), "-o", str(out_ll)], timeout=180), "native-ir")
         text = out_ll.read_text(encoding="utf-8")
         assert "define" in text and "@main" in text, "IR 里没有 main 定义"
 
@@ -400,35 +395,22 @@ def check_end_to_end(report: Report, sonc: Path, app: Path, work: Path, has_comp
         report.skip("端到端编译运行", "这台机器没有可用的 C 编译器")
         return
 
-    examples = sorted(p for p in (app / "examples").glob("*.sa") if not is_library_module(p))
-    covered = set(EXPECTED_OUTPUT) | {"use_user_module"}
-
-    for name, expected in EXPECTED_OUTPUT.items():
-        source = app / "examples" / f"{name}.sa"
-        if not source.is_file():
-            report.skip(f"run {name}.sa", "示例不存在")
+    entries = []
+    with check(report, "读取端到端示例清单"):
+        entries = example_catalog(app)
+    for entry in entries:
+        if entry["kind"] != "program":
             continue
-        with check(report, f"run {name}.sa 输出符合预期"):
+        name = entry["path"]
+        if entry["run"] == "manual":
+            report.skip(f"run {name}", entry["reason"])
+            continue
+        source = app / "examples" / name
+        with check(report, f"run {name} 输出符合预期"):
             proc = run([str(sonc), "run", str(source)], timeout=600, cwd=work)
             assert_ok(proc, f"run {name}")
-            for fragment in expected:
+            for fragment in entry.get("expect", []):
                 assert fragment in proc.stdout, f"输出里没有 {fragment!r}:\n{tail(proc)}"
-
-    with check(report, "run 带用户模块的示例（模块分离编译 + 链接）"):
-        proc = run([str(sonc), "run", str(app / "examples" / "use_user_module.sa")], timeout=600, cwd=work)
-        assert_ok(proc, "run use_user_module")
-        assert proc.stdout.strip(), "模块示例没有任何输出"
-
-    # 剩下的只断言"能跑完"。上面那些有精确断言的就不重复编译了，每个示例都是一次完整
-    # 的 C 编译 + 链接，重复跑纯属浪费。
-    rest = [p for p in examples if p.stem not in UNATTENDED_BLOCKLIST and p.stem not in covered]
-    with check(report, f"run 其余 {len(rest)} 个示例全部退出码 0"):
-        broken = []
-        for path in rest:
-            proc = run([str(sonc), "run", str(path)], timeout=600, cwd=work)
-            if proc.returncode != 0:
-                broken.append(f"{path.name}: 退出码 {proc.returncode}\n{tail(proc, 6)}")
-        assert not broken, "以下示例运行失败:\n" + "\n\n".join(broken)
 
     probe = work / "probe.sa"
     probe.write_text(PROBE_SOURCE, encoding="utf-8")
@@ -454,7 +436,7 @@ def check_packaging(report: Report, sonc: Path, app: Path, work: Path, has_compi
     # zipfile / hashlib 这些只在打包路径上才被 import，冻结漏包时前面所有检查都发现不了
     with check(report, "pack 产出 .spkg"):
         spkg = work / "mathlib.spkg"
-        assert_ok(run([str(sonc), "pack", str(app / "examples" / "mathlib.sa"), "-o", str(spkg)], timeout=180), "pack")
+        assert_ok(run([str(sonc), "pack", str(app / "examples" / "modules/basic/mathlib.sa"), "-o", str(spkg)], timeout=180), "pack")
         assert spkg.is_file() and spkg.stat().st_size > 0, "spkg 是空的"
 
     with check(report, "--pkg 引用 .spkg 编译"):
@@ -463,7 +445,7 @@ def check_packaging(report: Report, sonc: Path, app: Path, work: Path, has_compi
         isolated = work / "pkg_consumer"
         isolated.mkdir(exist_ok=True)
         consumer = isolated / "use_user_module.sa"
-        shutil.copy2(app / "examples" / "use_user_module.sa", consumer)
+        shutil.copy2(app / "examples" / "modules/basic/main.sa", consumer)
         proc = run(
             [str(sonc), "check", str(consumer), "--pkg", str(work / "mathlib.spkg")],
             timeout=180,
@@ -472,13 +454,13 @@ def check_packaging(report: Report, sonc: Path, app: Path, work: Path, has_compi
 
     with check(report, "slib 产出源码包"):
         slib = work / "statslib.slib"
-        assert_ok(run([str(sonc), "slib", str(app / "examples" / "statslib.sa"), "-o", str(slib)], timeout=300), "slib")
+        assert_ok(run([str(sonc), "slib", str(app / "examples" / "modules/statistics/statslib.sa"), "-o", str(slib)], timeout=300), "slib")
         assert slib.is_file() and slib.stat().st_size > 0, "slib 是空的"
 
     with check(report, "USE 引用 .slib 编译"):
         isolated = work / "slib_consumer"
         isolated.mkdir(exist_ok=True)
-        shutil.copy2(app / "examples" / "use_statslib.sa", isolated / "use_statslib.sa")
+        shutil.copy2(app / "examples" / "modules/statistics/main.sa", isolated / "use_statslib.sa")
         shutil.copy2(work / "statslib.slib", isolated / "statslib.slib")
         assert_ok(run([str(sonc), "check", str(isolated / "use_statslib.sa")], timeout=180), "check 引用 slib")
 
@@ -489,7 +471,7 @@ def check_packaging(report: Report, sonc: Path, app: Path, work: Path, has_compi
     with check(report, "slib --binary 产出带静态库的包"):
         binary_slib = work / "statslib_binary.slib"
         assert_ok(
-            run([str(sonc), "slib", str(app / "examples" / "statslib.sa"), "-o", str(binary_slib), "--binary"], timeout=900),
+            run([str(sonc), "slib", str(app / "examples" / "modules/statistics/statslib.sa"), "-o", str(binary_slib), "--binary"], timeout=900),
             "slib --binary",
         )
         with zipfile.ZipFile(binary_slib) as archive:

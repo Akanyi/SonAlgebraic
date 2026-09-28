@@ -12,6 +12,7 @@ SonAlgebraic 的指针不是为了日常编程准备的——普通逻辑用变�
 - [CAST 类型转换](#cast-类型转换)
 - [C FFI 声明](#c-ffi-声明)
 - [完整示例：手工管理的堆内存](#完整示例手工管理的堆内存)
+- [函数指针与回调](#函数指针与回调)
 - [当前限制](#当前限制)
 
 ## 两种指针
@@ -202,8 +203,41 @@ CAST <目标类型> <表达式>
 - 分配失败要检查 `NULL`。
 - C 分配的内存**不由编译器托管**，必须自己 `free`。
 
+## 函数指针与回调
+
+在 FFI 边界上，函数引用 `PTR TO SUB(...)` 就是 C 函数指针（函数引用本身见[第 3 章](./03-subroutines.md#函数引用callable-与-callret)）。`DECLARE C` 的参数和返回值都可以用它，两个方向都通：
+
+- **SA 函数交给 C 当回调**：实参写 `@foo()`，或者一个函数引用变量。
+- **C 函数交给 SA 调用**：`@CB.cfunc()` 取 C 函数的地址，拿到的就是它的裸地址，不经过任何中转函数；原样交回给 C 时，C 那边比较指针也是相等的。
+- **C 返回的函数指针**：返回类型写 `PTR TO SUB(...)`，拿到后当普通函数引用调用。`AS REF` 的函数引用参数也可以用（C 侧是函数指针的指针）。
+
+```basic
+10 USEC "stdlib.h" AS CSTD
+20 DECLARE C SUB CSTD.atexit(f AS PTR TO SUB) AS BOOL
+30 SUB bye AS VOID
+40 PRINT "bye from SA"
+50 .ENDSUB
+60 DIM ok AS BOOL AS VAR
+70 SUB main AS PUBLIC AS VOID
+80 ok = CSTD.atexit(@bye())
+90 PRINT "main done"
+100 .ENDSUB
+110 CALL main
+120 END
+```
+
+输出 `main done`，程序退出时 C 运行时再回调 `bye`，打出 `bye from SA`。
+
+几条规矩：
+
+- **签名必须和 C 一侧逐字节对得上。** 编译器不读 C 头文件，也不生成类型转换的中转函数，函数指针就是原样传递的。SA 的 `NUM AS LONG` 是 `long long`、`BOOL` 是 `int`（映射表见[第 9 章](./09-implementation-notes.md#命名与类型映射)），所以 `int (*)(int)` 这种回调没法用 `SUB(x AS NUM AS LONG) AS NUM AS LONG` 冒充——参数宽度不同，按错误的宽度读寄存器会读到垃圾。
+- **callable 实体（`SUB` 类型）不能过边界**，不管是直接当参数，还是藏在函数引用的签名里。C 不会替它维护引用计数，也不认识它的内存布局。
+- **返回 `STRING` 等托管类型的 C 函数不能取引用。** 经函数引用调用时，SA 会按自己的约定在语句结束时释放返回值；而 C 返回的串归谁所有，编译器无从得知，按 SA 的约定去 `free` 可能释放掉一块静态内存。
+- 回调里抛出的 SA 异常会 `longjmp` 穿过 C 的栈帧。能不能这样穿过去由那个 C 库决定：`qsort` 这种不持有资源的函数一般没事，带锁、带资源的库就别在回调里 `THROW`。
+
 ## 当前限制
 
-- FFI 支持 C 函数调用、`CPTR` 不透明指针和 `PTR TO <类型>` 类型指针。
-- **C struct 字段访问、函数回调、字符串所有权转换**都还没有，需要后续扩展。SA 没有函数指针，所以回调式 API（包括经典的 GUI 回调注册）暂时表达不了——`SYS.GUI` 走的是轮询式事件循环，就是这个原因。
+- FFI 支持 C 函数调用、`CPTR` 不透明指针、`PTR TO <类型>` 类型指针，以及 `PTR TO SUB` 函数指针（见上一节）。
+- **C struct 字段访问、字符串所有权转换**都还没有，需要后续扩展。
+- 回调只能是 SA 里具名的 `SUB`：没有 Lambda，也就没法给 C 回调附带捕获的上下文。C API 若提供 `void* user_data`，可以用它传一个 `CPTR` 来凑合。
 - 指针不参与编译器的资源托管。`ENTITY`、`STRING` 那套自动释放对指针指向的内存无效。

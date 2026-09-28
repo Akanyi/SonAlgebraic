@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ...analysis.semantics import Symbol
-from ...analysis.typesys import is_cptr, is_error, is_handle, is_numeric, is_promise, is_ptr, is_string, is_symbol, same_type_spec
+from ...analysis.typesys import is_cptr, is_error, is_handle, is_numeric, is_promise, is_ptr, is_string, is_sub_ptr, is_sub_type, is_symbol, same_type_spec, sub_signature
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import CGenBase
@@ -24,7 +24,7 @@ class StmtsMixin(CGenBase):
         # 异常穿透清理：若当前帧有存活局部托管资源，且本语句会 CALL 可能抛异常的用户 SUB，
         # 用一个只做清理的 landing pad（setjmp 帧）包住它——被调用方抛出时 longjmp 回这里，
         # 先释放本帧资源再向外层重抛，避免异常穿过本 SUB 时局部泄漏。
-        if self._stmt_may_throw_user_call(stmt):
+        if not self.async_frame_stack and self._stmt_may_throw_user_call(stmt):
             cleanup = self.active_local_resource_cleanup_lines(indent + 1)
             if cleanup:
                 return self._wrap_throw_cleanup(stmt, indent, cleanup)
@@ -46,6 +46,9 @@ class StmtsMixin(CGenBase):
         if isinstance(expr, ast.CallExpr):
             if self.checked.subs.get(expr.name.lower()) is not None or self.resolve_external_sub(expr.name) is not None:
                 return True
+            # 经 callable / 函数引用调用：目标可能是会抛异常的 SA SUB，空引用本身也会抛 ERR_NULL_CALL
+            if self.callable_var_type(expr.name) is not None:
+                return True
             return any(self.expr_has_user_call(arg) for arg in expr.args)
         if isinstance(expr, ast.Binary):
             return self.expr_has_user_call(expr.left) or self.expr_has_user_call(expr.right)
@@ -58,8 +61,10 @@ class StmtsMixin(CGenBase):
         return False
 
     def _wrap_throw_cleanup(self, stmt: ast.Stmt, indent: int, cleanup: list[str]) -> list[str]:
+        return self._wrap_throw_lines(self._emit_stmt(stmt, indent), indent, cleanup)
+
+    def _wrap_throw_lines(self, body: list[str], indent: int, cleanup: list[str]) -> list[str]:
         pad = "    " * indent
-        body = self._emit_stmt(stmt, indent)
         return [
             f"{pad}sa_try_top++;",
             f"{pad}if (SA_SETJMP(sa_try_stack[sa_try_top - 1].env) == 0) {{",
@@ -87,10 +92,18 @@ class StmtsMixin(CGenBase):
             if c_func is not None:
                 prelude, args, cleanup = self.c_call_args_with_prelude(c_func, stmt.args)
                 return [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude), f"{pad}{c_func.name}({', '.join(args)});", *(f"{pad}{line}" for line in cleanup)]
+            indirect = self.callable_call(stmt.name, stmt.args, stmt.line_no)
+            if indirect is not None:
+                prelude, call, cleanup, _ = indirect
+                return [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude), f"{pad}{call};", *(f"{pad}{line}" for line in cleanup)]
             prelude, args, cleanup = self.call_args_with_prelude(stmt.name, stmt.args)
             return [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude), f"{pad}{self.call_c_name(stmt.name)}({', '.join(args)});", *(f"{pad}{line}" for line in cleanup)]
         if isinstance(stmt, ast.TryCatch):
             return self.try_catch_stmt(stmt, indent)
+        if isinstance(stmt, ast.NewSub):
+            return self.new_sub_stmt(stmt, indent)
+        if isinstance(stmt, ast.CallRet):
+            return self.callret_stmt(stmt, indent)
         if isinstance(stmt, ast.ThrowNew):
             prelude, message, cleanup = self.expr_with_prelude(stmt.message)
             return [
@@ -149,6 +162,44 @@ class StmtsMixin(CGenBase):
         if isinstance(stmt, ast.AwaitStmt):
             return self.await_stmt(stmt, indent)
         raise SonCompileError("未知语句类型", stmt.line_no)
+
+    def new_sub_stmt(self, stmt: ast.NewSub, indent: int) -> list[str]:
+        pad = "    " * indent
+        signature = sub_signature(self.type_of(stmt.source))
+        prelude, value, cleanup = self.expr_with_prelude(stmt.source)
+        self.symbols[stmt.name.lower()] = Symbol(stmt.name, signature, True)
+        name = self.c_ident(stmt.name)
+        lines = [
+            self.source_comment(stmt.line_no, indent),
+            *(f"{pad}{line}" for line in prelude),
+            f"{pad}SaCallable* {name} = sa_callable_new({value});",
+            *(f"{pad}{line}" for line in cleanup),
+        ]
+        self.register_local_resource(name, signature)
+        return lines
+
+    def callret_stmt(self, stmt: ast.CallRet, indent: int) -> list[str]:
+        """CALLRET f(args)：先调用、再清理本帧、最后带着 f 的结果返回。结果先落到外层声明的变量里，
+        这样调用可以像普通 CALL 一样包进异常落地垫——RETURN 自己不在落地垫里，return 会跳过 sa_try_top--。"""
+        pad = "    " * indent
+        call = ast.CallExpr(stmt.line_no, stmt.name, stmt.args)
+        return_type = self.current_sub_return_type()
+        lines = [self.source_comment(stmt.line_no, indent)]
+        result: str | None = None
+        if return_type.name == "VOID":
+            # 被调方若有返回值就地丢弃；托管类型的返回值已由 owned_call_result 登记了释放
+            prelude, value, cleanup = self.expr_with_prelude(call)
+            body = [*(f"{pad}{line}" for line in prelude), f"{pad}(void){value};", *(f"{pad}{line}" for line in cleanup)]
+        else:
+            result = self.next_temp()
+            value_lines, temp = self.return_value_lines(call, indent)
+            lines.append(f"{pad}{self.c_type(return_type)} {result};")
+            body = [*value_lines, f"{pad}{result} = {temp};"]
+        landing_cleanup = self.active_local_resource_cleanup_lines(indent + 1)
+        lines.extend(self._wrap_throw_lines(body, indent, landing_cleanup) if landing_cleanup else body)
+        lines.extend(self.active_local_resource_cleanup_lines(indent))
+        lines.append(f"{pad}return;" if result is None else f"{pad}return {result};")
+        return lines
 
     def print_stmt(self, stmt: ast.Print, indent: int) -> list[str]:
         pad = "    " * indent
@@ -215,6 +266,8 @@ class StmtsMixin(CGenBase):
         lines = [f"{pad}{line}" for line in prelude]
         if is_promise(type_spec) or self.adopt_temp_cleanup(value, type_spec, cleanup):
             lines.append(f"{pad}{c_type} {temp} = {value};")
+        elif is_sub_type(type_spec):
+            lines.append(f"{pad}SaCallable* {temp} = sa_callable_retain({value});")
         elif is_string(type_spec):
             lines.append(f"{pad}char* {temp} = sa_strdup({value});")
         elif is_error(type_spec):
@@ -248,6 +301,13 @@ class StmtsMixin(CGenBase):
             return [*self.entity_free_lines(target, type_spec, indent), f"{pad}{target} = {value};"]
         return self.entity_copy_lines(target, value, type_spec, indent)
 
+    def callable_store_lines(self, target: str, value: str, cleanup: list[str], indent: int) -> list[str]:
+        """callable 赋值。刚返回的 callable 临时量直接接管那份计数，其余多持一份。"""
+        pad = "    " * indent
+        if self.adopt_temp_cleanup(value, ast.TypeSpec("SUB"), cleanup):
+            return [f"{pad}sa_callable_release({target});", f"{pad}{target} = {value};"]
+        return [f"{pad}sa_callable_set(&{target}, {value});"]
+
     def discarded_call_lines(self, call: str, return_type: ast.TypeSpec, indent: int) -> list[str]:
         """丢弃返回值的调用（TRY CALL f()）：托管类型的返回值归调用方所有，不接就得当场释放。"""
         pad = "    " * indent
@@ -280,9 +340,13 @@ class StmtsMixin(CGenBase):
             init = "{0}"
         if is_error(stmt.type_spec):
             init = '{0, "ERR_NONE", NULL, 0, NULL}'
-        if is_symbol(stmt.type_spec):
+        if is_symbol(stmt.type_spec) or is_sub_type(stmt.type_spec):
             init = "NULL"
         if in_frame:
+            if self._is_managed_type(stmt.type_spec):
+                lines.append(f"{pad}f->sa_borrowed_{self.c_ident(stmt.name)} = 0;")
+            if init.startswith("{"):
+                init = f"({self.c_type(stmt.type_spec)}){init}"
             lines.append(f"{pad}{name} = {init};")
         else:
             lines.append(f"{pad}{self.c_type(stmt.type_spec)} {name} = {init};")
@@ -308,6 +372,8 @@ class StmtsMixin(CGenBase):
             lines.extend(f"{pad}{line}" for line in prelude)
             if is_string(stmt.type_spec):
                 lines.extend(self.string_store_lines(name, value, cleanup, indent))
+            elif is_sub_type(stmt.type_spec):
+                lines.extend(self.callable_store_lines(name, value, cleanup, indent))
             elif stmt.type_spec.name == "ENTITY" and self.type_has_managed_resources(stmt.type_spec):
                 lines.extend(self.entity_store_lines(name, value, stmt.type_spec, cleanup, indent))
             else:
@@ -337,11 +403,15 @@ class StmtsMixin(CGenBase):
             lines.extend(self.moved_source_reset_lines(source_c, target_type, indent))
         else:
             self.unregister_local_resource(target_c)
+            if self.async_frame_stack and target_c.startswith("f->"):
+                lines.append(f"{pad}f->sa_borrowed_{self.c_ident(stmt.target.name)} = 1;")
         return lines
 
     def assign_stmt(self, stmt: ast.Assign, indent: int) -> list[str]:
         pad = "    " * indent
-        if stmt.mode != "copy":
+        # 函数引用不持有任何资源，f= 就是普通赋值（m= 语义层已拦下），不走所有权转移
+        fn_ref = isinstance(stmt.expr, ast.SubRef) or (isinstance(stmt.target, ast.VarRef) and is_sub_ptr(self.type_of(stmt.target)))
+        if stmt.mode != "copy" and not fn_ref:
             return self.ownership_assign_stmt(stmt, indent)
         # SYMBOL 变量赋值走独立路径：symbol_expr 自带 prelude（DERIV/SUBST 产生临时量）
         if isinstance(stmt.target, ast.VarRef) and is_symbol(self.type_of(stmt.target)):
@@ -359,8 +429,18 @@ class StmtsMixin(CGenBase):
         lines = [self.source_comment(stmt.line_no, indent), *(f"{pad}{line}" for line in prelude)]
 
         if isinstance(stmt.target, ast.Deref):
-            target_expr = self.expr(stmt.target.expr)
             target_type = self.type_of(stmt.target)
+            if target_type.name == "ENTITY" and self.type_has_managed_resources(target_type):
+                target_prelude, target_expr, target_cleanup = self.expr_with_prelude(stmt.target.expr)
+                lines.extend(f"{pad}{line}" for line in target_prelude)
+                # 逐字段复制会反复引用目标，先固定地址，避免指针调用被重复求值。
+                target_ptr = self.next_temp()
+                lines.append(f"{pad}{self.c_type(target_type)}* {target_ptr} = {target_expr};")
+                lines.extend(self.entity_store_lines(f"(*{target_ptr})", value, target_type, cleanup, indent))
+                lines.extend(f"{pad}{line}" for line in target_cleanup)
+                lines.extend(f"{pad}{line}" for line in cleanup)
+                return lines
+            target_expr = self.expr(stmt.target.expr)
             if is_string(target_type):
                 lines.append(f"{pad}sa_set_string(({target_expr}), {value});")
             else:
@@ -387,6 +467,8 @@ class StmtsMixin(CGenBase):
         if is_string(target_type):
             target_name = self.c_value(name) if target_root.by_ref else self.c_ident_path(name)
             lines.extend(self.string_store_lines(target_name, value, cleanup, indent))
+        elif is_sub_type(target_type):
+            lines.extend(self.callable_store_lines(self.c_value(name), value, cleanup, indent))
         elif target_type.name == "ENTITY" and self.type_has_managed_resources(target_type):
             lines.extend(self.entity_store_lines(self.c_value(name), value, target_type, cleanup, indent))
         else:
@@ -428,15 +510,17 @@ class StmtsMixin(CGenBase):
         lines.append(f"{pad}    sa_try_top--;")
         lines.append(f"{pad}}} else {{")
         lines.append(f"{pad}    sa_try_top--;")
-        lines.append(f"{pad}    sa_set_error(&{self.c_ident(stmt.traceback_var)}, &sa_current_error);")
+        lines.append(f"{pad}    sa_set_error(&{self.c_value(stmt.traceback_var)}, &sa_current_error);")
 
         for index, branch in enumerate(stmt.catches):
             prefix = "if" if index == 0 else "else if"
             condition = "1" if branch.error_type == "ERR_ANY" else f"strcmp(sa_current_error.type, \"{branch.error_type}\") == 0"
             lines.append(f"{pad}    {prefix} ({condition}) {{")
             lines.append(self.source_comment(branch.line_no, indent + 2))
-            alias_c = self.c_ident(branch.alias)
-            if self.current_sub_has_gosub() or self.current_sub_has_goto():
+            alias_c = self.c_ident_path(branch.alias)
+            if self.async_frame_stack:
+                pass
+            elif self.current_sub_has_gosub() or self.current_sub_has_goto():
                 # 提升到函数作用域：GOSUB RETURN 的 goto 会跳回 CATCH 块内返回标签，
                 # GOTO 可能从 CATCH 块内直接跳出——两者都会跨过/跳过块尾的清理。
                 self.hoisted_catch_vars[alias_c] = alias_c
@@ -448,7 +532,7 @@ class StmtsMixin(CGenBase):
             self.scope_stack.append(branch_scope)
             lines.extend(self.block(branch.body, indent + 2))
             self.scope_stack.pop()
-            lines.append(f"{pad}        sa_error_clear(&{self.c_ident(branch.alias)});")
+            lines.append(f"{pad}        sa_error_clear(&{alias_c});")
             lines.append(f"{pad}    }}")
 
         lines.append(f"{pad}    else {{")

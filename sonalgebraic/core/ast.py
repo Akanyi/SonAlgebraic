@@ -11,6 +11,10 @@ class TypeSpec:
     inner: "TypeSpec | None" = None
     # 定长数组的元素个数；None 表示非数组。数组的元素类型是去掉 array_size 的同一 TypeSpec。
     array_size: int | None = None
+    # 只对 name == "SUB" 有意义：callable 的参数表（返回类型放 inner，与 PTR TO / PROMISE OF 同构）。
+    # 复用 Param 而不是另造一个「无名参数」类型，是为了让签名能直接喂给 check_call_args /
+    # call_args_with_prelude 这些吃 `.params` 的现成路径；名字和行号不参与 same_type_spec 比较。
+    params: "tuple[Param, ...] | None" = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,22 @@ class Assign(Stmt):
 class Call(Stmt):
     name: str
     args: list["Expr"]
+
+
+@dataclass(frozen=True)
+class CallRet(Stmt):
+    """CALLRET name(args)：把 callable 当作当前 SUB 的返回出口。调用它、然后本 SUB 就此终结，
+    其后语句不可达。name 是 callable 实体或 PTR TO SUB 变量（可带 ENTITY 字段路径）。"""
+    name: str
+    args: list["Expr"]
+
+
+@dataclass(frozen=True)
+class NewSub(Stmt):
+    """NEW SUB name FROM ptr：从函数引用生成一个有本块生命周期的 callable 实体并绑定到 name。
+    没有 .ENDSUB——它不定义函数体。类型由 source 的签名推出，所以这里不带 type_spec。"""
+    name: str
+    source: "Expr"
 
 
 @dataclass(frozen=True)
@@ -291,6 +311,13 @@ class Deref(Expr):
 @dataclass(frozen=True)
 class AddressOf(Expr):
     expr: Expr
+
+
+@dataclass(frozen=True)
+class SubRef(Expr):
+    """@name()：取函数引用，类型是 PTR TO SUB(签名)。尾随的空括号是语法层区分「取函数」与
+    「取变量地址」的记号，不是调用。name 可以是本地 SUB、USE 模块的 SUB 或 DECLARE C 的函数。"""
+    name: str
 
 
 @dataclass(frozen=True)

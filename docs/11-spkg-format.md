@@ -263,7 +263,7 @@ mylib.spkg (zip)
 单个文件打包为根模块：
 
 ```powershell
-python -m sonalgebraic pack examples/mathlib.sa -o build/mathlib.spkg
+python -m sonalgebraic pack examples/modules/basic/mathlib.sa -o build/mathlib.spkg
 ```
 
 得到的 zip 只有两个条目：

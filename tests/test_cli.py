@@ -11,7 +11,7 @@ from sonalgebraic.driver.formatter import renumber_source
 
 
 def test_cli_check_command_returns_zero() -> None:
-    assert cli_main(["check", "examples/hello.sa"]) == 0
+    assert cli_main(["check", "examples/basics/hello.sa"]) == 0
 
 
 def test_cli_native_ir_command_writes_llvm_ir() -> None:
@@ -19,7 +19,7 @@ def test_cli_native_ir_command_writes_llvm_ir() -> None:
         output = Path(temp) / "hello.ll"
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
-            exit_code = cli_main(["native-ir", "examples/hello.sa", "-o", str(output)])
+            exit_code = cli_main(["native-ir", "examples/basics/hello.sa", "-o", str(output)])
 
         assert exit_code == 0
         assert stderr.getvalue() == ""

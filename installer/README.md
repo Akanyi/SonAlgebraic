@@ -83,7 +83,7 @@ python installer/smoke.py --integration  # 连 PATH / 文件关联一起测（�
 python installer/smoke.py --keep         # 跑完不卸载，留着人工看
 ```
 
-全开时 51 项检查，覆盖安装布局、CLI 表层、诊断、代码生成、端到端编译运行、打包、工具链隔离、
+覆盖安装布局、VSCode 扩展、CLI 表层、诊断、代码生成、端到端编译运行、打包、工具链隔离、
 卸载残留和注册表清理。默认全程只碰一个临时目录，跑完自动卸载；失败不中断，一次列完所有问题。
 
 **和 pytest 那套的分工。** `tests/` 测的是编译器逻辑，跑的是仓库里的 Python 源码。smoke 测的是
@@ -99,8 +99,9 @@ python installer/smoke.py --keep         # 跑完不卸载，留着人工看
 - **工具链隔离**：把 PATH 砍到只剩 `System32`，验证只靠 SADK 自带的 zig 也能编译运行——这是
   「用户机器上什么都没装」这个场景的唯一真实证明。
 - **PATH 精确恢复**：卸载后逐字节比对安装前的用户 PATH，并确认值类型仍是 `REG_EXPAND_SZ`。
-- **库模块识别**：`examples/` 里混着 `mathlib.sa` 这类没有 `SUB main` 的库，smoke 按有没有 main
-  自动区分，库走 slib / spkg 那几项覆盖，不会拿去当主程序跑。
+- **示例清单**：`examples/catalog.json` 明确区分程序、库模块与手动运行条件，smoke 从安装目录读取清单，
+  自动项逐个运行并核对输出，手动项报告运行条件；库通过同目录 `main.sa` 和 slib / spkg 路径验证。
+  安装器递归保留示例子目录，同时打包导航和清单，避免只收集根目录 `.sa` 而漏装。
 
 
 ## 安装后的布局

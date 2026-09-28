@@ -1,0 +1,22 @@
+10 REM 先取得 Promise，再用 SYNC/AWAIT 消费；纯计算示例。
+20 ASYNC SUB twice(value AS NUM AS LONG) AS NUM AS LONG
+30     RETURN value * 2
+40 .ENDSUB
+50 ASYNC SUB join() AS NUM AS LONG
+60     DIM left AS PROMISE OF NUM AS LONG AS VAR
+70     DIM right AS PROMISE OF NUM AS LONG AS VAR
+80     DIM a AS NUM AS LONG AS VAR
+90     DIM b AS NUM AS LONG AS VAR
+100     left = CALL twice(10)
+110     right = CALL twice(20)
+120     a = AWAIT left
+130     b = AWAIT right
+140     RETURN a + b
+150 .ENDSUB
+160 SUB main AS PUBLIC AS VOID
+170     DIM result AS NUM AS LONG AS VAR
+180     result = SYNC join()
+190     PRINT result
+200 .ENDSUB
+210 CALL main
+220 END

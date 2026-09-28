@@ -90,7 +90,7 @@
 
 输出 `2`。
 
-托管字段的实现细节见[第 9 章](./09-implementation-notes.md#entity-的字符串字段)。当前限制：`ENTITY` 内的 `SYMBOL` 字段不做深层 clone/free 托管。
+托管字段的实现细节见[第 9 章](./09-implementation-notes.md#entity-的字符串字段)。`SYMBOL` 字段在 C/native 两个后端均递归深拷贝和释放，嵌套实体、按值传参及返回也遵循独立所有权。
 
 ## ENUM 枚举
 

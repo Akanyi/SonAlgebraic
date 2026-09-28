@@ -1,6 +1,6 @@
 """SA 协程（ASYNC / AWAIT / SYNC / PROMISE）测试。
 
-阶段 0：解析、语义约束、类型推断、native 拒绝（不生成协程 C）。
+阶段 0：解析、语义约束、类型推断、native 状态机 IR。
 阶段 1：codegen 结构断言 + 端到端编译运行 + 无泄漏——把无栈状态机、
 事件循环、PROMISE 结果搬运、资源清理融合一起压实。
 """
@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from conftest import compile_c, expect_error, requires_c_compiler
+from conftest import build_temp, compile_c, expect_error, requires_c_compiler
 from sonalgebraic.analysis.semantics import check_program
 from sonalgebraic.backend.native import generate_native_llvm_ir
 from sonalgebraic.core import ast
@@ -281,13 +281,15 @@ def test_try_call_of_async_is_rejected() -> None:
 
 # --- native 后端拒绝 ASYNC SUB（首期不接，纯 Python 校验、不需编译器） ---
 
-def test_native_backend_rejects_async() -> None:
+def test_native_backend_supports_async() -> None:
     checked = check_program(parse_program(
         "10 ASYNC SUB a() AS NUM AS LONG\n20 RETURN 1\n30 .ENDSUB\n"
         "40 SUB main AS PUBLIC AS VOID\n50 DIM x AS NUM AS LONG AS VAR\n60 x = SYNC a()\n70 .ENDSUB\n"
     ))
-    with pytest.raises(SonCompileError, match="ASYNC"):
-        generate_native_llvm_ir(checked)
+    ir = generate_native_llvm_ir(checked)
+    assert "define i64 @sa_a_start(" in ir
+    assert "define void @sa_a_resume(" in ir
+    assert "call void @sa_event_loop_run_until(" in ir
 
 
 # --- 阶段 1：codegen 结构断言（生成的 C 长成无栈状态机的样子） ---
@@ -499,14 +501,18 @@ def test_net_async_emits_promise_primitives() -> None:
     assert "sa_async_poll_one" in c         # WSAPoll/poll 抽象
 
 
-def test_native_backend_rejects_async_net_server() -> None:
-    """echo server 含 ASYNC SUB，native 后端首期整体拒绝。"""
+def test_native_backend_supports_async_net_server() -> None:
+    """纯 IR 验证网络协程使用共享运行时，不启动监听或发起连接。"""
     checked = check_program(parse_program(_ECHO_SERVER_TEMPLATE.format(port=8099)))
-    with pytest.raises(SonCompileError, match="ASYNC"):
-        generate_native_llvm_ir(checked)
+    ir = generate_native_llvm_ir(checked)
+    assert "define i64 @sa_accept_one_start(" in ir
+    assert "call i64 @sa_net_accept_promise(" in ir
+    assert "call i64 @sa_net_recv_promise(" in ir
+    assert "call i64 @sa_net_send_promise(" in ir
+    assert "call void @sa_coro_await(" in ir
 
 
-# --- 阶段 2：端到端真实 socket（仅 C 后端；native 由上面的拒绝测试覆盖） ---
+# --- 阶段 2：C 端到端真实 socket；native 见 test_native_async_integration.py ---
 
 @requires_c_compiler
 def test_e2e_async_echo_server() -> None:
@@ -554,8 +560,8 @@ def test_e2e_async_echo_server() -> None:
 
 
 def test_async_echo_example_stays_async() -> None:
-    """examples/async_echo_server.sa 是异步 I/O 的样板，退化成同步就失去意义。"""
-    source = (Path(__file__).resolve().parents[1] / "examples" / "async_echo_server.sa").read_text(encoding="utf-8")
+    """examples/async/echo_server.sa 是异步 I/O 的样板，退化成同步就失去意义。"""
+    source = (Path(__file__).resolve().parents[1] / "examples" / "async" / "echo_server.sa").read_text(encoding="utf-8")
     assert "ASYNC SUB" in source
     assert "AWAIT N.ACCEPT_ASYNC" in source
     assert "AWAIT N.RECV_ASYNC" in source
@@ -906,6 +912,126 @@ def test_e2e_async_concurrent_connections() -> None:
 
 
 # --- 阶段 3：drop / 取消 + 挂起协程安全回收 ---
+
+@requires_c_compiler
+@pytest.mark.parametrize("kind", ["SYMBOL", "ERROR"])
+@pytest.mark.parametrize("lifecycle", ["complete", "caller_free", "drop_unstarted", "cancel_suspended"])
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_async_managed_param_owns_snapshot(kind: str, lifecycle: str, opt: str) -> None:
+    """用真实帧校验深拷贝，并精确停在取消点；净分配检查覆盖帧和整棵符号树。
+
+    C 驱动能原地修改调用方树的叶节点，避免普通赋值更换根指针掩盖浅层 clone，
+    也能在子协程尚未运行时断言父帧确实挂起，防止取消用例误走正常完成路径。
+    """
+    gcc = shutil.which("gcc")
+    if gcc is None:
+        pytest.skip("需要 gcc 做 malloc 计数插桩")
+    source = (
+        "10 ASYNC SUB tick() AS VOID\n20 RETURN\n30 .ENDSUB\n"
+        f"40 ASYNC SUB worker(value AS {kind}) AS NUM AS LONG\n"
+        "50 AWAIT tick()\n60 PRINT value\n70 RETURN 7\n80 .ENDSUB\n"
+        "90 SUB main AS PUBLIC AS VOID\n100 .ENDSUB\n110 CALL main\n120 END\n"
+    )
+    if kind == "SYMBOL":
+        setup = """
+            SaSymbol original = sa_symbol_new(SA_SYM_OP, NULL, '+',
+                sa_symbol_new(SA_SYM_VAR, "x", 0, NULL, NULL),
+                sa_symbol_new(SA_SYM_OP, NULL, '*',
+                    sa_symbol_new(SA_SYM_CONST, "2", 0, NULL, NULL),
+                    sa_symbol_new(SA_SYM_CONST, "3", 0, NULL, NULL)));
+        """
+        snapshot = "check_tree(frame->sa_value, original);"
+        mutate = "original->left->text[0] = 'y'; assert(strcmp(frame->sa_value->left->text, \"x\") == 0);"
+        clear = "sa_symbol_free(original); original = NULL;"
+        intact = "assert(strcmp(original->left->text, \"x\") == 0);"
+        expected = "(x + (2 * 3))"
+    else:
+        setup = 'SaError original = {42, "ERR_SAMPLE", sa_strdup("original message"), 123, "caller"};'
+        snapshot = """
+            assert(frame->sa_value.message != original.message);
+            assert(strcmp(frame->sa_value.message, original.message) == 0);
+            assert(frame->sa_value.err_code == 42);
+            assert(strcmp(frame->sa_value.type, "ERR_SAMPLE") == 0);
+            assert(frame->sa_value.line_number == 123);
+            assert(strcmp(frame->sa_value.sub_name, "caller") == 0);
+        """
+        mutate = 'original.message[0] = \'X\'; assert(strcmp(frame->sa_value.message, "original message") == 0);'
+        clear = "sa_error_clear(&original);"
+        intact = 'assert(strcmp(original.message, "original message") == 0);'
+        expected = "original message"
+    if lifecycle == "caller_free":
+        before = mutate + clear
+        after = ""
+    else:
+        before = ""
+        after = intact + clear
+    if lifecycle in {"complete", "caller_free"}:
+        action = """
+            sa_event_loop_run_until(promise);
+            assert(sa_async_slot(promise)->coro == NULL);
+            assert(sa_promise_take_long(promise) == 7);
+            sa_promise_release(promise);
+        """
+    elif lifecycle == "drop_unstarted":
+        action = "assert(frame->base.state == 0); sa_promise_release(promise);"
+    else:
+        action = """
+            assert(sa_ready_queue[sa_ready_head] == promise);
+            sa_ready_head = (sa_ready_head + 1) % SA_ASYNC_SLOT_COUNT;
+            frame->base.resume(&frame->base);
+            assert(frame->base.state != 0);
+            SaHandle child = frame->base.awaited;
+            assert(child != 0);
+            assert(sa_async_slot(child)->status == SA_PROMISE_PENDING);
+            assert(sa_async_slot(child)->waiter == promise);
+            sa_promise_release(promise);
+            assert(sa_async_slot(child) == NULL);
+        """
+    # 只替换入口，保留真实生成的 start / resume / cleanup 和完整运行时。
+    c_text = compile_c(source).replace("int main(void) {", "int sa_test_unused_main(void) {", 1)
+    tree_check = """
+        static void check_tree(SaSymbol copy, SaSymbol original) {
+            if (!original) { assert(copy == NULL); return; }
+            assert(copy && copy != original);
+            assert(copy->kind == original->kind && copy->op == original->op);
+            if (original->text) {
+                assert(copy->text != original->text);
+                assert(strcmp(copy->text, original->text) == 0);
+            }
+            check_tree(copy->left, original->left);
+            check_tree(copy->right, original->right);
+        }
+    """ if kind == "SYMBOL" else ""
+    c_text = _LEAK_SHIM + "\n#include <assert.h>\n" + c_text + tree_check + f"""
+        int main(void) {{
+            {setup}
+            SaHandle promise = sa_worker_start(original);
+            SaCoro_sa_worker* frame = (SaCoro_sa_worker*)sa_async_slot(promise)->coro;
+            {snapshot}
+            {before}
+            {action}
+            assert(sa_async_slot(promise) == NULL);
+            {after}
+            /* 在全局退出兜底之前检查，防止兜底回收掩盖当前路径泄漏。 */
+            assert(sa__live == 0);
+            sa__rep();
+            return 0;
+        }}
+    """
+    with build_temp("coro-param-", subdir="coroutine-tests") as temp:
+        c_path = Path(temp) / "param.c"
+        c_path.write_text(c_text, encoding="utf-8")
+        exe = _exe_path(Path(temp), "param")
+        compiled = subprocess.run([gcc, str(c_path), opt, "-std=c11", "-o", str(exe), "-lm"], text=True, capture_output=True, timeout=60)
+        assert compiled.returncode == 0, compiled.stderr
+        proc = subprocess.run([str(exe)], text=True, capture_output=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert "SA_LIVE=0" in proc.stderr
+    if lifecycle in {"complete", "caller_free"}:
+        assert expected in proc.stdout
+    else:
+        assert proc.stdout == ""
+
 
 # CALL 得到 promise 却不 AWAIT：pending 协程被 release 时，帧内 strdup 的参数/局部得清理，
 # 否则泄漏。echo 的 STRING 参数在 start 时 strdup 进帧——run 丢弃 p 就触发这条回收路径。

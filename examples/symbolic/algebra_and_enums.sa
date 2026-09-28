@@ -1,4 +1,4 @@
-10 REM 第四批特性验证：内置常量 + 枚举 + SYMBOL 代数
+10 REM 枚举、数学常量与 SYMBOL 求导、化简、代入求值
 20 USE SYS.MATH AS M
 30 ENUM Planet
 40 MERCURY

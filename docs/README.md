@@ -17,6 +17,7 @@
 | 9 | [实现说明](./09-implementation-notes.md) | 生成的 C 长什么样：命名映射、资源清理、异常、`GOSUB` |
 | 10 | [.slib 格式规范](./10-slib-format.md) | 单模块库包：zip 布局、manifest、三种打包形态 |
 | 11 | [.spkg 格式规范](./11-spkg-format.md) | 多模块自包含包：manifest、解包安全、构建时选择 |
+| 12 | [异步子程序与 Promise](./12-async.md) | 三种取值方式、并发等待、网络 I/O、错误传播与取消边界 |
 
 ## 怎么读
 

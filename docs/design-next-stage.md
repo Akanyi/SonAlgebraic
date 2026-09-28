@@ -12,7 +12,7 @@
 
 > C struct 字段访问、**函数回调、字符串所有权转换**都还没有，需要后续扩展。SA 没有**函数指针**，所以回调式 API（包括经典的 GUI 回调注册）暂时表达不了——`SYS.GUI` 走的是轮询式事件循环，就是这个原因。
 
-本文的**函数指针（`PTR TO SUB`）、托管回调、所有权语义（`= / f= / m=`）、托管 HANDLE、异步模型、以及 Context Manager 上下文治理体系**，就是来平这几笔账的（所有权语义和异步模型已经先落地了）。它们不是各自独立的语法糖，而是围绕一个共同哲学长出来的七个面：
+本文的**函数指针（`PTR TO SUB`）、托管回调、所有权语义（`= / f= / m=`）、托管 HANDLE、异步模型、以及 Context Manager 上下文治理体系**，就是来平这几笔账的（所有权语义、异步模型、函数指针和 GUI 托管回调已经落地，第 6 章那两笔「没有函数指针 / 回调」的账已销）。它们不是各自独立的语法糖，而是围绕一个共同哲学长出来的七个面：
 
 > **边界不允许隐式穿透。** 作用域、扩展链、所有权、执行上下文、异步实例，每一处都有明确的屏障；跨越屏障必须显式，且身份与权限会随之改变。
 
@@ -20,11 +20,11 @@
 
 | 方向 | 关键构造 | 解决的问题 | 进度 |
 |---|---|---|---|
-| [一、函数模型](#一函数模型) | `REAL`/`VIRTUAL SUB`、`PTR TO SUB`、`NEW SUB`、Lambda、托管回调、`CALLRET`、实体函数 | 函数有了正式的身份、指针、生命周期和回调出口 | 未动 |
+| [一、函数模型](#一函数模型) | `REAL`/`VIRTUAL SUB`、`PTR TO SUB`、`NEW SUB`、Lambda、托管回调、`CALLRET`、实体函数 | 函数有了正式的身份、指针、生命周期和回调出口 | `PTR TO SUB`、`NEW SUB`、`CALLRET`、GUI 托管回调 ✅（C/native）；REAL/VIRTUAL、Lambda、实体函数未动 |
 | [二、扩展模型](#二扩展模型) | `EXTEND`、`BEFORE`/`AFTER`/`FINALLY`、`TAG`、`::tag` | 不改签名地向执行结构注入，且注入能力可显式转发、可截断 | 未动 |
 | [三、作用域模型](#三作用域模型) | Runtime / Instance / Internal+Public Scope、Scope Barrier | 函数身份随作用域边界改变，是整套设计的地基 | 未动 |
-| [四、资源模型](#四资源模型) | `= / f= / m=`、托管 HANDLE、callable ownership | 复制/借用/移动三分，作用域绑定的 RAII | `= / f= / m=` 与 `RETURN` 所有权 ✅；托管 HANDLE、callable ownership 未动 |
-| [五、异步模型](#五异步模型) | `ASYNC SUB`、`PROMISE OF`、`CALL`/`AWAIT`/`SYNC` | 真正的异步函数与三种取值方式 | ✅ C 后端；native 后端拒绝 `ASYNC SUB` |
+| [四、资源模型](#四资源模型) | `= / f= / m=`、托管 HANDLE、callable ownership | 复制/借用/移动三分，作用域绑定的 RAII | `= / f= / m=`、`RETURN` 所有权、callable ownership ✅；托管 HANDLE 未动 |
+| [五、异步模型](#五异步模型) | `ASYNC SUB`、`PROMISE OF`、`CALL`/`AWAIT`/`SYNC` | 真正的异步函数与三种取值方式 | ✅ C/native 核心状态机；native 特有边界见第 12 章 |
 | [六、上下文治理模型（Context Manager）](#六上下文治理模型context-manager) | Handle Switcher、Scope Exchanger、`SYS.MULTIPROCESS[WORKER/FORK]` | 资源操作权交接、跨域函数能力转换、多进程并发治理 | 未动 |
 | [七、开发体验](#七开发体验) | SA lint、自动行号、SA Traceback | 行号不再靠手维护，崩溃回映射到 SA 世界 | 行号 ✅；Traceback 只有编译期 |
 
@@ -36,8 +36,10 @@
 |---|---|---|
 | `= / f= / m=` 复制 / 借用 / 移动（[4.1](#41-复制--借用--移动--f--m已落地)） | `STRING` / `SYMBOL` / `ERROR` / 含托管字段的 `ENTITY`；C 与 native 两个后端；借用存续期间源在**编译期冻结** | [第 2 章 · 赋值：复制、借用、移动](./02-language-basics.md#赋值复制借用移动)、[第 9 章 · 借用与移动如何接进清理登记](./09-implementation-notes.md#借用与移动如何接进清理登记)、`tests/test_ownership.py` |
 | `RETURN` 的所有权交接（[4.1](#41-复制--借用--移动--f--m已落地)） | 本帧局部整体搬出、搬不动的深拷贝、临时量直接接管；调用方接管或语句尾释放；两个后端 | [第 9 章 · RETURN 交出去的是一份独立所有权](./09-implementation-notes.md#return-交出去的是一份独立所有权)、`tests/test_return_ownership.py` |
-| `ASYNC SUB` / `PROMISE OF <T>` / `CALL` / `AWAIT` / `SYNC`（[5.1](#51-async-sub--promise--call--await--sync已落地)） | 三种取值方式、独立 `AWAIT` / `SYNC` 语句、`SYS.NET` 的 `*_ASYNC` 原语、跨模块调用；**仅 C 后端** | `tests/test_coroutines.py`；**用户章节还没写**，语法速览暂在 5.1 |
+| `ASYNC SUB` / `PROMISE OF <T>` / `CALL` / `AWAIT` / `SYNC`（[5.1](#51-async-sub--promise--call--await--sync已落地)） | 三种取值方式、异步网络、跨模块调用、异常清理及原错误传播；**C/native** | [第 12 章](./12-async.md)、`tests/test_coroutines.py`、`tests/test_async_errors.py`、`tests/test_async_diagnostics.py`、`tests/test_native_coroutines.py`、`tests/test_native_async_integration.py` |
 | 自动行号（[7.1](#71-sa-lint-与自动行号部分落地)，部分） | `sonc fmt --renumber`、`USE SYS.LINT AS NONE_NUMBER` | [第 1 章](./01-getting-started.md) |
+| `PTR TO SUB` / `@foo()` / `NEW SUB ... FROM` / `CALLRET`（[1.2](#12-函数指针-ptr-to-sub已落地)、[1.3](#13-new-sub--from-ptr生成局部-callable-实体已落地)、[1.6](#16-callret以回调替代-return-的控制流出口已落地)、[4.3](#43-callable-ownership已落地)） | 函数引用、引用计数 callable、`CALLRET` 终结语句；FFI 上对标 C 函数指针；**C/native** | [第 3 章 · 函数引用、callable 与 CALLRET](./03-subroutines.md#函数引用callable-与-callret)、[第 6 章 · 函数指针与回调](./06-pointers-and-ffi.md#函数指针与回调)、[第 9 章 · 函数引用与 callable](./09-implementation-notes.md#函数引用与-callable)、`tests/test_function_model.py`、`tests/test_native_function_model.py` |
+| GUI 托管回调（[1.5](#15-托管回调部分落地)，部分） | `SYS.GUI.ON_CLICK` / `RUN`，复用现有事件队列；timer / 网络事件未动 | [第 8 章 · SYS.GUI](./08-stdlib.md#sysgui-窗口界面) |
 | SA Traceback（[7.2](#72-sa-traceback部分落地)，部分） | 只有 C **编译期**报错反查 SA 行；运行期 traceback 未动 | [第 9 章 · 行号溯源注释](./09-implementation-notes.md#行号溯源注释) |
 
 ---
@@ -76,7 +78,7 @@ SUB foo(...)
 
 > 术语衔接：现有实现里 C 函数通过 [`DECLARE C SUB`](./06-pointers-and-ffi.md#c-ffi-声明) 注册、模块通过 [`USE`](./07-modules.md) 导入。本文的“有名虚函数”就是这两类导入函数在当前实例里的身份归类。
 
-### 1.2 函数指针 `PTR TO SUB`【方向已定】
+### 1.2 函数指针 `PTR TO SUB`【已落地】
 
 正式的函数指针类型，与现有 [`PTR TO T`](./06-pointers-and-ffi.md#两种指针) 同族：
 
@@ -109,7 +111,13 @@ a m= @foo()
 
 理由干净利落——函数引用**不持有函数代码的所有权**，没有可转移的东西，`m=` 自然非法。这条约束和[资源模型](#四资源模型)里的所有权规则是同一套。
 
-### 1.3 `NEW SUB ... FROM ptr`：生成局部 callable 实体【方向已定】
+> 落地说明（用法见[第 3 章](./03-subroutines.md#函数引用callable-与-callret)）：
+>
+> - 带签名的写法是 `PTR TO SUB(x AS NUM AS LONG) AS NUM AS LONG`，裸写 `PTR TO SUB` 等于无参 `VOID`；签名比较不看参数名。调用直接写 `op(3)`，空引用调用抛 `ERR_NULL_CALL`。
+> - `@` 的两种语义靠尾随 `()` 在语法层区分，`@foo()` 能取本文件 `SUB`、用户模块 `PUBLIC SUB` 和 `DECLARE C` 函数。
+> - **FFI 边界上对标 C 函数指针，内部表示可以养胖。** 现在内部就是瘦指针（`SaSubFn`），出入 FFI 原样传递、不生成中转函数，`@CB.cfunc()` 拿到的是裸地址。转换只集中在 codegen 的一个点上，将来为 Lambda 换成 `{fn, env}` 胖指针时，FFI 一侧只改那一处（见[第 9 章](./09-implementation-notes.md#ffi-边界唯一的转换点)）。
+
+### 1.3 `NEW SUB ... FROM ptr`：生成局部 callable 实体【已落地】
 
 要把一个函数指针变成**具有 SA 局部生命周期的可调用体**：
 
@@ -139,15 +147,19 @@ dest m= fooo
 
 这正是“函数引用不可 `m=`，但 callable 实体可 `m=`”的分界线所在。
 
-### 1.4 Lambda：无名虚函数【方向已定】
+> 落地说明：callable 的类型写作 `SUB(参数) AS T`，C 里是引用计数的 `SaCallable*`。「局部生命周期」只是默认——它和 `STRING` 一样可以传参、返回、存进 `ENTITY` 字段和全局变量，计数归零时释放。callable 不能过 FFI，C 不会替它维护计数。REAL / VIRTUAL 二分还没落地，所以「无名虚函数」目前只体现为：callable 不能再 `@` 取址。
+
+### 1.4 Lambda：无名虚函数【方向已定，未进首期】
 
 局部 Lambda 归类为**无名虚函数**：可以调用、可以进入 callback / callable 系统，但**不能**拿它继续做结构化 `EXTEND`。
 
 【细节待定】如果 Lambda 要**捕获局部变量**，得进一步处理 closure environment 与 lifetime——捕获值还是捕获引用、闭包逃逸后被捕获变量的生命周期如何延续，都还没定。这一块和[托管 HANDLE](#42-托管-handle方向已定) 的逃逸规则要一起想。
 
-### 1.5 托管回调【方向已定】
+> 函数模型首期没做 Lambda，原因有两个：一是捕获语义（[未决问题 #3](#九未决问题)）没定，而没有捕获的 Lambda 和「具名 `SUB` + `@foo()`」没有区别，只是省了个名字；二是捕获一旦落地，函数引用就得从瘦指针换成 `{fn, env}`，`env` 的生命周期要跟[托管 HANDLE](#42-托管-handle方向已定) 的逃逸规则一起设计，这块现在还是空的。首期已经把 FFI 转换收拢到一处，给这次改造留好了位置。
 
-SA 要让 callback 不再等价于“裸 C 函数指针”。路径是：函数引用先形成 [callable 实体](#13-new-sub--from-ptr生成局部-callable-实体方向已定)，再交给 runtime 托管其回调生命周期。
+### 1.5 托管回调【部分落地】
+
+SA 要让 callback 不再等价于“裸 C 函数指针”。路径是：函数引用先形成 [callable 实体](#13-new-sub--from-ptr生成局部-callable-实体已落地)，再交给 runtime 托管其回调生命周期。
 
 这会成为一批上层能力的公共地基：
 
@@ -157,7 +169,11 @@ SA 要让 callback 不再等价于“裸 C 函数指针”。路径是：函数�
 - FFI callback；
 - async runtime。
 
-### 1.6 `CALLRET`：以回调替代 RETURN 的控制流出口【方向已定】
+> 落地说明：GUI 这一项已经进来了，`SYS.GUI.ON_CLICK(button, handler)` 挂回调、`RUN()` 派发（见[第 8 章](./08-stdlib.md#sysgui-窗口界面)）。按[第十节](#十和现有实现的衔接与建议落地顺序)的要求复用了现有事件队列，没有另起一套：回调和 `WAIT_EVENT` 轮询共用同一个队列，派发发生在 `RUN` 自己的栈帧里，这样 SA 异常的 `longjmp` 不会穿过 WndProc / GTK 主循环。FFI callback 走的是 `PTR TO SUB` 裸函数指针，不经过托管层（callable 不过 FFI）。timer、网络事件未动；async runtime 的事件循环和 GUI 队列还没合并。
+
+> 生命周期补充：GUI 派发器临时保活 handler，并用异常清理帧保证正常返回、回调抛错、回调释放注册引用后抛错都归还这份引用；清理后原样重抛，不改写原错误信息。测试覆盖 `-O0` / `-O2`、重复派发的异常栈平衡和零净分配。
+
+### 1.6 `CALLRET`：以回调替代 RETURN 的控制流出口【已落地】
 
 `CALLRET` **不是** `return foo()`，**也不是** tail-call。它的含义是：
 
@@ -184,11 +200,19 @@ PRINT "hello"        REM 不可达代码
 >
 > 记号家族：`CALLRET` 天然是**语句级**关键字，和 [`CALL` 的定位](./03-subroutines.md#call-能出现在哪里)一致——不能嵌进表达式中间。
 
-### 1.7 实体函数（ENTITY 方法）【细节待定】
+> 落地说明：
+>
+> - 终结语义、语句级、接进返回路径分析，都按上面实现了，其后同块代码报不可达。目标只能是 callable 或函数引用；具名 `SUB` 直接 `CALL` 再 `RETURN`。
+> - 比原稿多了一条：在**非 `VOID`** 的 `SUB` 里，被调 callable 的返回值就是本 `SUB` 的返回值（类型必须能赋过去）；`VOID` 的 `SUB` 里返回值被丢弃，这就是原稿里「把结果交给返回 callback」的用法。这么做是因为非 `VOID` 的 `SUB` 必须有返回值，与其禁止，不如让它自然地透传。
+> - 首期限制：`ASYNC SUB` 里不能用；含 `GOSUB` 的 `SUB` 里不能用（那里的返回要先过返回栈分发）。
+
+### 1.7 实体函数（ENTITY 方法）【细节待定，未进首期】
 
 `ENTITY` 准备允许定义自己的内部函数 / 方法，不再只能当纯数据结构。
 
 但要讲清楚一件事：**SA 的“继承”落在 [`SUB EXTEND`](#二扩展模型) 上，而不是传统 class inheritance。** 实体函数提供的是“数据带行为”，不是类型层级。这条决定了 ENTITY 方法的设计不能滑向 OOP 类继承那一套。
+
+> 函数模型首期没做实体函数：它和 `SUB EXTEND` 的分工（[未决问题 #4](#九未决问题)）还没划死，而扩展模型整章都没动，现在定方法语法等于替 `EXTEND` 提前拍板；另外，方法要隐式绑定 `self`，本质上是一种带捕获的 callable，应该和 Lambda 的 `{fn, env}` 表示一起设计。在这之前，「数据带行为」可以用 callable 字段凑合：`ENTITY` 里放一个 `SUB(...)` 类型的字段，调用时手动把实体传进去。
 
 ---
 
@@ -382,7 +406,7 @@ m=   move     所有权转移
 - 覆盖 `STRING` / `SYMBOL` / `ERROR` 和含托管字段的 `ENTITY`，两个后端都支持。
 - 三条限制：含 `GOTO` / `GOSUB` 的 SUB 里禁用（标签跳转让顺序分析不可靠）；借用目标必须与借用语句同块 `DIM`（借用靠摘清理登记实现，登记按块静态生成）；移动的源不能是全局、`AS REF` 参数或按值传入的 `SYMBOL` / `ERROR` 参数（本帧不持有它们）。
 - `RETURN` 走同一套思路：本帧拥有的局部整体搬给调用方（源清零），搬不动的深拷贝，本语句刚算出的临时量直接接管；调用方把返回值当自己的资源接管或在语句尾释放——见[第 9 章 · RETURN 交出去的是一份独立所有权](./09-implementation-notes.md#return-交出去的是一份独立所有权)。
-- 还没接进来的：[`PTR TO SUB`](#12-函数指针-ptr-to-sub方向已定) 与 [callable 实体](#43-callable-ownership)的所有权规则，等那两项落地后并入同一套检查。
+- [`PTR TO SUB`](#12-函数指针-ptr-to-sub已落地) 与 [callable 实体](#43-callable-ownership已落地)已并入同一套检查，见 4.3。
 
 ### 4.2 托管 HANDLE【方向已定】
 
@@ -398,9 +422,11 @@ m=   move     所有权转移
 
 > 实现衔接：现有编译器已经做局部 `STRING` / `SYMBOL` / `ERROR` 的[释放策略](./03-subroutines.md#返回值)（TODO P0 已落地），返回前先算返回值、再清本帧资源，返回值的所有权也已明确交给调用方（见 [4.1](#41-复制--借用--移动--f--m已落地)）。托管 HANDLE 是把这套自动清理**从内置类型扩展到用户资源**，清理时机要和 `AFTER AS FINALLY`、异常退出统一到同一条退出路径上。
 
-### 4.3 callable ownership
+### 4.3 callable ownership【已落地】
 
-[callable 实体](#13-new-sub--from-ptr生成局部-callable-实体方向已定)本身带生命周期，因此纳入同一套所有权规则：函数引用（`PTR TO SUB`）不可 `m=`，callable 实体可 `m=`。这条已在函数模型讲过，此处只是强调它和 `= / f= / m=` 是**同一个所有权系统**，而不是平行的两套。
+[callable 实体](#13-new-sub--from-ptr生成局部-callable-实体已落地)本身带生命周期，因此纳入同一套所有权规则：函数引用（`PTR TO SUB`）不可 `m=`，callable 实体可 `m=`。这条已在函数模型讲过，此处只是强调它和 `= / f= / m=` 是**同一个所有权系统**，而不是平行的两套。
+
+> 落地说明：确实是同一套。callable 实体走的是 `STRING` 那条路，借用冻结、移动后源失效、`RETURN` 交出所有权都直接沿用；区别只在「复制」是加一份引用计数，不复制函数本身。函数引用写 `m=` 在语义层报错。
 
 ---
 
@@ -408,7 +434,7 @@ m=   move     所有权转移
 
 ### 5.1 `ASYNC SUB` / `PROMISE` / `CALL` / `AWAIT` / `SYNC`【已落地】
 
-> 落地范围：C 后端全量（无栈状态机协程 + 单线程事件循环），native 后端遇到 `ASYNC SUB` 直接报错、让用户改走 C 后端。测试在 `tests/test_coroutines.py`。**用户章节还没写**——docs 第 1–11 章目前没有异步这一章，本节暂时兼作语法速览，下面的写法都是实际编译得过的。
+> 落地范围：C/native 核心异步模型（无栈状态机协程 + 单线程事件循环）。native 直接发射堆帧与 start/resume/cleanup LLVM IR，并共用 runtime；返回值范围及 native 的跨作用域跳转、数组和聚合 ABI 边界见[第 12 章](./12-async.md)。该章包含受检的完整示例；本节保留设计速览，省略号需要替换为实际语句。
 
 ```sa
 ASYNC SUB asyncfoo(n AS NUM AS LONG) AS STRING
@@ -457,6 +483,10 @@ x = SYNC asyncfoo(1)
 - `ASYNC SUB` 不能用独立 `CALL` 语句调用（只能 `AWAIT` / `SYNC` / `p = CALL`），也不能作为 `TRY CALL` 的目标；
 - `AWAIT` 不能出现在 `TRY` 块内（挂起会破坏 setjmp 异常栈），`SYNC` 不挂起当前帧、不受此限；
 - `ASYNC SUB` 不支持 `AS REF` 参数（协程帧需独占参数所有权）；
+- `SYMBOL` 参数在启动时递归 clone，`ERROR` 参数复制消息并保留错误元数据，帧独立拥有副本；ENTITY 内 SYMBOL 字段也递归托管。正常完成、异常、未启动即 drop、挂起取消，以及跨挂起的 ENTITY 临时值均有零净分配回归，见[实现说明](./09-implementation-notes.md#协程参数拥有独立资源)。
+- Promise 失败保留原错误类型、错误码、消息、行号和 SUB 名称，取值时先释放失败 Promise 再重抛；这是原错误位置传播，尚非完整异步调用栈。网络原语自身错误仍可为 `ERR_ASYNC`。
+- 不支持的异步返回类型和 `PROMISE OF T` 内层类型在语义检查阶段报告，不再等到 C 生成阶段。
+- 异步返回值目前仅支持 `NUM` / `BOOL` / `STRING` / `HANDLE` / `VOID`；支持 SYMBOL / ERROR 参数不代表支持它们作为异步返回值。`ASYNC SUB` 内仍不能使用 `NEW SUB` / `CALLRET`；
 - `SYS.NET` 提供 `ACCEPT_ASYNC` / `RECV_ASYNC` / `SEND_ASYNC` / `CONNECT_ASYNC`，分别返回 `PROMISE OF NET_STREAM` / `STRING` / `NUM` / `NET_STREAM`，是真正会挂起让出的 I/O 点；
 - 跨模块调用 `ASYNC SUB` 走同一套 ABI。
 - 原稿里「Promise 完全不透明、返回类型靠用户猜」的脑洞版**没有采纳**，落地的就是带类型的 `PROMISE OF <T>`。
@@ -645,14 +675,15 @@ CALLRET responseCallback(response)
 2. **`USE C` / `USE LIB` vs 现有 `USEC` / `USELIB`。** 笔记里写 `USE C` / `USE LIB`（带空格），现有实现是 [`USEC` / `USELIB`](./06-pointers-and-ffi.md#c-ffi-声明)（连写）。需要统一，否则文档和实现两张皮。
 3. **Lambda 闭包捕获。** 捕获值还是捕获引用？闭包逃逸后被捕获变量的生命周期如何延续？和[托管 HANDLE](#42-托管-handle方向已定) 的逃逸规则要一起定。
 4. **ENTITY 方法的边界。** 实体函数与 `SUB EXTEND` 的分工要划死，防止滑向 OOP 类继承。
-5. **`CALLRET` 与返回路径分析的合流。** 含 `CALLRET` 的路径视为“已终结”，其后不可达——需要接进现有的非 `VOID SUB` 返回路径检查。
-6. **FORK 继承与状态清理细节。** Fork 动作后 Context Manager 如何同步继承 Handle 树、Scope Exchanger 状态与 Promise 状态，需要独立规约。
+5. **FORK 继承与状态清理细节。** Fork 动作后 Context Manager 如何同步继承 Handle 树、Scope Exchanger 状态与 Promise 状态，需要独立规约。
 
 **随落地拍板、不再悬着的：**
 
 - **`PROMISE` 带不带结果类型** → 带，写法 `PROMISE OF <类型>`，与 `PTR TO <类型>` 同构；「完全不透明」版弃用（见 [5.1](#51-async-sub--promise--call--await--sync已落地)）。
 - **"font Copy" 代号** → 没有沿用。正式名就叫复制 / 借用 / 移动（`= / f= / m=`），用户文档和实现里都不出现这个代号。
 - **借用悬空是谁的责任** → 原稿「`FREE b` 之后 `a` 立即失效」由用户自己兜，落地改成编译期冻结源（见 [4.1](#41-复制--借用--移动--f--m已落地)）。
+- **`CALLRET` 与返回路径分析的合流** → 已接入，含 `CALLRET` 的路径视为已终结；非 `VOID` 的 `SUB` 里透传被调方的返回值（见 [1.6](#16-callret以回调替代-return-的控制流出口已落地)）。
+- **`PTR TO SUB` 在 FFI 上是什么** → 边界上就是 C 函数指针，原样传递；内部表示允许以后加胖，转换点只有一处（见 [1.2](#12-函数指针-ptr-to-sub已落地)）。
 
 ---
 
@@ -661,8 +692,8 @@ CALLRET responseCallback(response)
 粗排落地顺序（沿用 TODO 的 P 级习惯），✅ 表示已进编译器：
 
 - **P0（地基，别的都依赖它）**：[作用域模型](#三作用域模型) 与 [Scope Exchanger](#62-sa-scope-exchanger跨域能力转换引擎方向已定)（REAL/VIRTUAL 二分 + Scope Barrier + 转换规则）。它决定了函数身份，是扩展模型和函数指针的前提。
-- **P1（函数与资源）**：✅ [`= / f= / m=`](#41-复制--借用--移动--f--m已落地)（连同 `RETURN` 的所有权交接）先于这条链落地了。剩下 [`PTR TO SUB`](#12-函数指针-ptr-to-sub方向已定) → [`NEW SUB FROM`](#13-new-sub--from-ptr生成局部-callable-实体方向已定) → [托管 HANDLE 与 Handle Switcher](#61-sa-handle-switcher资源权属调度与死锁恢复方向已定)，前两项落地时要接进 4.1 已有的所有权检查。第 6 章的三笔账里，“没有函数指针 / 回调”两笔还在；“所有权转换”SA 侧有了，C FFI 的字符串所有权转换是另一回事，未动。
+- **P1（函数与资源）**：✅ [`= / f= / m=`](#41-复制--借用--移动--f--m已落地)（连同 `RETURN` 的所有权交接）先于这条链落地了。✅ [`PTR TO SUB`](#12-函数指针-ptr-to-sub已落地) → ✅ [`NEW SUB FROM`](#13-new-sub--from-ptr生成局部-callable-实体已落地)，已接进 4.1 的所有权检查。剩下 [托管 HANDLE 与 Handle Switcher](#61-sa-handle-switcher资源权属调度与死锁恢复方向已定)。第 6 章的三笔账里，“没有函数指针 / 回调”两笔已销；“所有权转换”SA 侧有了，C FFI 的字符串所有权转换是另一回事，未动。
 - **P1（扩展）**：[`EXTEND` + `BEFORE`/`AFTER`/`FINALLY`](#21-extend函数执行结构继承方向已定) → [`TAG` / `::tag`](#22-tag-扩展点与禁止隔代打祖宗方向已定)。
-- **P2（并发与异步）**：✅ [`ASYNC`/`AWAIT`/`SYNC`/`PROMISE`](#五异步模型)（C 后端）。顺序和原计划反了——异步先于托管回调落地，事件循环已经在 runtime 里；剩下 [托管回调](#15-托管回调方向已定) → [`SYS.MULTIPROCESS[WORKER]`](#63-sysmultiprocess进程执行上下文扩展方向已定) → [`CALLRET`](#16-callret以回调替代-return-的控制流出口方向已定)，托管回调接进来时应复用这个循环而不是另起一套。native 后端补 `ASYNC` 也挂在这条线上。
+- **P2（并发与异步）**：✅ [`ASYNC`/`AWAIT`/`SYNC`/`PROMISE`](#五异步模型)（C/native）。顺序和原计划反了——异步先于托管回调落地，事件循环已经在 runtime 里；之后 [`CALLRET`](#16-callret以回调替代-return-的控制流出口已落地) ✅ 和 [托管回调](#15-托管回调部分落地) 的 GUI 部分 ✅ 也进来了，GUI 回调复用了现有事件队列；timer / 网络事件回调、async 事件循环与 GUI 队列合并还没做。剩下 [`SYS.MULTIPROCESS[WORKER]`](#63-sysmultiprocess进程执行上下文扩展方向已定) 与 native 的部分数组/聚合 ABI 扩展。
 - **P2（体验）**：[SA lint / 自动行号](#71-sa-lint-与自动行号部分落地)（✅ 工具已有，混写规则未定）、[SA Traceback](#72-sa-traceback部分落地)（✅ 编译期，运行期未动）。可与主线并行推进。
 - **P3（深度探索）**：[`SYS.MULTIPROCESS[FORK]`](#2-multiprocessfork进程上下文分裂细节待定) 规范化。

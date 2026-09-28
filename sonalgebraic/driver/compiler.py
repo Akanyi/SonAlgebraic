@@ -475,7 +475,9 @@ def run_native_compiler(
     exe_path.parent.mkdir(parents=True, exist_ok=True)
     sources = [str(ir_path), *(str(p) for p in extra_sources or [])]
     lib_args = [str(path) for path in libs or []]
-    link_lib_args = _link_lib_args(link_libs or [], compiler)
+    # Windows CRT 提供数学函数；源码模块显式 USELIB "m" 也不能变成不存在的 m.lib。
+    selected_link_libs = [lib for lib in link_libs or [] if lib != "m" or "windows" not in normalize_target(target)]
+    link_lib_args = _link_lib_args(selected_link_libs, compiler)
     rpath_args = rpath_flags(libs or [], normalize_target(target))
     passthrough = extra_args or []
     gc_compile, gc_link = gc_section_flags(compiler, normalize_target(target))

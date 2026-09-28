@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...analysis.typesys import is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_ptr, is_string, is_symbol, type_of
+from ...analysis.typesys import is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_promise, is_ptr, is_string, is_sub_ptr, is_sub_type, is_symbol, type_of
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import LLVMValue, NativeGenBase
@@ -39,19 +39,19 @@ class TypesMixin(NativeGenBase):
             if value.type_name != "ptr":
                 raise SonCompileError("native 后端 SYMBOL 赋值需要 SYMBOL 值")
             return LLVMValue("ptr", value.value, target)
-        if is_ptr(target) or is_cptr(target):
+        if is_ptr(target) or is_cptr(target) or is_sub_type(target):
             if value.type_name == "ptr":
                 return LLVMValue("ptr", value.value, target)
             int_value = self.cast_to_i64(value)
             temp = self.next_temp()
             self.emit(f"  {temp} = inttoptr i64 {int_value.value} to ptr")
             return LLVMValue("ptr", temp, target)
-        if is_handle(target):
+        if is_handle(target) or is_promise(target):
             if value.type_name == "i64":
                 return LLVMValue("i64", value.value, target)
             if value.type_name == "ptr" and is_null(value.type_spec or ast.TypeSpec("VOID")):
                 return LLVMValue("i64", "0", target)
-            raise SonCompileError("native 后端 HANDLE 只能接收同 kind HANDLE 或 NULL")
+            raise SonCompileError(f"native 后端 {target.name} 只能接收兼容句柄或 NULL")
         if target.name == "STRING":
             if value.type_name != "ptr":
                 raise SonCompileError("native 后端字符串赋值需要字符串值")
@@ -170,9 +170,9 @@ class TypesMixin(NativeGenBase):
             return "void"
         if type_spec.name == "BOOL":
             return "i1"
-        if type_spec.name == "HANDLE":
+        if type_spec.name in {"HANDLE", "PROMISE"}:
             return "i64"
-        if type_spec.name in {"STRING", "PTR", "CPTR", "SYMBOL"}:
+        if type_spec.name in {"STRING", "PTR", "CPTR", "SYMBOL", "SUB"}:
             return "ptr"
         if type_spec.name == "ERROR":
             return "%SaError"
@@ -206,7 +206,7 @@ class TypesMixin(NativeGenBase):
             return "zeroinitializer"
         if is_string(type_spec):
             return "@.sa_empty"
-        if is_ptr(type_spec) or is_cptr(type_spec) or is_symbol(type_spec):
+        if is_ptr(type_spec) or is_cptr(type_spec) or is_symbol(type_spec) or is_sub_type(type_spec):
             return "null"
         if is_error(type_spec):
             return "zeroinitializer"

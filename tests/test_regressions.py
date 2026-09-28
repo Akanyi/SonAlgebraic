@@ -371,7 +371,7 @@ def test_fmt_numbers_a_none_number_source() -> None:
 @pytest.mark.e2e
 def test_run_passes_arguments_after_double_dash() -> None:
     """`--` 之后的东西转发给程序，但 --backend 这类编译器选项不能被一起吞掉。"""
-    result = _sonc("run", str(REPO_ROOT / "examples" / "hello.sa"), "--backend", "c", "--", "extra")
+    result = _sonc("run", str(REPO_ROOT / "examples" / "basics" / "hello.sa"), "--backend", "c", "--", "extra")
     assert result.returncode == 0
     assert "Hello World!" in result.stdout
 
@@ -536,7 +536,8 @@ def test_c_and_native_backends_agree(name: str) -> None:
     )
 
 
-def test_native_backend_links_libm_for_posix_targets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("link_libs", [[], ["m", "custom_math"]])
+def test_native_backend_links_libm_for_posix_targets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, link_libs: list[str]) -> None:
     """runtime 的 SYMBOL 求值调 pow/log/exp/sin/cos/tan/sqrt。
 
     glibc 把这些放在单独的 libm 里，链接命令漏了 `-lm` 就是一串 undefined
@@ -561,11 +562,16 @@ def test_native_backend_links_libm_for_posix_targets(monkeypatch: pytest.MonkeyP
 
     for compiler in ("clang", "zig"):
         seen.clear()
-        driver.run_native_compiler(compiler, ir, tmp_path / "app", target="x86_64-linux-gnu")
+        driver.run_native_compiler(compiler, ir, tmp_path / "app", target="x86_64-linux-gnu", link_libs=link_libs)
         command = next(iter(seen.values()))
         assert "-lm" in command, f"{compiler} 的 POSIX 链接命令缺少 -lm: {' '.join(command)}"
+        if link_libs:
+            assert "-lcustom_math" in command
 
-        seen.clear()
-        driver.run_native_compiler(compiler, ir, tmp_path / "app", target="x86_64-windows-msvc")
-        command = next(iter(seen.values()))
-        assert "-lm" not in command, f"{compiler} 不该给 Windows 目标加 -lm: {' '.join(command)}"
+        for target in ("x86_64-windows-msvc", "x86_64-windows-gnu"):
+            seen.clear()
+            driver.run_native_compiler(compiler, ir, tmp_path / "app", target=target, link_libs=link_libs)
+            command = next(iter(seen.values()))
+            assert "-lm" not in command, f"{compiler} 不该给 Windows 目标加 -lm: {' '.join(command)}"
+            if link_libs:
+                assert "-lcustom_math" in command

@@ -106,6 +106,12 @@ class ExprParser:
             # 拦下 `CALL 名字` 这个形态，把用户真正要改的地方说清楚。
             if word == "CALL" and self.tokens[self.i].kind == "IDENT":
                 self.reject_nested_call(self.tokens[self.i].value)
+            if word == "CALLRET" and self.tokens[self.i].kind == "IDENT":
+                raise SonCompileError(
+                    "`CALLRET` 是终结当前 SUB 的语句，不产生值，不能出现在表达式里；"
+                    "它只能独立成句（`CALLRET cb(args)`）",
+                    self.line_no,
+                )
             if self.match_op("("):
                 args = self.parse_args()
                 return ast.CallExpr(self.line_no, token.value, args)
@@ -115,7 +121,17 @@ class ExprParser:
         if token.kind == "OP" and token.value == "^":
             return ast.Deref(self.line_no, self.parse(_PREFIX_PREC))
         if token.kind == "OP" and token.value == "@":
-            return ast.AddressOf(self.line_no, self.parse(_PREFIX_PREC))
+            operand = self.parse(_PREFIX_PREC)
+            # `@foo()` 取函数引用，`@x` 取变量地址：尾随的空括号就是两者在语法层的分界。
+            if isinstance(operand, ast.CallExpr):
+                if operand.args:
+                    raise SonCompileError(
+                        f"`@{operand.name}(...)` 取函数引用时括号里不能写参数；"
+                        f"写成 `@{operand.name}()`，调用时再传参",
+                        self.line_no,
+                    )
+                return ast.SubRef(self.line_no, operand.name)
+            return ast.AddressOf(self.line_no, operand)
         if token.kind == "OP" and token.value == "(":
             expr = self.parse(0)
             self.expect_op(")")

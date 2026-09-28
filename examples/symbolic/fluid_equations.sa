@@ -48,7 +48,7 @@
 480 REM ρ*A*v = constant (质量守恒)
 490 continuity = rho * A * v
 500 PRINT "连续性方程（质量守恒）:"
-510 PRINT F"Q_volumetric = {continuity} (立方米/秒)"
+510 PRINT F"质量流量 = {continuity} (千克/秒)"
 520 PRINT ""
 530 REM
 540 REM 符号计算：简化纳维-斯托克斯方程
@@ -96,7 +96,7 @@
 960 PRINT "说明:"
 970 PRINT "  此示例演示用 SYMBOL 类型捕获流体动力学方程的表达式树。"
 980 PRINT "  每个方程都作为符号表达式存储，保留数学结构供后续分析。"
-990 PRINT "  未来可扩展支持求导、化简、参数代入等符号计算操作。"
+990 PRINT "  求导、化简与代入示例见同目录 fluid_derivatives.sa。"
 1000 .ENDSUB
 1010 CALL main
 1020 END

@@ -1,0 +1,16 @@
+10 REM 学习用数值方法：固定迭代次数适合小规模演示，不替代标准数学库。
+20 USE mathlib_enhanced AS M
+30 SUB main AS PUBLIC AS VOID
+40     PRINT F"sin(0.5) = {M.sin_approx(0.5)}"
+50     PRINT F"cos(0.5) = {M.cos_approx(0.5)}"
+60     PRINT F"exp(1) = {M.exp_approx(1.0)}"
+70     PRINT F"sqrt(2) = {M.sqrt_newton(2.0)}"
+80     PRINT F"reference e = {M.E}, sqrt(2) = {M.SQRT2}"
+90     PRINT F"det = {M.det_2x2(1, 2, 3, 4)}"
+100     PRINT F"reciprocal determinant = {M.reciprocal_det(1, 2, 3, 4)}"
+110     PRINT F"trace = {M.trace_2x2(1, 4)}"
+120     PRINT F"clamp = {M.clamp_val(1.5, 0, 1)}"
+130     PRINT F"lerp = {M.lerp(1, 5, 0.5)}"
+140 .ENDSUB
+150 CALL main
+160 END

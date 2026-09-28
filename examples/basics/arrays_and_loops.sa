@@ -1,4 +1,4 @@
-10 REM 第二批特性验证：数组 + FOR/WHILE 循环
+10 REM 定长数组、FOR 累加、倒序步长与 WHILE 循环
 20 DIM scores[5] AS NUM AS LONG AS VAR
 30 DIM total AS NUM AS LONG AS VAR
 40 DIM i AS NUM AS LONG AS VAR

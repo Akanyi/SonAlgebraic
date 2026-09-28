@@ -1,0 +1,11 @@
+﻿10 REM 指针加一按元素大小前进；这里只比较地址，不解引用越过对象的地址。
+15 DIM arr AS NUM AS LONG AS VAR
+20 DIM p AS PTR TO NUM AS LONG AS VAR
+30 SUB main AS PUBLIC AS VOID
+40 arr = 10
+50 p = @arr
+60 p = p + 1
+70 PRINT p = @arr + 1
+80 .ENDSUB
+90 CALL main
+100 END

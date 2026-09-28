@@ -155,8 +155,8 @@ python -m sonalgebraic c hello.sa
 | 查标准库 API | [第 8 章 标准库](./08-stdlib.md) |
 | 看生成的 C 是什么样 | [第 9 章 实现说明](./09-implementation-notes.md) |
 
-仓库的 `examples/` 目录有三十多个可直接运行的示例。想一次性确认工具链正常，跑这个：
+仓库的 [examples/](../examples/README.md) 按主题组织示例，模块库与程序入口、自动与交互运行方式都有说明。想一次性确认工具链正常，跑这个：
 
 ```powershell
-python -m sonalgebraic run examples/allexample.sa
+python -m sonalgebraic run examples/showcase/language_tour.sa
 ```

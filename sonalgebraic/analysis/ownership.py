@@ -22,7 +22,7 @@ from ..core import ast
 from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
-from .typesys import describe_type, is_error, is_string, is_symbol, resolve_c_func, resolve_path_type, same_type_spec
+from .typesys import callable_symbol_type, describe_type, is_error, is_string, is_sub_ptr, is_sub_type, is_symbol, resolve_c_func, resolve_path_type, same_type_spec, sub_signature, type_of
 
 if TYPE_CHECKING:
     from .semantics import Symbol
@@ -36,12 +36,12 @@ def is_managed_type(
     entities: dict[str, ast.EntityDef],
     external_modules: dict[str, ModuleExports],
 ) -> bool:
-    """f=/m= 只对「作用域末尾会被自动释放」的类型有意义：STRING / SYMBOL / ERROR，以及
-    含这类字段的 ENTITY。数组、PROMISE（已是单消费者语义）、数值 / HANDLE / PTR 之类的值
+    """f=/m= 只对「作用域末尾会被自动释放」的类型有意义：STRING / SYMBOL / ERROR、callable
+    实体（SUB），以及含这类字段的 ENTITY。数组、PROMISE（已是单消费者语义）、数值 / HANDLE / PTR 之类的值
     类型没有所有权可言，一律不算。判定口径与 codegen 的 type_has_managed_resources 一致。"""
     if type_spec.array_size is not None:
         return False
-    if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec):
+    if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_sub_type(type_spec):
         return True
     return type_spec.name == "ENTITY" and _entity_has_managed_fields(type_spec, entities, external_modules)
 
@@ -58,9 +58,7 @@ def _entity_has_managed_fields(
         field_type = field.type_spec
         if field_type.array_size is not None:
             continue
-        # 实体内的 SYMBOL 字段目前不做深层 clone/free 托管（见 09-implementation-notes），
-        # 所以它不构成「含托管字段」——与 codegen 的 inside_entity 口径对齐。
-        if is_string(field_type) or is_error(field_type):
+        if is_string(field_type) or is_symbol(field_type) or is_error(field_type) or is_sub_type(field_type):
             return True
         if field_type.name == "ENTITY" and _entity_has_managed_fields(field_type, entities, external_modules):
             return True
@@ -82,13 +80,13 @@ def _resolve_entity(
 
 
 def _frame_owns(kind: str, type_spec: ast.TypeSpec) -> bool:
-    """本帧是否真正持有这个变量的资源。局部 DIM 总是持有；按值参数只有 STRING 和含托管
-    字段的 ENTITY 会在入口被深拷贝进本帧，SYMBOL / ERROR 按值参数只是调用方指针的浅拷贝，
+    """本帧是否真正持有这个变量的资源。局部 DIM 总是持有；按值参数只有 STRING、含托管
+    字段的 ENTITY 会在入口被深拷贝进本帧，callable 在入口多持有一份引用计数，SYMBOL / ERROR 按值参数只是调用方指针的浅拷贝，
     释放它就是释放调用方的东西。"""
     if kind == "local":
         return True
     if kind == "param":
-        return is_string(type_spec) or type_spec.name == "ENTITY"
+        return is_string(type_spec) or type_spec.name == "ENTITY" or is_sub_type(type_spec)
     return False
 
 
@@ -245,9 +243,15 @@ class _Walker:
             self.read_expr(stmt.prompt)
             self.use(stmt.target, stmt.line_no, write=True)
         elif isinstance(stmt, ast.Call):
-            self.call_args(stmt.name, stmt.args)
+            self.call_args(stmt.name, stmt.args, stmt.line_no)
+        elif isinstance(stmt, ast.CallRet):
+            self.call_args(stmt.name, stmt.args, stmt.line_no)
+        elif isinstance(stmt, ast.NewSub):
+            self.read_expr(stmt.source)
+            source_type = type_of(stmt.source, self.scope, self.subs, self.entities, None, self.external_modules, self.c_funcs)
+            self.declare(stmt.name, sub_signature(source_type), True)
         elif isinstance(stmt, ast.TryCatch):
-            self.call_args(stmt.call_name, stmt.args)
+            self.call_args(stmt.call_name, stmt.args, stmt.line_no)
             self.use(stmt.traceback_var, stmt.line_no, write=True)
             for branch in stmt.catches:
                 self.catch_block(branch)
@@ -295,6 +299,14 @@ class _Walker:
     def ownership_assign(self, stmt: ast.Assign) -> None:
         op = _OP[stmt.mode]
         line = stmt.line_no
+        if isinstance(stmt.expr, ast.SubRef) or (
+            isinstance(stmt.target, ast.VarRef) and is_sub_ptr(resolve_path_type(stmt.target.name, self.scope, self.entities, line))
+        ):
+            # 函数引用是只读值，f= 就是普通赋值（m= 已在 check_stmt 拦下），不牵涉任何所有权状态
+            if isinstance(stmt.target, ast.VarRef):
+                self.use(stmt.target.name, line, write=True)
+            self.read_expr(stmt.expr)
+            return
         if self.has_jumps:
             raise SonCompileError(f"含 GOTO / GOSUB 的 SUB 里不能使用 {op}：标签跳转让所有权的顺序分析不可靠", line)
         if not isinstance(stmt.target, ast.VarRef):
@@ -321,7 +333,7 @@ class _Walker:
         for label, name, type_spec in (("目标", target, target_type), ("源", source, source_type)):
             if not is_managed_type(type_spec, self.entities, self.external_modules):
                 raise SonCompileError(
-                    f"{op} 只适用于 STRING / SYMBOL / ERROR 和含托管字段的 ENTITY，{label} {name} 是 {describe_type(type_spec)}",
+                    f"{op} 只适用于 STRING / SYMBOL / ERROR、callable 实体和含托管字段的 ENTITY，{label} {name} 是 {describe_type(type_spec)}",
                     line,
                 )
         if not same_type_spec(target_type, source_type):
@@ -414,12 +426,15 @@ class _Walker:
                 if isinstance(part, ast.Expr):
                     self.read_expr(part)
         elif isinstance(expr, ast.CallExpr):
-            self.call_args(expr.name, expr.args)
+            self.call_args(expr.name, expr.args, expr.line_no)
         elif isinstance(expr, ast.AwaitExpr | ast.SyncExpr):
             self.read_expr(expr.operand)
 
-    def call_args(self, name: str, args: list[ast.Expr]) -> None:
-        params = self.callee_params(name)
+    def call_args(self, name: str, args: list[ast.Expr], line: int) -> None:
+        # 经 callable / 函数引用变量调用，本身就是对这个变量的一次读：被 m= 移走之后再调用要报错
+        if self.callable_var(name, line) is not None:
+            self.use(name, line)
+        params = self.callee_params(name, line)
         for index, arg in enumerate(args):
             by_ref = index < len(params) and params[index].by_ref
             if by_ref and isinstance(arg, ast.VarRef):
@@ -427,10 +442,18 @@ class _Walker:
             else:
                 self.read_expr(arg)
 
-    def callee_params(self, name: str) -> list[ast.Param]:
+    def callable_var(self, name: str, line: int) -> ast.TypeSpec | None:
+        if self.subs.get(name.lower()) is not None:
+            return None
+        return callable_symbol_type(name, self.scope, self.entities, line)
+
+    def callee_params(self, name: str, line: int) -> list[ast.Param]:
         sub = self.subs.get(name.lower())
         if sub is not None:
             return sub.params
+        callee = self.callable_var(name, line)
+        if callee is not None:
+            return list(sub_signature(callee).params or ())
         split = split_module_member(name)
         if split is not None:
             alias, member = split

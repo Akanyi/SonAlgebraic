@@ -36,20 +36,20 @@ sa_print_string(sa_message);
 ## 快速开始
 
 ```powershell
-python -m sonalgebraic build examples/hello.sa -o build/hello.exe
+python -m sonalgebraic build examples/basics/hello.sa -o build/hello.exe
 build/hello.exe
 ```
 
 只生成 C：
 
 ```powershell
-python -m sonalgebraic c examples/hello.sa -o build/hello.c
+python -m sonalgebraic c examples/basics/hello.sa -o build/hello.c
 ```
 
 完整特性演示：
 
 ```powershell
-python -m sonalgebraic run examples/allexample.sa
+python -m sonalgebraic run examples/showcase/language_tour.sa
 ```
 
 ## 安装 SADK
@@ -87,6 +87,7 @@ sonc doctor
 - `ENTITY` 支持嵌套结构、字段访问、字符串字段深拷贝和常规生命周期清理。
 - 托管资源的三种赋值：`=` 深拷贝、`f=` 只读借用、`m=` 所有权移动，移走后再用、借用期间改源都是编译错误。
 - `ERROR` / `TRY` / `CATCH` / `THROW` 结构化异常处理。
+- `ASYNC SUB` / `PROMISE OF T` / `AWAIT` / `SYNC` 无栈协程：C/native 双后端，共用事件循环、异步网络与错误传播，详见[异步章节](./docs/12-async.md)。
 - `ENUM` 枚举；`SYS.MATH` / `SYS.IO` / `SYS.STRING` / `SYS.BINARY` / `SYS.LIST` / `SYS.MAP` / `SYS.NET` / `SYS.FILE` / `SYS.DESKTOP` 内置模块。
 - `SYMBOL` 完整代数：表达式树捕获、求导 `DERIV`、化简 `SIMPLIFY`、代入 `SUBST`、数值求值 `EVAL`。
 - 字符串操作 `SYS.STRING`：LENGTH / CONCAT / SLICE / FIND / UPPER / LOWER / REPLACE。
@@ -128,7 +129,7 @@ examples/broken.sa:4:10 error: [SA 40] 变量未声明: missing
 ### 编译并运行
 
 ```powershell
-python -m sonalgebraic run examples/hello.sa
+python -m sonalgebraic run examples/basics/hello.sa
 ```
 
 `run` 会编译到临时目录后执行生成的程序，并返回程序退出码。`--` 之后的参数会原样转发给被编译的程序：
@@ -163,19 +164,19 @@ python -m sonalgebraic build app.sa -o build/app.exe
 python -m sonalgebraic build app.sa -o build/app.exe --backend native
 ```
 
-native 后端已覆盖数值、字符串、数组/指针、SYMBOL、ERROR/TRY、GOSUB、ENTITY、C FFI、用户模块以及 NET/FILE/DESKTOP runtime 调用；真实构建需要安装 `clang` 或 `zig`。外部模块导出的 ENTITY ABI 仍需按目标平台继续验证。
+native 后端已覆盖数值、字符串、数组/指针、SYMBOL、ERROR/TRY、GOSUB、ENTITY、C FFI、用户模块以及 NET/FILE/DESKTOP runtime 调用，并通过手写 LLVM IR 实现异步状态机；真实构建需要安装 `clang` 或 `zig`。异步的已验证平台及聚合参数等边界见[第 12 章](./docs/12-async.md#126-native-后端的实现与边界)。外部模块导出的 ENTITY ABI 仍需按目标平台继续验证。
 
 带用户模块时会生成一个 C 项目目录，里面包含主程序 C、模块 C、模块头文件和 `sa_runtime.h/.c`：
 
 ```powershell
-python -m sonalgebraic build examples/use_user_module.sa -o build/use_user_module.exe
+python -m sonalgebraic build examples/modules/basic/main.sa -o build/use_user_module.exe
 build/use_user_module.exe
 ```
 
 ### 只生成 C 代码
 
 ```powershell
-python -m sonalgebraic c examples/use_user_module.sa -o build/use_user_module_project
+python -m sonalgebraic c examples/modules/basic/main.sa -o build/use_user_module_project
 ```
 
 只生成 C 时也可以引用 `.spkg`：
@@ -189,7 +190,7 @@ python -m sonalgebraic c app.sa -o build/app_project --pkg build/mathlib.spkg
 ### 只生成 LLVM IR
 
 ```powershell
-python -m sonalgebraic native-ir examples/hello.sa -o build/hello.ll
+python -m sonalgebraic native-ir examples/basics/hello.sa -o build/hello.ll
 ```
 
 `native-ir` 不要求本机已有 LLVM 工具链，只做前端检查和 LLVM IR 文本生成，方便调试 native 后端。
@@ -198,13 +199,13 @@ python -m sonalgebraic native-ir examples/hello.sa -o build/hello.ll
 
 ```powershell
 # 源码包
-python -m sonalgebraic slib examples/statslib.sa -o examples/statslib.slib
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib.slib
 
 # 带静态二进制库
-python -m sonalgebraic slib examples/statslib.sa -o build/statslib_binary.slib --binary
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib_binary.slib --binary
 
 # 带动态库（Windows DLL + import lib / Linux .so / macOS .dylib）
-python -m sonalgebraic slib examples/statslib.sa -o build/statslib_dynamic.slib --dynamic
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib_dynamic.slib --dynamic
 ```
 
 ### 打包 .spkg
@@ -213,10 +214,10 @@ python -m sonalgebraic slib examples/statslib.sa -o build/statslib_dynamic.slib 
 
 ```powershell
 # 单文件包（会作为包的根模块）
-python -m sonalgebraic pack examples/mathlib.sa -o build/mathlib.spkg
+python -m sonalgebraic pack examples/modules/basic/mathlib.sa -o build/mathlib.spkg
 
-# 目录包（目录内所有 .sa 作为子模块）
-python -m sonalgebraic pack examples/mypkg -o build/mypkg.spkg
+# 目录包（将自己的库源码目录打包为多个子模块）
+python -m sonalgebraic pack path/to/mypkg -o build/mypkg.spkg
 ```
 
 编译时引用：
@@ -230,7 +231,7 @@ python -m sonalgebraic build app.sa -o build/app.exe --pkg build/mathlib.spkg
 需要安装 `zig`：
 
 ```powershell
-python -m sonalgebraic slib examples/statslib.sa -o build/statslib_linux.slib --binary --target x86_64-linux-gnu
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib_linux.slib --binary --target x86_64-linux-gnu
 python -m sonalgebraic build app.sa -o build/app_linux --target x86_64-linux-gnu
 ```
 
@@ -275,34 +276,26 @@ examples/broken.sa:4:10 error: [SA 40] 变量未声明: missing
 
 ## 示例程序
 
-仓库内置示例位于 `examples/`：
+完整入口、运行条件和学习顺序见 [examples/README.md](./examples/README.md)。目录按主题组织：
 
-- `hello.sa`：最小可运行程序，变量声明与输出。
-- `functions.sa`：非 `VOID SUB`、参数和 `AS REF`。
-- `entity.sa`：基础 `ENTITY` 字段访问。
-- `entity_strings.sa`：嵌套 `ENTITY` 字符串字段深拷贝和运行时验证。
-- `errors.sa`：`TRY` / `CATCH` / `THROW`。
-- `gosub.sa`：`GOSUB` / 无参 `RETURN`。
-- `symbol.sa`：`SYMBOL` 公式树捕获和打印。
-- `lists.sa`：`SYS.LIST` 数值/字符串动态列表。
-- `maps.sa`：`SYS.MAP` 关联容器和 KEYS 遍历。
-- `gui_hello.sa`：`SYS.GUI` 窗口、按钮、输入框和事件循环。
-- `net_tls.sa`：`SYS.NET` 的 TLS client，握手后手写一条 HTTP 请求。
-- `web_server.sa`：`SYS.NET` 的 TCP listener，accept 循环 + 路由的迷你 HTTP server，访问 `/quit` 关服。
-- `ptr_basic.sa`、`ptr_arith.sa`、`ptr_cast.sa`：typed pointer、取址、解引用和 CAST。
-- `ffi_hello.sa`：C FFI 的 `USEC` / `DECLARE C`。
-- `use_math.sa`、`use_io.sa`：内置系统模块导入。
-- `mathlib.sa`、`use_user_module.sa`：用户模块分离编译。
-- `samath.sa`、`use_samath.sa`：基于 C `math.h` FFI 的 SAMATH 数值计算库，可打包为 `.slib` 原生库。
-- `statslib.sa`、`use_statslib.sa`：`.slib` 打包/引用示例。
-- `toy.sa`：综合小演示。
-- `allexample.sa`：当前主要语言特性的 all-in-one smoke example。
+| 目录 | 内容 |
+|---|---|
+| `basics/` | 输出、子程序、分支、数组循环、字符串、错误和控制台输入 |
+| `data/` | 实体、深拷贝、列表和字典 |
+| `pointers/`、`ffi/` | 指针、堆内存与 C 函数调用 |
+| `symbolic/` | 表达式树、符号代数、流体表达式及 PDE 残差 |
+| `modules/` | 四个自包含项目，每个目录含 `main.sa` 与配套库 |
+| `platform/` | 文件、剪贴板、消息框和 GUI |
+| `network/`、`async/` | TLS/HTTP、Promise 基础与异步回显 |
+| `showcase/` | 综合语言演示 |
 
-推荐用 `allexample.sa` 快速确认当前工具链：
+`examples/catalog.json` 统一登记自动程序、交互/联网程序和库模块，测试与安装包据此检查。构建产物放在 `build/`。
+
+快速确认当前工具链：
 
 ```powershell
-python -m sonalgebraic check examples/allexample.sa
-python -m sonalgebraic run examples/allexample.sa
+python -m sonalgebraic check examples/showcase/language_tour.sa
+python -m sonalgebraic run examples/showcase/language_tour.sa
 ```
 
 ## 语言文档
@@ -353,6 +346,7 @@ python -m pytest -m ffi
 - `test_packaging.py`：模块分离编译、`.slib` 三态、`.spkg` 打包/hash/路径安全、循环依赖。
 - `test_cli.py`：`check` / `run` / `fmt` 退出码与诊断输出。
 - `test_e2e.py`（`e2e` 标记）：`hello.sa`、`entity_strings.sa` 真正编译运行。
+- `test_examples.py`：示例清单全覆盖、导航链接、模块依赖、C/native 双后端构建，以及隔离目录内自动示例输出。
 - `test_ffi_reverse.py`（`ffi` 标记）：C 程序 `#include` 头并链接调用 SA 编译出的 DLL，验证反向 FFI。
 - `test_regressions.py`：审计发现的缺陷回归，含两条结构性防护——
   - runtime 头文件与实现的一致性：codegen 会发射的每个 `sa_*` 都必须在 `RUNTIME_HEADER` 里有声明，防止模块模式下退化成隐式声明；

@@ -1,7 +1,7 @@
 """表达式发射。带 prelude / cleanup 的临时量协议在这里进出。"""
 from __future__ import annotations
 
-from ...analysis.typesys import is_cptr, is_error, is_handle, is_ptr, is_string, is_symbol, resolve_builtin_const
+from ...analysis.typesys import is_cptr, is_error, is_handle, is_ptr, is_string, is_sub_ptr, is_symbol, resolve_builtin_const
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import c_number, c_string, CGenBase
@@ -60,7 +60,21 @@ class ExprsMixin(CGenBase):
             return self.sync_expr(expr)
         if isinstance(expr, ast.CallExpr):
             return self.call_expr(expr)
+        if isinstance(expr, ast.SubRef):
+            return self.sub_ref_value(expr)
         raise SonCompileError("未知表达式类型", expr.line_no)
+
+    def sub_ref_value(self, expr: ast.SubRef) -> str:
+        """@name() 的 C 值：被引用函数的地址擦成 SaSubFn。解析顺序与语义层 sub_ref_type 一致；
+        C 函数直接取裸地址、不生成转接函数，这样它原样交回给 C 时仍是那个函数。"""
+        if self.checked.subs.get(expr.name.lower()) is not None:
+            return f"((SaSubFn){self.sub_c_name(expr.name)})"
+        if self.resolve_external_sub(expr.name) is not None:
+            return f"((SaSubFn){self.call_c_name(expr.name)})"
+        c_func = self.resolve_c_func(expr.name)
+        if c_func is not None:
+            return f"((SaSubFn){c_func.name})"
+        raise SonCompileError(f"@{expr.name}() 找不到可取引用的 SUB 或 C 函数", expr.line_no)
 
     def binary(self, expr: ast.Binary) -> str:
         if expr.op == "**":
@@ -148,6 +162,9 @@ class ExprsMixin(CGenBase):
                 self.add_prelude(line)
             for line in cleanup:
                 self.add_cleanup(line)
+            if is_sub_ptr(c_func.return_type):
+                # C 返回的是具体类型的函数指针，统一擦成 SaSubFn 才能和 SA 侧的函数引用互相赋值、比较
+                return f"((SaSubFn){c_func.name}({', '.join(args)}))"
             return f"{c_func.name}({', '.join(args)})"
         sub = self.checked.subs.get(expr.name.lower()) or self.resolve_external_sub(expr.name)
         if sub is not None:
@@ -159,6 +176,14 @@ class ExprsMixin(CGenBase):
             if sub.is_async:
                 return f"{self.call_c_name(expr.name)}_start({', '.join(args)})"
             return self.owned_call_result(f"{self.call_c_name(expr.name)}({', '.join(args)})", sub.return_type)
+        indirect = self.callable_call(expr.name, expr.args, expr.line_no)
+        if indirect is not None:
+            prelude, call, cleanup, return_type = indirect
+            for line in prelude:
+                self.add_prelude(line)
+            for line in cleanup:
+                self.add_cleanup(line)
+            return self.owned_call_result(call, return_type)
         raise SonCompileError(f"未知内置函数: {expr.name}", expr.line_no)
 
     def owned_call_result(self, call: str, return_type: ast.TypeSpec) -> str:

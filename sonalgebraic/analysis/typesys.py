@@ -148,6 +148,76 @@ def is_promise(type_spec: ast.TypeSpec) -> bool:
     return type_spec.name == "PROMISE"
 
 
+def is_sub_type(type_spec: ast.TypeSpec) -> bool:
+    """callable 实体（NEW SUB 生成）：托管、引用计数，离开作用域释放。"""
+    return type_spec.name == "SUB"
+
+
+def is_sub_ptr(type_spec: ast.TypeSpec) -> bool:
+    """函数引用 PTR TO SUB(...)：只读值，不拥有函数代码。"""
+    return type_spec.name == "PTR" and type_spec.inner is not None and type_spec.inner.name == "SUB"
+
+
+def is_callable_value(type_spec: ast.TypeSpec) -> bool:
+    return is_sub_type(type_spec) or is_sub_ptr(type_spec)
+
+
+def sub_signature(type_spec: ast.TypeSpec) -> ast.TypeSpec:
+    """函数引用和 callable 实体共用同一种签名表示（SUB spec），调用检查只认签名。"""
+    if is_sub_ptr(type_spec):
+        assert type_spec.inner is not None
+        return type_spec.inner
+    return type_spec
+
+
+def sub_type_for(params: list[ast.Param] | tuple[ast.Param, ...], return_type: ast.TypeSpec) -> ast.TypeSpec:
+    return ast.TypeSpec("SUB", inner=return_type, params=tuple(params))
+
+
+def sub_ref_type(
+    name: str,
+    subs: dict[str, ast.Subroutine],
+    external_modules: dict[str, ModuleExports],
+    c_funcs: dict[str, ast.CFunctionDecl],
+    line_no: int,
+) -> ast.TypeSpec:
+    """@name() 的类型：PTR TO SUB(被引用函数的签名)。查找顺序与普通调用一致。"""
+    sub = subs.get(name.lower())
+    if sub is None:
+        split = split_module_member(name)
+        module = external_modules.get(split[0]) if split is not None else None
+        if module is not None and split is not None:
+            sub = module.subs.get(split[1].lower())
+    if sub is not None:
+        if sub.is_async:
+            raise SonCompileError(f"不能对 ASYNC SUB 取函数引用: {name}（协程入口返回 PROMISE，签名与普通 SUB 不同）", line_no)
+        return ast.TypeSpec("PTR", inner=sub_type_for(sub.params, sub.return_type))
+    c_func = resolve_c_func(name, c_funcs)
+    if c_func is not None:
+        return ast.TypeSpec("PTR", inner=sub_type_for(c_func.params, c_func.return_type))
+    raise SonCompileError(f"@{name}() 找不到可取引用的 SUB 或 C 函数（内置模块函数不能取引用）", line_no)
+
+
+def callable_symbol_type(
+    name: str,
+    symbols: dict[str, Symbol],
+    entities: dict[str, ast.EntityDef],
+    line_no: int,
+) -> ast.TypeSpec | None:
+    """name 是 callable 实体 / 函数引用变量（可带 ENTITY 字段路径）时返回其类型，否则 None。
+
+    解析失败也返回 None 而不是抛错：调用点在查完 SUB / C 函数之后才轮到这里，
+    查不到应该落回调用点原有的「未知 SUB」诊断，而不是冒出一条字段错误把人带偏。
+    """
+    if name.split(".")[0].lower() not in symbols and name.lower() not in symbols:
+        return None
+    try:
+        type_spec = resolve_path_type(name, symbols, entities, line_no)
+    except SonCompileError:
+        return None
+    return type_spec if is_callable_value(type_spec) and type_spec.array_size is None else None
+
+
 def same_handle_kind(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
     return is_handle(left) and is_handle(right) and (left.subtype or "").lower() == (right.subtype or "").lower()
 
@@ -163,11 +233,30 @@ def same_type_spec(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
         return False
     if (left.inner is None) != (right.inner is None):
         return False
-    return left.inner is None or same_type_spec(left.inner, right.inner)
+    if left.inner is not None and right.inner is not None and not same_type_spec(left.inner, right.inner):
+        return False
+    # SUB 签名：参数名只是文档，不参与比较；传参方式和类型必须逐个一致，
+    # 否则经函数引用调用时按错的 ABI 传参。
+    left_params = left.params or ()
+    right_params = right.params or ()
+    if len(left_params) != len(right_params):
+        return False
+    return all(
+        lp.by_ref == rp.by_ref and same_type_spec(lp.type_spec, rp.type_spec)
+        for lp, rp in zip(left_params, right_params)
+    )
 
 
 def describe_type(type_spec: ast.TypeSpec) -> str:
     """把 TypeSpec 还原成接近源码写法的形式，让诊断信息能直接照抄改。"""
+    if type_spec.name == "SUB":
+        params = ", ".join(
+            f"{param.name} AS {describe_type(param.type_spec)}{' AS REF' if param.by_ref else ''}"
+            for param in type_spec.params or ()
+        )
+        ret = type_spec.inner or VOID
+        text = f"SUB({params}) AS {describe_type(ret)}"
+        return f"{text}[{type_spec.array_size}]" if type_spec.array_size is not None else text
     text = type_spec.name
     if type_spec.inner is not None:
         text = f"{text} TO {describe_type(type_spec.inner)}"
@@ -212,6 +301,8 @@ def type_of(
         return BOOL if expr.op == "NOT" else type_of(expr.expr, symbols, subs, entities, uses, external_modules, c_funcs)
     if isinstance(expr, ast.Deref):
         ptr_type = type_of(expr.expr, symbols, subs, entities, uses, external_modules, c_funcs)
+        if is_sub_ptr(ptr_type):
+            raise SonCompileError("^ 不能用于函数引用；要调用它直接写 name(args)", expr.line_no)
         if is_ptr(ptr_type) and ptr_type.inner is not None:
             return ptr_type.inner
         if is_cptr(ptr_type):
@@ -221,7 +312,13 @@ def type_of(
         if not isinstance(expr.expr, ast.VarRef):
             raise SonCompileError("@ 只能用于变量", expr.line_no)
         inner = resolve_path_type(expr.expr.name, symbols, entities, expr.line_no)
+        # PTR TO SUB 已经被「函数引用」占用：让 @callable 也得到这个类型，C 层的
+        # SaCallable** 就会被当成 SaSubFn 调用。
+        if is_sub_type(inner):
+            raise SonCompileError(f"不能对 callable 实体取址: {expr.expr.name}（要传递它请直接赋值或按值传参）", expr.line_no)
         return ast.TypeSpec("PTR", inner=inner)
+    if isinstance(expr, ast.SubRef):
+        return sub_ref_type(expr.name, subs, external_modules, c_funcs, expr.line_no)
     if isinstance(expr, ast.Cast):
         return expr.type_spec
     if isinstance(expr, ast.Index):
@@ -241,7 +338,7 @@ def type_of(
             return SYMBOL
         if expr.op == "**":
             return DOUBLE
-        if is_ptr(left) and is_numeric(right) and expr.op in {"+", "-"}:
+        if is_ptr(left) and not is_sub_ptr(left) and is_numeric(right) and expr.op in {"+", "-"}:
             return left
         return wider_numeric(left, right, expr.line_no)
     if isinstance(expr, ast.AwaitExpr | ast.SyncExpr):
@@ -304,6 +401,9 @@ def type_of(
             if sub.is_async:
                 return ast.TypeSpec("PROMISE", inner=sub.return_type)
             return sub.return_type
+        callable_type = callable_symbol_type(expr.name, symbols, entities, expr.line_no)
+        if callable_type is not None:
+            return sub_signature(callable_type).inner or VOID
     raise SonCompileError("无法推断表达式类型", expr.line_no)
 
 
@@ -341,9 +441,15 @@ def c_type(type_spec: ast.TypeSpec) -> str:
         return "double"
     if type_spec.name == "ENTITY":
         return f"SaEntity_{entity_c_name(type_spec.subtype or '')}"
+    if type_spec.name == "SUB":
+        return "SaCallable*"
     if type_spec.name == "PTR":
         if type_spec.inner is None:
             raise SonCompileError("PTR 类型缺少内部类型", 0)
+        if type_spec.inner.name == "SUB":
+            # C 的函数指针声明是 `ret (*name)(args)`，名字夹在类型中间，套不进生成器里
+            # 到处在用的 `{ctype} {name}` 模板。统一擦成 SaSubFn，调用点再按签名强转回去。
+            return "SaSubFn"
         return c_type(type_spec.inner) + "*"
     raise SonCompileError(f"无法映射到 C 类型: {type_spec.name}")
 
@@ -700,9 +806,15 @@ def resolve_map_function(name: str, uses: dict[str, str]) -> tuple[list[ast.Type
     return MAP_FUNCTIONS.get(member.upper())
 
 
-# SYS.GUI 窗口模块：轮询式事件（SA 没有函数指针，不做回调注册）。
-# BUTTON 创建时带用户自定义 control id，WAIT_EVENT 阻塞返回被点击的 id，
-# 0 表示所有窗口已关闭。仅 Windows 实现，POSIX 全部失败并给 LAST_ERROR。
+# 按钮点击回调的签名：SUB onClick(id AS NUM AS LONG)。id 就是 BUTTON 创建时给的 control id，
+# 一个 SUB 能服务多个按钮。
+GUI_CLICK_HANDLER = ast.TypeSpec("SUB", inner=VOID, params=(ast.Param("id", LONG, False, 0),))
+
+# SYS.GUI 窗口模块，两种事件模型共存、共用同一个事件队列：
+# - 轮询：BUTTON 创建时带用户自定义 control id，WAIT_EVENT 阻塞返回被点击的 id，
+#   0 表示所有窗口已关闭；
+# - 回调：ON_CLICK 给按钮挂一个 callable，RUN 跑事件循环并派发，直到窗口全关。
+# Windows 走 Win32，Linux 可选 GTK3（SA_ENABLE_GUI_GTK）；别的平台全部失败并给 LAST_ERROR。
 GUI_FUNCTIONS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
     "WINDOW": ([STRING, LONG, LONG], GUI_WINDOW_HANDLE),
     "BUTTON": ([GUI_WINDOW_HANDLE, LONG, STRING, LONG, LONG, LONG, LONG], GUI_WIDGET_HANDLE),
@@ -711,6 +823,8 @@ GUI_FUNCTIONS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
     "SET_TEXT": ([GUI_WIDGET_HANDLE, STRING], BOOL),
     "GET_TEXT": ([GUI_WIDGET_HANDLE], STRING),
     "WAIT_EVENT": ([], LONG),
+    "ON_CLICK": ([GUI_WIDGET_HANDLE, GUI_CLICK_HANDLER], BOOL),
+    "RUN": ([], BOOL),
     "CLOSE": ([GUI_WINDOW_HANDLE], BOOL),
     "LAST_ERROR": ([], STRING),
 }

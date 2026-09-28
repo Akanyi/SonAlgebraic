@@ -7,8 +7,8 @@ from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
 from ..core.lines import LINT_OPTIONS
-from .ownership import check_ownership
-from .typesys import BUILTIN_MODULES, describe_type, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_promise, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
+from .ownership import check_ownership, is_managed_type
+from .typesys import BUILTIN_MODULES, VOID, callable_symbol_type, describe_type, is_callable_value, is_sub_ptr, is_sub_type, sub_signature, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_promise, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
 
 
 @dataclass(frozen=True)
@@ -146,6 +146,12 @@ def collect_sub_diagnostics(
         if _add_diagnostic(diagnostics, exc, max_errors):
             return
 
+    try:
+        check_callable_flow(sub)
+    except SonCompileError as exc:
+        if _add_diagnostic(diagnostics, exc, max_errors):
+            return
+
     for stmt in sub.body:
         stmt_ok = True
         try:
@@ -230,6 +236,14 @@ def collect_c_funcs(program: ast.Program, c_headers: dict[str, ast.UseCHeader]) 
         key = f"{decl.alias.lower()}.{decl.name.lower()}"
         if key in funcs:
             raise SonCompileError(f"重复 DECLARE C: {decl.alias}.{decl.name}", decl.line_no)
+        # FFI 边界上 PTR TO SUB 就是 C 函数指针；callable 实体是 SA 运行时托管的对象，
+        # C 那边既不会 retain / release 它，也不认识它的布局，所以不能过边界。
+        for type_spec in [decl.return_type, *(param.type_spec for param in decl.params)]:
+            if _ffi_rejects_callable(type_spec):
+                raise SonCompileError(
+                    "DECLARE C 的参数和返回值不能是 callable 实体（SUB 类型）；C 回调请用函数引用 PTR TO SUB",
+                    decl.line_no,
+                )
         funcs[key] = decl
     return funcs
 
@@ -285,7 +299,12 @@ def collect_symbols(
             raise SonCompileError(f"重复声明变量: {decl.name}", decl.line_no)
         reject_use_alias_conflict(decl.name, uses, decl.line_no, decl.type_spec)
         reject_unsupported_type(decl.type_spec, decl.line_no, entities=entities, uses=uses, external_modules=external_modules, allow_entity=True)
+        reject_callable_name_conflict(decl.name, decl.type_spec, {sub.name.lower() for sub in program.subs}, decl.line_no)
         symbols[key] = Symbol(decl.name, decl.type_spec, decl.mutable)
+        if decl.expr is not None and _contains_sub_ref(decl.expr):
+            # 全局初值在 SUB 表建立之前检查，这时 @foo() 还解析不到；与其为它单独排一遍顺序，
+            # 不如让用户在 main 里赋值——函数引用本来就是零成本的值。
+            raise SonCompileError("全局变量的初值不能是函数引用 @name()；请声明后在 SUB 里赋值", decl.line_no)
         if decl.expr is not None:
             check_expr(decl.expr, symbols, {}, entities, uses, external_modules, {}, {}, c_funcs or {})
             expr_type = type_of(decl.expr, symbols, {}, entities, uses, external_modules, c_funcs)
@@ -305,6 +324,8 @@ def collect_subs(
         if key in subs:
             raise SonCompileError(f"重复定义 SUB: {sub.name}", sub.line_no)
         # ENTITY existence is validated during statement/type resolution where the entity table is available.
+        if sub.is_async:
+            reject_unsupported_async_result(sub.return_type, sub.line_no, "ASYNC SUB 返回类型")
         reject_unsupported_type(sub.return_type, sub.line_no, allow_void=True, allow_entity=True, uses=uses, external_modules=external_modules)
         seen_params: set[str] = set()
         for param in sub.params:
@@ -316,6 +337,7 @@ def collect_subs(
                 raise SonCompileError("ASYNC SUB 不支持 AS REF 参数（协程帧需独占参数所有权）", param.line_no)
             reject_use_alias_conflict(param.name, uses, param.line_no)
             reject_unsupported_type(param.type_spec, param.line_no, allow_entity=True, uses=uses, external_modules=external_modules)
+            reject_callable_name_conflict(param.name, param.type_spec, {other.name.lower() for other in program.subs}, param.line_no)
         subs[key] = sub
     return subs
 
@@ -338,6 +360,7 @@ def check_sub(
     labels = collect_labels(sub.body)
     reject_end_in_sub(sub.body)
     check_await_placement(sub.body, sub.is_async)
+    check_callable_flow(sub)
     for stmt in sub.body:
         check_stmt(stmt, scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
         check_return(stmt, sub.return_type, scope, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
@@ -415,7 +438,8 @@ def has_required_return_path(body: list[ast.Stmt], jump_targets: set[str] | None
             if stmt.name.lower() in jump_targets:
                 return False
             continue
-        if isinstance(stmt, ast.Return):
+        # CALLRET 把 callable 的结果当作本 SUB 的返回值交出去，和 RETURN 一样终结路径
+        if isinstance(stmt, ast.Return | ast.CallRet):
             return True
         # 带 ELSE 的 IF：当 then、所有 ELSE IF、ELSE 分支都保证返回时，整条 IF 必定返回
         if isinstance(stmt, ast.If) and stmt.else_body:
@@ -481,6 +505,10 @@ def check_return(
             if isinstance(inner, ast.LocalDeclaration):
                 scope[inner.name.lower()] = Symbol(inner.name, inner.type_spec, inner.mutable)
                 continue
+            if isinstance(inner, ast.NewSub):
+                source_type = type_of(inner.source, scope, subs, entities, uses, external_modules, c_funcs)
+                scope[inner.name.lower()] = Symbol(inner.name, sub_signature(source_type), True)
+                continue
             check_return(inner, return_type, scope, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
 
     if isinstance(stmt, ast.If):
@@ -499,6 +527,19 @@ def check_return(
             branch_symbols = symbols.copy()
             branch_symbols[branch.alias.lower()] = Symbol(branch.alias, ast.TypeSpec("ERROR"), False)
             check_body(branch.body, branch_symbols)
+        return
+    if isinstance(stmt, ast.CallRet):
+        callee = callable_symbol_type(stmt.name, symbols, entities, stmt.line_no)
+        # VOID SUB 的 CALLRET 只是「调用后结束」，callee 有返回值也照样丢弃
+        if callee is None or return_type.name == "VOID":
+            return
+        callee_ret = sub_signature(callee).inner or VOID
+        if callee_ret.name == "VOID":
+            raise SonCompileError(
+                f"非 VOID SUB 里 CALLRET 的结果就是本 SUB 的返回值，{stmt.name} 却不返回值（{describe_type(callee)}）",
+                stmt.line_no,
+            )
+        require_assignable(return_type, callee_ret, stmt.line_no)
         return
     if not isinstance(stmt, ast.Return):
         return
@@ -530,6 +571,7 @@ def check_stmt(
             raise SonCompileError(f"重复声明变量: {stmt.name}", stmt.line_no)
         reject_use_alias_conflict(stmt.name, uses, stmt.line_no)
         reject_unsupported_type(stmt.type_spec, stmt.line_no, entities=entities, uses=uses, external_modules=external_modules, allow_entity=True)
+        reject_callable_name_conflict(stmt.name, stmt.type_spec, set(subs), stmt.line_no)
         symbols[key] = Symbol(stmt.name, stmt.type_spec, stmt.mutable)
         if stmt.expr is not None:
             check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
@@ -554,7 +596,12 @@ def check_stmt(
         else:
             raise SonCompileError("赋值目标必须是变量、数组元素或 ^指针", stmt.line_no)
         check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
-        if stmt.mode != "copy":
+        if stmt.mode != "copy" and (is_sub_ptr(target_type) or isinstance(stmt.expr, ast.SubRef)):
+            # 函数引用是只读的值：借用和复制没有区别，所以 f= 退化成普通赋值检查；
+            # 它不拥有函数代码，没有可以转交的东西，m= 无从谈起。
+            if stmt.mode == "move":
+                raise SonCompileError("函数引用不持有函数代码的所有权，没有可转移的东西，不能 m= 移动；复制或借用请用 = / f=", stmt.line_no)
+        elif stmt.mode != "copy":
             # f=/m= 要求两侧严格同型且是托管类型，这些连同所有权状态一起由 ownership 预检负责；
             # 这里只保留上面那几条对所有赋值都成立的检查（CONST、变量存在性）。
             return
@@ -565,6 +612,7 @@ def check_stmt(
         if stmt.expr is not None:
             check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
             reject_unowned_buffer_calls(stmt.expr, uses)
+            reject_printing_callable(type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs), stmt.line_no)
     elif isinstance(stmt, ast.Input):
         symbol = require_symbol(stmt.target, symbols, stmt.line_no)
         if not symbol.mutable:
@@ -578,7 +626,14 @@ def check_stmt(
         sub = subs.get(stmt.name.lower()) or resolve_external_sub(stmt.name, uses, external_modules)
         c_func = resolve_c_func(stmt.name, c_funcs)
         if sub is None and c_func is None:
-            raise SonCompileError(f"未知 SUB 或 C 函数: {stmt.name}", stmt.line_no)
+            callee = callable_symbol_type(stmt.name, symbols, entities, stmt.line_no)
+            if callee is None:
+                raise SonCompileError(f"未知 SUB 或 C 函数: {stmt.name}", stmt.line_no)
+            signature = sub_signature(callee)
+            if (signature.inner or VOID).name != "VOID":
+                raise SonCompileError("带返回值的 callable 必须通过 `x = CALL name(...)` 使用", stmt.line_no)
+            check_call_args(stmt.name, stmt.args, signature, symbols, subs, entities, uses, external_modules, stmt.line_no, c_headers, c_libs, c_funcs)
+            return
         target = sub if sub is not None else c_func
         if sub is not None and sub.is_async:
             raise SonCompileError("ASYNC SUB 不能用独立 CALL 调用；请用 `AWAIT`、`SYNC` 或 `p = CALL ...`", stmt.line_no)
@@ -590,6 +645,8 @@ def check_stmt(
         if not is_error(trap.type_spec):
             raise SonCompileError("TRACEBACK 目标必须是 ERROR 变量", stmt.line_no)
         sub = subs.get(stmt.call_name.lower()) or resolve_external_sub(stmt.call_name, uses, external_modules)
+        if sub is None and callable_symbol_type(stmt.call_name, symbols, entities, stmt.line_no) is not None:
+            raise SonCompileError(f"TRY CALL 暂不支持经 callable / 函数引用调用: {stmt.call_name}；请包一层具名 SUB", stmt.line_no)
         if sub is None:
             raise SonCompileError(f"未知 SUB: {stmt.call_name}", stmt.line_no)
         if sub.is_async:
@@ -656,6 +713,119 @@ def check_stmt(
         check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
     elif isinstance(stmt, ast.AwaitStmt):
         check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+    elif isinstance(stmt, ast.NewSub):
+        key = stmt.name.lower()
+        if key in symbols:
+            raise SonCompileError(f"重复声明变量: {stmt.name}", stmt.line_no)
+        reject_use_alias_conflict(stmt.name, uses, stmt.line_no)
+        check_expr(stmt.source, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        source_type = type_of(stmt.source, symbols, subs, entities, uses, external_modules, c_funcs)
+        if not is_sub_ptr(source_type):
+            raise SonCompileError(
+                f"NEW SUB 的来源必须是函数引用（PTR TO SUB，比如 @foo()），实际是 {describe_type(source_type)}",
+                stmt.line_no,
+            )
+        signature = sub_signature(source_type)
+        reject_callable_name_conflict(stmt.name, signature, set(subs), stmt.line_no)
+        symbols[key] = Symbol(stmt.name, signature, True)
+    elif isinstance(stmt, ast.CallRet):
+        callee = callable_symbol_type(stmt.name, symbols, entities, stmt.line_no)
+        if callee is None:
+            if subs.get(stmt.name.lower()) or resolve_external_sub(stmt.name, uses, external_modules) or resolve_c_func(stmt.name, c_funcs):
+                raise SonCompileError(
+                    f"CALLRET 的目标必须是 callable 实体或函数引用变量；具名 SUB {stmt.name} 请直接 CALL 后 RETURN",
+                    stmt.line_no,
+                )
+            raise SonCompileError(f"CALLRET 的目标必须是 callable 实体或函数引用变量: {stmt.name}", stmt.line_no)
+        check_call_args(stmt.name, stmt.args, sub_signature(callee), symbols, subs, entities, uses, external_modules, stmt.line_no, c_headers, c_libs, c_funcs)
+
+
+def _contains_sub_ref(value: object) -> bool:
+    if isinstance(value, ast.SubRef):
+        return True
+    if isinstance(value, ast.Expr):
+        return any(_contains_sub_ref(getattr(value, name)) for name in vars(value) if name != "line_no")
+    if isinstance(value, list):
+        return any(_contains_sub_ref(item) for item in value)
+    return False
+
+
+def _ffi_rejects_callable(type_spec: ast.TypeSpec) -> bool:
+    if is_sub_type(type_spec):
+        return True
+    if is_sub_ptr(type_spec):
+        signature = sub_signature(type_spec)
+        return any(_ffi_rejects_callable(param.type_spec) for param in signature.params or ()) or _ffi_rejects_callable(signature.inner or VOID)
+    return type_spec.inner is not None and _ffi_rejects_callable(type_spec.inner)
+
+
+# 表达式里 `name(args)` 先按内置函数、C 函数、SUB 查，最后才轮到 callable 变量。和它们重名的
+# callable 永远调不到，与其默默遮蔽，不如声明时就拦下。
+_CALL_BUILTINS = {"number", "string", "deriv", "simplify", "subst", "eval"}
+
+
+def reject_callable_name_conflict(name: str, type_spec: ast.TypeSpec, sub_names: set[str], line_no: int) -> None:
+    if not is_callable_value(type_spec):
+        return
+    key = name.lower()
+    if key in sub_names:
+        raise SonCompileError(f"callable / 函数引用变量不能与 SUB 同名: {name}（调用时 SUB 优先，这个变量永远调不到）", line_no)
+    if key in _CALL_BUILTINS:
+        raise SonCompileError(f"callable / 函数引用变量不能与内置函数同名: {name}", line_no)
+
+
+def reject_printing_callable(type_spec: ast.TypeSpec, line_no: int) -> None:
+    if is_callable_value(type_spec):
+        raise SonCompileError("函数引用 / callable 不能打印或转成 STRING；要判断是否为空请用 `= NULL`", line_no)
+
+
+def _gosub_in(body: list[ast.Stmt]) -> bool:
+    for stmt in body:
+        if isinstance(stmt, ast.Gosub):
+            return True
+        if any(_gosub_in(inner) for inner in _child_bodies(stmt)):
+            return True
+    return False
+
+
+def _child_bodies(stmt: ast.Stmt) -> list[list[ast.Stmt]]:
+    if isinstance(stmt, ast.If):
+        return [stmt.body, *(branch.body for branch in stmt.elifs), stmt.else_body]
+    if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
+        return [stmt.body]
+    if isinstance(stmt, ast.TryCatch):
+        return [branch.body for branch in stmt.catches]
+    return []
+
+
+def check_callable_flow(sub: ast.Subroutine) -> None:
+    """NEW SUB / CALLRET 的结构约束，和 check_await_placement 一样是纯语法层的扫描。
+
+    - CALLRET 终结控制流，同块里它后面的语句不可达（遇到标签为止：标签可能被 GOTO 跳进来）；
+    - ASYNC SUB 的局部变量要搬进协程帧，NEW SUB 的块尾释放、CALLRET 的提前返回都还没接进状态机；
+    - 含 GOSUB 的 SUB 里 RETURN 还兼任「回到 GOSUB 调用点」，CALLRET 算哪种说不清，先不让用。
+    """
+    has_gosub = _gosub_in(sub.body)
+
+    def walk(body: list[ast.Stmt]) -> None:
+        terminated_at: int | None = None
+        for stmt in body:
+            if isinstance(stmt, ast.Label):
+                terminated_at = None
+            elif terminated_at is not None and not isinstance(stmt, ast.NoOp):
+                raise SonCompileError(f"CALLRET 之后的代码不可达（CALLRET 在第 {terminated_at} 行）", stmt.line_no)
+            if isinstance(stmt, ast.NewSub) and sub.is_async:
+                raise SonCompileError("ASYNC SUB 里暂不支持 NEW SUB（callable 的块尾释放还没接进协程状态机）", stmt.line_no)
+            if isinstance(stmt, ast.CallRet):
+                if sub.is_async:
+                    raise SonCompileError("ASYNC SUB 里暂不支持 CALLRET", stmt.line_no)
+                if has_gosub:
+                    raise SonCompileError("含 GOSUB 的 SUB 里不能使用 CALLRET（RETURN 在这里还兼任 GOSUB 返回，CALLRET 的出口含义不明确）", stmt.line_no)
+                terminated_at = stmt.line_no
+            for inner in _child_bodies(stmt):
+                walk(inner)
+
+    walk(sub.body)
 
 
 def check_expr(
@@ -697,10 +867,26 @@ def check_expr(
         if not is_ptr(ptr_type):
             raise SonCompileError("^ 只能用于指针类型", expr.line_no)
     elif isinstance(expr, ast.AddressOf):
+        if isinstance(expr.expr, ast.VarRef) and expr.expr.name.split(".")[0].lower() not in symbols and (
+            expr.expr.name.lower() in subs or resolve_external_sub(expr.expr.name, uses, external_modules) is not None
+        ):
+            raise SonCompileError(f"`@{expr.expr.name}` 是取变量地址；要取函数引用请写 `@{expr.expr.name}()`", expr.line_no)
         check_expr(expr.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         if not isinstance(expr.expr, ast.VarRef):
             raise SonCompileError("@ 只能用于变量", expr.line_no)
         reject_address_of_constant(expr.expr.name, symbols, uses, external_modules, expr.line_no)
+        type_of(expr, symbols, subs, entities, uses, external_modules, c_funcs)
+    elif isinstance(expr, ast.SubRef):
+        ref_type = type_of(expr, symbols, subs, entities, uses, external_modules, c_funcs)
+        c_func = resolve_c_func(expr.name, c_funcs)
+        ret = sub_signature(ref_type).inner or VOID
+        # @cfunc() 就是 C 函数的裸地址。经函数引用调用时按 SA 的约定，托管类型的返回值归调用方
+        # 并在语句尾释放；C 函数返回的串是谁的没人说得清，按 SA 约定去 free 就可能释放静态内存。
+        if c_func is not None and (subs.get(expr.name.lower()) is None) and is_managed_type(ret, entities, external_modules):
+            raise SonCompileError(
+                f"不能对返回 {describe_type(ret)} 的 C 函数取函数引用: {expr.name}（C 返回值的所有权不归 SA 管）",
+                expr.line_no,
+            )
     elif isinstance(expr, ast.Cast):
         check_expr(expr.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         reject_unsupported_type(expr.type_spec, expr.line_no, allow_entity=True, entities=entities, uses=uses, external_modules=external_modules)
@@ -728,6 +914,7 @@ def check_expr(
         for part in expr.parts:
             if isinstance(part, ast.Expr):
                 check_expr(part, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+                reject_printing_callable(type_of(part, symbols, subs, entities, uses, external_modules, c_funcs), part.line_no)
     elif isinstance(expr, ast.AwaitExpr | ast.SyncExpr):
         check_expr(expr.operand, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         keyword = "AWAIT" if isinstance(expr, ast.AwaitExpr) else "SYNC"
@@ -798,6 +985,8 @@ def check_expr(
             if builtin == "NUMBER":
                 if not is_string(arg_type):
                     raise SonCompileError("NUMBER() 的参数必须是 STRING", arg.line_no)
+            elif is_callable_value(arg_type):
+                reject_printing_callable(arg_type, arg.line_no)
             elif not (
                 is_string(arg_type)
                 or is_numeric(arg_type)
@@ -811,7 +1000,14 @@ def check_expr(
                 raise SonCompileError(f"STRING() 不支持这个类型的参数: {arg_type.name}", arg.line_no)
             return
         elif sub is None and c_func is None:
-            raise SonCompileError(f"未知内置函数或 SUB: {expr.name}", expr.line_no)
+            callee = callable_symbol_type(expr.name, symbols, entities, expr.line_no)
+            if callee is None:
+                raise SonCompileError(f"未知内置函数或 SUB: {expr.name}", expr.line_no)
+            signature = sub_signature(callee)
+            if (signature.inner or VOID).name == "VOID":
+                raise SonCompileError(f"不返回值的 callable 不能作为表达式使用: {expr.name}", expr.line_no)
+            check_call_args(expr.name, expr.args, signature, symbols, subs, entities, uses, external_modules, expr.line_no, c_headers, c_libs, c_funcs)
+            return
         target = sub if sub is not None else c_func
         if target is not None:
             # ASYNC SUB 即使返回 VOID，其调用也产出 PROMISE（非 void 值），可作表达式
@@ -916,6 +1112,18 @@ def resolve_symbol_path(
 def require_assignable(target: ast.TypeSpec, source: ast.TypeSpec, line_no: int) -> None:
     if target.array_size is not None or source.array_size is not None:
         raise SonCompileError("数组不能整体赋值或作为标量传递，请通过下标访问元素", line_no)
+    # 函数引用 / callable 放在最前：后面那条「SYMBOL 什么都收」以及 PTR 与数值互通的宽松
+    # 规则都不能漏到它们身上——签名差一点，经函数引用调用时就是按错的 ABI 传参。
+    if is_callable_value(target) or is_callable_value(source):
+        if is_callable_value(target) and is_null(source):
+            return
+        if (is_sub_type(target) and is_sub_type(source)) or (is_sub_ptr(target) and is_sub_ptr(source)):
+            if same_type_spec(target, source):
+                return
+            raise SonCompileError(f"函数签名不一致：需要 {describe_type(target)}，实际是 {describe_type(source)}", line_no)
+        if is_sub_type(target) and is_sub_ptr(source):
+            raise SonCompileError("callable 实体要用 `NEW SUB 名称 FROM 函数引用` 生成，不能直接拿函数引用赋值", line_no)
+        raise SonCompileError(f"赋值两侧类型不兼容：需要 {describe_type(target)}，实际是 {describe_type(source)}", line_no)
     if is_string(target) and is_string(source):
         return
     if is_numeric(target) and is_numeric(source):
@@ -974,7 +1182,7 @@ def check_symbol_algebra_call(
 def check_call_args(
     name: str,
     args: list[ast.Expr],
-    sub: ast.Subroutine | ast.CFunctionDecl,
+    sub: ast.Subroutine | ast.CFunctionDecl | ast.TypeSpec,
     symbols: dict[str, Symbol],
     subs: dict[str, ast.Subroutine],
     entities: dict[str, ast.EntityDef],
@@ -1061,6 +1269,15 @@ def list_producing_call(expr: ast.CallExpr, uses: dict[str, str]) -> bool:
     return bool(fn and is_list_handle(fn[1]))
 
 
+def reject_unsupported_async_result(type_spec: ast.TypeSpec, line_no: int, context: str) -> None:
+    # Promise 槽位只承载标量结果；参数仍按普通类型规则检查，不能把结果限制套到参数上。
+    if type_spec.array_size is not None or type_spec.name not in {"NUM", "BOOL", "STRING", "HANDLE", "VOID"}:
+        raise SonCompileError(
+            f"{context}不支持 {describe_type(type_spec)}；当前支持非数组 NUM / BOOL / STRING / HANDLE / VOID",
+            line_no,
+        )
+
+
 def reject_unsupported_type(
     type_spec: ast.TypeSpec,
     line_no: int,
@@ -1072,7 +1289,9 @@ def reject_unsupported_type(
 ) -> None:
     # 数组：校验元素类型即可（元素类型 = 去掉 array_size）
     if type_spec.array_size is not None:
-        element = ast.TypeSpec(type_spec.name, type_spec.subtype, type_spec.inner)
+        element = ast.TypeSpec(type_spec.name, type_spec.subtype, type_spec.inner, params=type_spec.params)
+        if is_callable_value(element):
+            raise SonCompileError("数组暂不支持 SUB / PTR TO SUB 元素类型", line_no)
         # 支持值类型和 STRING 元素；SYMBOL/ERROR/ENTITY 数组需逐元素深拷贝，留待后续
         if element.name in {"SYMBOL", "ERROR", "ENTITY"}:
             raise SonCompileError(f"数组暂不支持 {element.name} 元素类型，当前支持 NUM/BOOL/HANDLE/CPTR/PTR/STRING", line_no)
@@ -1090,12 +1309,18 @@ def reject_unsupported_type(
         if type_spec.inner is not None:
             reject_unsupported_type(type_spec.inner, line_no, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
         return
+    if type_spec.name == "SUB":
+        for param in type_spec.params or ():
+            reject_unsupported_type(param.type_spec, line_no, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
+        if type_spec.inner is not None and is_promise(type_spec.inner):
+            raise SonCompileError("SUB 签名的返回类型不能是 PROMISE（ASYNC SUB 不能取函数引用）", line_no)
+        reject_unsupported_type(type_spec.inner or VOID, line_no, allow_void=True, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
+        return
     if type_spec.name == "PROMISE":
         if type_spec.inner is None:
             raise SonCompileError("PROMISE 必须写成 `PROMISE OF <类型>`", line_no)
-        # 结果类型允许 VOID（async void sub 的 promise），其余按普通类型校验
-        if type_spec.inner.name != "VOID":
-            reject_unsupported_type(type_spec.inner, line_no, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
+        reject_unsupported_async_result(type_spec.inner, line_no, "PROMISE 结果类型")
+        reject_unsupported_type(type_spec.inner, line_no, allow_void=True, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
         return
     if allow_entity and type_spec.name == "ENTITY":
         if entities is not None and (type_spec.subtype or "").lower() not in entities and not external_entity_exists(type_spec.subtype or "", uses or {}, external_modules or {}):
@@ -1121,6 +1346,11 @@ def validate_binary(
         if (is_numeric(left) or is_bool(left)) and (is_numeric(right) or is_bool(right)):
             return
         raise SonCompileError("位运算只能用于整数", expr.line_no)
+    if is_callable_value(left) or is_callable_value(right):
+        # 函数引用只能判等（包括和 NULL 比）；callable 实体是托管对象，比地址没有意义
+        if expr.op in {"=", "==", "!=", "<>"} and (is_sub_ptr(left) or is_null(left)) and (is_sub_ptr(right) or is_null(right)):
+            return
+        raise SonCompileError("函数引用只能做等值比较（=、<>，含与 NULL 比较），callable 实体不能参与运算", expr.line_no)
     if expr.op in {"+", "-", "*", "/", "**"}:
         if (is_numeric(left) and is_numeric(right)) or is_symbol(left) or is_symbol(right):
             return

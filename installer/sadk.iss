@@ -100,7 +100,9 @@ Source: "{#DistRoot}\_internal\*"; DestDir: "{app}\bin\_internal"; Components: c
 Source: "sadk-env.cmd"; DestDir: "{app}\bin"; Components: compiler; Flags: ignoreversion
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Components: compiler; Flags: ignoreversion
 Source: "{#SourceRoot}\docs\*"; DestDir: "{app}\docs"; Components: docs; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SourceRoot}\examples\*.sa"; DestDir: "{app}\examples"; Components: examples; Flags: ignoreversion
+Source: "{#SourceRoot}\examples\*.sa"; DestDir: "{app}\examples"; Components: examples; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceRoot}\examples\*.md"; DestDir: "{app}\examples"; Components: examples; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceRoot}\examples\catalog.json"; DestDir: "{app}\examples"; Components: examples; Flags: ignoreversion
 Source: "{#SourceRoot}\editors\vscode\sonalgebraic\*"; DestDir: "{app}\editors\vscode\sonalgebraic"; Components: vscode; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceRoot}\editors\vscode\sonalgebraic\*"; DestDir: "{code:VSCodeExtensionDir}"; Components: vscode; Tasks: vscodeext; Flags: ignoreversion recursesubdirs createallsubdirs uninsneveruninstall
 

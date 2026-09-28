@@ -387,7 +387,7 @@ def test_module_project_links_on_linux() -> None:
 
     with work_dir("sa-modlink-") as temp:
         root = Path(temp)
-        (root / "mathlib.sa").write_text(Path("examples/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
+        (root / "mathlib.sa").write_text(Path("examples/modules/basic/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
         main = root / "app.sa"
         main.write_text(
             "10 USE MATHLIB AS LIB\n"

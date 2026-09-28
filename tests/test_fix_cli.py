@@ -158,7 +158,7 @@ def test_check_json_carries_both_line_numbers(tmp_path: Path) -> None:
 
 
 def test_check_json_is_empty_list_when_clean() -> None:
-    code, out, err = _run_cli("check", str(REPO_ROOT / "examples" / "hello.sa"), "--json")
+    code, out, err = _run_cli("check", str(REPO_ROOT / "examples" / "basics" / "hello.sa"), "--json")
     assert code == 0
     assert err == ""
     assert json.loads(out) == []

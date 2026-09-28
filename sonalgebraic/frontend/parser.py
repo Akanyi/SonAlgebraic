@@ -149,6 +149,12 @@ class Parser:
         if _starts_word(upper, "CALL"):
             name, args = self.parse_call(_after_keyword(text, "CALL"), line.no)
             return ast.Call(line.no, name, args)
+        if _starts_word(upper, "CALLRET"):
+            name, args = self.parse_call(_after_keyword(text, "CALLRET"), line.no, "CALLRET")
+            return ast.CallRet(line.no, name, args)
+        new_sub = self.try_parse_new_sub(text, line.no)
+        if new_sub is not None:
+            return new_sub
         if _starts_word(upper, "TRY"):
             return self.parse_try(line, text)
         if _starts_word(upper, "IF"):
@@ -353,13 +359,18 @@ class Parser:
         return ast.UseLibrary(lib, match.group(2), line.no)
 
     def parse_c_decl(self, line: SourceLine) -> ast.CFunctionDecl:
-        match = re.match(rf'^DECLARE\s+C\s+(SUB|FUNCTION)\s+({_NAME})\.({_NAME})\s*\((.*)\)\s+AS\s+(.+)$', line.text, re.IGNORECASE)
+        usage = "DECLARE C 必须写成 `DECLARE C SUB/FUNCTION 别名.函数名(参数...) AS 返回类型`"
+        match = re.match(rf'^DECLARE\s+C\s+(SUB|FUNCTION)\s+({_NAME})\.({_NAME})\s*(\(.*)$', line.text, re.IGNORECASE)
         if not match:
-            raise SonCompileError("DECLARE C 必须写成 `DECLARE C SUB/FUNCTION 别名.函数名(参数...) AS 返回类型`", line.no)
+            raise SonCompileError(usage, line.no)
+        params_text, rest = _take_paren_group(match.group(4), line.no)
+        ret_match = re.match(r"^\s+AS\s+(.+)$", rest, re.IGNORECASE)
+        if params_text is None or not ret_match:
+            raise SonCompileError(usage, line.no)
         alias = match.group(2)
         name = match.group(3)
-        params = self.parse_params(match.group(4), line.no)
-        return_type = _parse_type_tokens(match.group(5).upper().split(), line.no)
+        params = _parse_param_list(params_text, line.no)
+        return_type = _parse_type_tokens(ret_match.group(1).upper().split(), line.no)
         return ast.CFunctionDecl(alias, name, params, return_type, line.no)
 
     def parse_declaration(self, line: SourceLine) -> ast.Declaration:
@@ -398,7 +409,7 @@ class Parser:
 
         element_type = _parse_type_tokens(type_tokens[1:], line.no)
         type_spec = element_type if array_size is None else ast.TypeSpec(
-            element_type.name, element_type.subtype, element_type.inner, array_size
+            element_type.name, element_type.subtype, element_type.inner, array_size, element_type.params
         )
 
         return ast.Declaration(
@@ -413,15 +424,16 @@ class Parser:
         # 括号前允许空白：贴不贴函数名都行，否则参数表会整段掉进 suffix，
         # 报出「未知 SUB 修饰符: (a」这种完全看不懂的错。
         # 可选的 ASYNC 前缀把这个 SUB 标成协程（编译成无栈状态机 + PROMISE 返回）。
-        match = re.match(rf"^(ASYNC\s+)?SUB\s+({_NAME})\s*(?:\((.*)\))?(.*)$", line.text, re.IGNORECASE)
+        match = re.match(rf"^(ASYNC\s+)?SUB\s+({_NAME})(.*)$", line.text, re.IGNORECASE)
         if not match:
             raise SonCompileError("SUB 头不完整", line.no)
 
         is_async = match.group(1) is not None
         name = match.group(2)
         _validate_name(name, line.no)
-        params = self.parse_params(match.group(3) or "", line.no)
-        suffix_tokens = (match.group(4) or "").strip().split()
+        params_text, suffix = _take_paren_group(match.group(3), line.no)
+        params = _parse_param_list(params_text or "", line.no)
+        suffix_tokens = suffix.strip().split()
         visibility = "PRIVATE"
         return_type = ast.TypeSpec("VOID")
 
@@ -446,25 +458,14 @@ class Parser:
 
         return name, params, visibility, return_type, is_async
 
-    def parse_params(self, text: str, line_no: int) -> list[ast.Param]:
-        if not text.strip():
-            return []
-
-        params: list[ast.Param] = []
-        for raw in _split_top_level_list(text, line_no):
-            tokens = raw.split()
-            if len(tokens) < 3:
-                raise SonCompileError("参数必须写成 `name AS Type ...`", line_no)
-            name = tokens[0]
-            _validate_name(name, line_no)
-            type_tokens = tokens[1:]
-            by_ref = bool(len(type_tokens) >= 2 and type_tokens[-2].upper() == "AS" and type_tokens[-1].upper() == "REF")
-            if by_ref:
-                type_tokens = type_tokens[:-2]
-            if not type_tokens or type_tokens[0].upper() != "AS":
-                raise SonCompileError("参数缺少类型", line_no)
-            params.append(ast.Param(name, _parse_type_tokens(type_tokens[1:], line_no), by_ref, line_no))
-        return params
+    def try_parse_new_sub(self, text: str, line_no: int) -> ast.NewSub | None:
+        # 只有 `NEW SUB` 两个词连着打头才算：NEW 单独不是保留字，变量照样可以叫 new。
+        if not re.match(r"^NEW\s+SUB\b", text, re.IGNORECASE):
+            return None
+        match = re.match(rf"^NEW\s+SUB\s+({_NAME})\s+FROM\s+(.+)$", text, re.IGNORECASE)
+        if not match:
+            raise SonCompileError("NEW SUB 必须写成 `NEW SUB 名称 FROM 函数引用`", line_no)
+        return ast.NewSub(line_no, match.group(1), parse_expr(match.group(2), line_no))
 
     def try_parse_input(self, text: str, line_no: int) -> ast.Input | None:
         match = re.match(rf"^({_NAME})\.INPUT\s+(.+)$", text, re.IGNORECASE)
@@ -504,10 +505,10 @@ class Parser:
             return ast.SyncExpr(line_no, parse_expr(_after_keyword(stripped, "SYNC"), line_no))
         return None
 
-    def parse_call(self, text: str, line_no: int) -> tuple[str, list[ast.Expr]]:
+    def parse_call(self, text: str, line_no: int, keyword: str = "CALL") -> tuple[str, list[ast.Expr]]:
         match = re.match(rf"^({_DOTTED_NAME})(?:\((.*)\))?$", text, re.IGNORECASE)
         if not match:
-            raise SonCompileError("CALL 必须写成 `CALL name` 或 `CALL name(args...)`", line_no)
+            raise SonCompileError(f"{keyword} 必须写成 `{keyword} name` 或 `{keyword} name(args...)`", line_no)
         name = match.group(1)
         for part in name.split("."):
             _validate_name(part, line_no)
@@ -589,10 +590,11 @@ def _read_as_parts(tokens: list[str], line_no: int) -> list[str]:
 _TYPE_DECL_KEYWORDS = frozenset({
     "NUM", "LONG", "DOUBLE", "FLOAT",
     "STRING", "SYMBOL", "ERROR", "CPTR", "BOOL", "VOID",
-    "ENTITY", "HANDLE", "PTR", "TO", "PROMISE", "OF", "AS",
+    "ENTITY", "HANDLE", "PTR", "TO", "PROMISE", "OF", "AS", "SUB",
 })
 # CAST 不接受 PROMISE OF——那是 async 的返回类型，语言里不允许强转过去。
-CAST_TYPE_KEYWORDS = _TYPE_DECL_KEYWORDS - {"PROMISE", "OF"}
+# 也不接受 SUB：强转出来的签名是假的，经函数引用调用时会按错的 ABI 传参。
+CAST_TYPE_KEYWORDS = _TYPE_DECL_KEYWORDS - {"PROMISE", "OF", "SUB"}
 
 
 def _parse_type_parts(parts: list[str], line_no: int) -> ast.TypeSpec:
@@ -603,6 +605,9 @@ def _parse_type_tokens(tokens: list[str], line_no: int) -> ast.TypeSpec:
     if not tokens:
         raise SonCompileError("声明缺少类型", line_no)
     first = tokens[0].upper()
+    if first == "SUB" or first.startswith("SUB("):
+        # 签名里嵌着参数表，调用方按空白切出来的 token 会把括号拆散，拼回去整体再解析。
+        return _parse_sub_type(" ".join(tokens), line_no)
     if first == "NUM":
         if len(tokens) != 3 or tokens[1].upper() != "AS" or tokens[2].upper() not in {"LONG", "DOUBLE", "FLOAT"}:
             raise SonCompileError("NUM 声明必须指定 LONG/DOUBLE/FLOAT", line_no)
@@ -625,6 +630,73 @@ def _parse_type_tokens(tokens: list[str], line_no: int) -> ast.TypeSpec:
     if len(tokens) == 1 and first in {"STRING", "SYMBOL", "ERROR", "CPTR", "VOID", "BOOL"}:
         return ast.TypeSpec(first)
     raise SonCompileError("无法识别的类型声明", line_no)
+
+
+def _parse_sub_type(text: str, line_no: int) -> ast.TypeSpec:
+    """`SUB[(参数...)] [AS 返回类型]`：callable 签名。参数表省略就是无参，返回类型省略就是
+    VOID——最常见的 `PTR TO SUB` 因此不用写全。"""
+    params_text, rest = _take_paren_group(text.strip()[len("SUB"):], line_no)
+    params = tuple(_parse_param_list(params_text or "", line_no))
+    tokens = rest.split()
+    if not tokens:
+        return ast.TypeSpec("SUB", inner=ast.TypeSpec("VOID"), params=params)
+    if tokens[0].upper() != "AS" or len(tokens) < 2:
+        raise SonCompileError("SUB 类型必须写成 `SUB(参数...) AS 返回类型`", line_no)
+    return ast.TypeSpec("SUB", inner=_parse_type_tokens(tokens[1:], line_no), params=params)
+
+
+def _parse_param_list(text: str, line_no: int) -> list[ast.Param]:
+    if not text.strip():
+        return []
+
+    params: list[ast.Param] = []
+    for raw in _split_top_level_list(text, line_no):
+        tokens = raw.split()
+        if len(tokens) < 3:
+            raise SonCompileError("参数必须写成 `name AS Type ...`", line_no)
+        name = tokens[0]
+        _validate_name(name, line_no)
+        type_tokens = tokens[1:]
+        by_ref = bool(len(type_tokens) >= 2 and type_tokens[-2].upper() == "AS" and type_tokens[-1].upper() == "REF")
+        if by_ref:
+            type_tokens = type_tokens[:-2]
+        if not type_tokens or type_tokens[0].upper() != "AS":
+            raise SonCompileError("参数缺少类型", line_no)
+        params.append(ast.Param(name, _parse_type_tokens(type_tokens[1:], line_no), by_ref, line_no))
+    return params
+
+
+def _take_paren_group(text: str, line_no: int) -> tuple[str | None, str]:
+    """text（忽略前导空白）以 `(` 开头时，按括号配对切出第一组：返回 (组内文本, 其后剩余)；
+    不以 `(` 开头返回 (None, 原文)。
+
+    参数表里可能嵌着 `SUB(...)` 签名，返回类型里也可能有，贪婪正则 `\\((.*)\\)` 会一路
+    吞到最后一个右括号，把返回类型错切进参数表。
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith("("):
+        return None, text
+    quote: str | None = None
+    depth = 0
+    i = 0
+    while i < len(stripped):
+        ch = stripped[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in {'"', "'"}:
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return stripped[1:i], stripped[i + 1 :]
+        i += 1
+    raise SonCompileError("字符串或括号没有闭合", line_no)
 
 
 _ASSIGN_MODES = {"f": "borrow", "m": "move"}

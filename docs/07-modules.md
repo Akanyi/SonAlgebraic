@@ -99,10 +99,10 @@ USE <模块路径> AS <别名>
 80 END
 ```
 
-这一对就是仓库里的 `examples/mathlib.sa` 和 `examples/use_user_module.sa`，可以直接跑：
+这一对就是仓库里的 `examples/modules/basic/mathlib.sa` 和同目录 `main.sa`，可以直接跑：
 
 ```powershell
-python -m sonalgebraic run examples/use_user_module.sa
+python -m sonalgebraic run examples/modules/basic/main.sa
 ```
 
 注意 `SUB twice(...) AS PUBLIC AS NUM AS DOUBLE` 的修饰符顺序：参数列表在前，然后是可见性，最后是返回类型。

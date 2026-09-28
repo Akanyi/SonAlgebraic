@@ -194,16 +194,16 @@ target 未命中或为 `source` 形态时，全部模块走 C 源码编译路径
 
 ```powershell
 # 源码包
-python -m sonalgebraic slib examples/statslib.sa -o examples/statslib.slib
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib.slib
 
 # 静态库
-python -m sonalgebraic slib examples/statslib.sa -o build/statslib_binary.slib --binary
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib_binary.slib --binary
 
 # 动态库（Windows DLL + import lib / Linux .so / macOS .dylib）
-python -m sonalgebraic slib examples/statslib.sa -o build/statslib_dynamic.slib --dynamic
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib_dynamic.slib --dynamic
 
 # 交叉编译（需 zig）
-python -m sonalgebraic slib examples/statslib.sa -o build/statslib_linux.slib --binary --target x86_64-linux-gnu
+python -m sonalgebraic slib examples/modules/statistics/statslib.sa -o build/statslib_linux.slib --binary --target x86_64-linux-gnu
 ```
 
 引用方无需特殊参数，把 `.slib` 与引用它的 `.sa` 放在 `USE` 能解析到的目录即可（参见[模块系统](./07-modules.md#模块解析顺序)）。

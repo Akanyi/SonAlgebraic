@@ -1,4 +1,4 @@
-10 REM 迷你 HTTP server：单线程 accept 循环，按路径路由。访问 /quit 可以关掉它。
+10 REM 迷你 HTTP 服务端：同步 accept 循环，按路径路由。访问 /quit 可以关掉它。
 20 USE SYS.NET AS N
 30 USE SYS.STRING AS S
 50 SUB request_path(head AS STRING) AS STRING

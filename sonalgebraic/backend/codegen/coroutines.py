@@ -1,7 +1,9 @@
 """协程发射。同步 codegen 通过 async_frame_field 这一个闸口被复用到协程体里。"""
 from __future__ import annotations
 
-from ...analysis.typesys import is_error, is_handle, is_promise, is_string, is_symbol
+import re
+
+from ...analysis.typesys import is_error, is_handle, is_promise, is_string, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import AsyncFrameCtx, CGenBase
@@ -18,6 +20,64 @@ class CoroutinesMixin(CGenBase):
 
     def async_frame_type(self, name: str) -> str:
         return f"SaCoro_{self.c_ident(name)}"
+
+    def local_resource_cleanup_lines(self, resources: list[tuple[str, ast.TypeSpec]], indent: int) -> list[str]:
+        lines: list[str] = []
+        for name, type_spec in reversed(resources):
+            if self.async_frame_stack and re.fullmatch(r"sa_tmp_\d+(?:_result)?", name):
+                self.async_frame_stack[-1].temp_resources[name] = type_spec
+            lines.extend(super().local_resource_cleanup_lines([(name, type_spec)], indent))
+            # THROW、块退出和终结兜底可能经过同一个字段，实际所有权只能释放一次。
+            if self.async_frame_stack and name.startswith("f->"):
+                lines.append(f"{'    ' * indent}memset(&{name}, 0, sizeof({name}));")
+        return lines
+
+    def add_cleanup(self, line: str) -> None:
+        # 旧表达式接口有少量直接登记单条释放行的调用，同样转换为类型化所有权元数据。
+        if self.async_frame_stack:
+            match = re.fullmatch(r"(free|sa_symbol_free|sa_callable_release)\((sa_tmp_\d+(?:_result)?)\);", line)
+            if match:
+                kind = {"free": "STRING", "sa_symbol_free": "SYMBOL", "sa_callable_release": "SUB"}[match[1]]
+                self.async_frame_stack[-1].temp_resources[match[2]] = ast.TypeSpec(kind)
+        super().add_cleanup(line)
+
+    def hoist_async_temporaries(self, body: list[str], ctx: AsyncFrameCtx) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+        """只变换 C 代码词法片段，字符串、字符和注释原样保留；清理由所有权登记驱动。"""
+        tokens = re.split(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//[^\n]*)', "\n".join(body), flags=re.S)
+        fields: dict[str, str] = {}
+        declaration = re.compile(r"(?m)^(\s*)(char\s*\*|SaSymbol|SaError|SaCallable\s*\*|SaStringBuilder|SaHandle|SaEntity_\w+|long long|double|int)\s+(sa_tmp_\d+(?:_result)?)\s*(?==|;)")
+
+        def declare(match: re.Match[str]) -> str:
+            pad, kind, name = match.groups()
+            fields[name] = kind
+            # 无初始化声明只保留空语句；有初始化时保留赋值左值。
+            following = match.string[match.end():].lstrip()
+            return pad + (name + " " if following.startswith("=") else "")
+
+        for i in range(0, len(tokens), 2):
+            tokens[i] = declaration.sub(declare, tokens[i])
+        for i in range(0, len(tokens), 2):
+            code = tokens[i]
+            # 聚合零初始化声明改成赋值后需要显式复合字面量类型。
+            code = re.sub(r"\b(sa_tmp_\d+)\s*=\s*(?=\{)", lambda m: f"{m[1]} = ({fields[m[1]]})" if m[1] in fields else m[0], code)
+            # 真正执行释放的位置清空指针；别名中间量没有清理登记，不进入兜底集合。
+            code = re.sub(r"\b(free|sa_symbol_free|sa_callable_release)\((sa_tmp_\d+(?:_result)?(?:\.\w+)*)\);", lambda m: f"{m[0]} {m[2]} = NULL;", code)
+            code = re.sub(r"\bsa_tmp_\d+(?:_result)?\b", lambda m: f"f->{m[0]}" if m[0] in fields else m[0], code)
+            tokens[i] = code
+        cleanup: list[str] = []
+        for name, kind in reversed(list(ctx.temp_resources.items())):
+            if name in fields:
+                cleanup.extend(self.local_resource_cleanup_lines([(f"f->{name}", kind)], 1))
+        for name, kind in fields.items():
+            if kind == "SaStringBuilder":
+                cleanup.append(f"    free(f->{name}.data);")
+        return "".join(tokens).splitlines(), cleanup, [(kind, name) for name, kind in fields.items()]
+
+    def adopt_temp_cleanup(self, value: str, type_spec: ast.TypeSpec, cleanup: list[str]) -> bool:
+        adopted = super().adopt_temp_cleanup(value, type_spec, cleanup)
+        if adopted and self.async_frame_stack:
+            cleanup.extend(self.moved_source_reset_lines(value, type_spec, 0))
+        return adopted
 
     def async_resume_c_name(self, name: str) -> str:
         return f"{self.c_ident(name)}_resume"
@@ -54,6 +114,7 @@ class CoroutinesMixin(CGenBase):
                 result.extend(self._collect_local_decls(inner))
         elif isinstance(stmt, ast.TryCatch):
             for branch in stmt.catches:
+                result.append(ast.LocalDeclaration(branch.line_no, branch.alias, ast.TypeSpec("ERROR"), False, None))
                 for inner in branch.body:
                     result.extend(self._collect_local_decls(inner))
         return result
@@ -114,7 +175,7 @@ class CoroutinesMixin(CGenBase):
 
     def _is_managed_type(self, type_spec: ast.TypeSpec) -> bool:
         return (
-            is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec)
+            is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or is_sub_type(type_spec)
             or (type_spec.name == "ENTITY" and self.type_has_managed_resources(type_spec))
         )
 
@@ -122,14 +183,20 @@ class CoroutinesMixin(CGenBase):
         """所有 ASYNC SUB 的帧 typedef 与 resume/start 原型，放在普通原型区之前——帧类型
         被 resume/start 引用，start 之间也会互相调用（async sub 调 async sub）。"""
         chunks: list[str] = []
+        self._async_generated = {}
+        self._async_temp_fields = {}
         for sub in self.checked.program.subs:
             if not sub.is_async:
                 continue
+            self._async_generated[sub.name] = self.generate_async_sub(sub)
             frame_type = self.async_frame_type(sub.name)
             lines = ["typedef struct {", "    SaCoroBase base;"]
             for name, type_spec in self.async_frame_fields(sub):
                 suffix = f"[{type_spec.array_size}]" if type_spec.array_size is not None else ""
                 lines.append(f"    {self.c_type(type_spec)} {self.c_ident(name)}{suffix};")
+                if self._is_managed_type(type_spec):
+                    lines.append(f"    int sa_borrowed_{self.c_ident(name)};")
+            lines.extend(f"    {kind} {name};" for kind, name in self._async_temp_fields[sub.name])
             for loop in self._collect_for_loops_in_sub(sub):
                 end_name, step_name = self._for_frame_names(loop.line_no)
                 lines.append(f"    long long {end_name};")
@@ -143,6 +210,8 @@ class CoroutinesMixin(CGenBase):
         return "\n".join(chunks)
 
     def generate_async_sub(self, sub: ast.Subroutine) -> str:
+        if sub.name in getattr(self, "_async_generated", {}):
+            return self._async_generated[sub.name]
         frame_type = self.async_frame_type(sub.name)
         fields = self.async_frame_fields(sub)
         ctx = AsyncFrameCtx(sub, frame_type, {name.lower() for name, _ in fields})
@@ -170,10 +239,17 @@ class CoroutinesMixin(CGenBase):
             body_lines.extend(self.async_terminate_void(1))
 
         switch_lines = self.async_switch_lines(ctx, 1)
-        # 挂起中被回收时的帧清理体：清理集合与 resume 终结点用的是同一套（参数 + 所有局部），
-        # 趁 local_resource_stack 还没弹、async_frame_stack 还在场时抓下来——登记的名字此时
-        # 已是 f-> 形式，故这段 C 可以脱离上下文直接放进独立的 cleanup 函数。
-        cleanup_body = self.active_local_resource_cleanup_lines(1)
+        # 块作用域的登记此时已经弹出，兜底必须遍历全部帧字段；借用字段不拥有资源。
+        cleanup_body = []
+        for name, kind in reversed(fields):
+            if self._is_managed_type(kind):
+                cleanup_body.append(f"    if (!f->sa_borrowed_{self.c_ident(name)}) {{")
+                cleanup_body.extend(self.local_resource_cleanup_lines([(f"f->{self.c_ident(name)}", kind)], 2))
+                cleanup_body.append("    }")
+
+        body_lines, temp_cleanup, temp_fields = self.hoist_async_temporaries(body_lines, ctx)
+        cleanup_body.extend(temp_cleanup)
+        self._async_temp_fields[sub.name] = temp_fields
 
         self.local_resource_stack.pop()
         self.sub_has_goto_stack.pop()
@@ -208,7 +284,8 @@ class CoroutinesMixin(CGenBase):
             f"    sa_try_top++;",
             f"    if (SA_SETJMP(sa_try_stack[sa_try_top - 1].env) != 0) {{",
             f"        sa_try_top--;",
-            f"        sa_promise_reject(f->base.self, sa_current_error.message);",
+            f"        sa_promise_reject_error(f->base.self, &sa_current_error);",
+            f"        sa_error_clear(&sa_current_error);",
             f"        return;",
             f"    }}",
             *switch_lines,
@@ -217,9 +294,7 @@ class CoroutinesMixin(CGenBase):
         ])
 
     def async_cleanup_def(self, sub: ast.Subroutine, frame_type: str, cleanup_body: list[str]) -> str:
-        """挂起中被回收（drop/取消/退出未跑完）时释放帧内 strdup 的参数与 DIM 局部。清理集合
-        与 resume 终结点同源，故正常 RETURN 跑完的协程不经这里（那条路已清理并 free 帧），
-        不会 double-free；帧 calloc 零初始化保证还没执行到的局部是 NULL，free(NULL) 安全。"""
+        """正常返回、失败和取消统一兜底；字段释放后归零，未执行到的声明保持 calloc 的零值。"""
         return "\n".join([
             f"static void {self.async_cleanup_c_name(sub.name)}(SaCoroBase* base) {{",
             f"    {frame_type}* f = ({frame_type}*)base;",
@@ -240,13 +315,19 @@ class CoroutinesMixin(CGenBase):
             f"    f->base.cleanup = {self.async_cleanup_c_name(sub.name)};",
             "    f->base.awaited = 0;",
         ]
-        # 拷参进帧：STRING strdup、ENTITY 深拷贝、其余值拷贝——帧独占所有权（调用方的实参
+        # 拷参进帧：STRING / SYMBOL / ERROR / ENTITY 深拷贝，callable retain——帧持有所有权（调用方的实参
         # 生命周期与协程无关，协程可能在调用返回后很久才跑）
         for param in sub.params:
             name = self.c_ident(param.name)
             field = f"f->{name}"
             if is_string(param.type_spec):
                 lines.append(f"    {field} = sa_strdup({name});")
+            elif is_symbol(param.type_spec):
+                lines.append(f"    {field} = sa_symbol_clone({name});")
+            elif is_error(param.type_spec):
+                lines.append(f"    sa_set_error(&{field}, &{name});")
+            elif is_sub_type(param.type_spec):
+                lines.append(f"    {field} = sa_callable_retain({name});")
             elif param.type_spec.name == "ENTITY" and self.type_has_managed_resources(param.type_spec):
                 lines.extend(self.entity_init_lines(field, param.type_spec, 1))
                 lines.extend(self.entity_copy_lines(field, name, param.type_spec, 1))
@@ -289,7 +370,10 @@ class CoroutinesMixin(CGenBase):
         lines.extend(self.active_local_resource_cleanup_lines(indent))
         lines.append(f"{pad}sa_try_top--;")
         if is_string(return_type):
-            lines.append(f"{pad}sa_promise_fulfill_str(f->base.self, {temp});")
+            # 返回值临时量也提升进帧；settle 清帧之前先移交给栈上的交付值。
+            lines.append(f"{pad}char* sa_result = {temp};")
+            lines.append(f"{pad}{temp} = NULL;")
+            lines.append(f"{pad}sa_promise_fulfill_str(f->base.self, sa_result);")
         else:
             lines.append(f"{pad}{self.async_fulfill_call(return_type, temp)};")
         lines.append(f"{pad}return;")
@@ -333,9 +417,15 @@ class CoroutinesMixin(CGenBase):
         return self._promise_take_value("f->base.awaited", inner)
 
     def sync_expr(self, expr: ast.SyncExpr) -> str:
+        cleanup_start = len(self.cleanup_stack[-1])
         promise = self.expr(expr.operand)
         handle = self.next_temp()
         self.add_prelude(f"SaHandle {handle} = {promise};")
+        # start 已快照参数。取结果可能 longjmp，实参临时量必须在那之前释放。
+        argument_cleanup = self.cleanup_stack[-1][cleanup_start:]
+        del self.cleanup_stack[-1][cleanup_start:]
+        for line in argument_cleanup:
+            self.add_prelude(line)
         self.add_prelude(f"sa_event_loop_run_until({handle});")
         inner = self.await_result_type(expr.operand)
         return self._promise_take_value(handle, inner)

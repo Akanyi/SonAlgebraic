@@ -1,10 +1,5 @@
-10 REM 异步 echo server：单线程事件循环 + 非阻塞 socket，无线程。对照 web_server.sa
-20 REM 的同步 accept 循环——这里 accept/recv/send 全走 AWAIT，挂起时事件循环去 poll
-30 REM 别的 fd，就绪了再回来。首期异步 I/O 锁定服务端三件套：ACCEPT/RECV/SEND_ASYNC。
+10 REM 异步回显服务端：单线程事件循环 + 非阻塞 socket。对照 ../network/http_server.sa
 40 USE SYS.NET AS N
-50 USE SYS.STRING AS S
-60 REM 处理一条连接：收一次、原样回写、关闭。整个函数是一个协程，三个 AWAIT 是三个
-70 REM 挂起点，其间事件循环可以去干别的。
 80 ASYNC SUB serve(conn AS HANDLE AS NET_STREAM) AS VOID
 90 DIM request AS STRING AS VAR
 100 DIM sent AS NUM AS LONG AS VAR
@@ -31,7 +26,7 @@
 310 RETURN
 320 .ENDIF
 330 PRINT F"async echo server on 127.0.0.1:{N.LOCAL_PORT(listener)}"
-340 REM SYNC 从普通代码进入协程世界：驱动事件循环直到这一条连接处理完。
+340 REM SYNC 从普通代码进入协程
 350 SYNC accept_and_serve(listener)
 360 ok = N.TCP_LISTENER_CLOSE(listener)
 370 PRINT "server stopped"

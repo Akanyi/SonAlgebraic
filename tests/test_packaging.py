@@ -23,15 +23,15 @@ def _seed_mathlib(temp_dir: Path) -> tuple[Path, Path]:
     """在临时目录放置 mathlib 库和引用它的主程序，返回 (lib, main)。"""
     source_lib = temp_dir / "mathlib.sa"
     source_main = temp_dir / "use_mathlib.sa"
-    source_lib.write_text(Path("examples/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
-    source_main.write_text(Path("examples/use_user_module.sa").read_text(encoding="utf-8"), encoding="utf-8")
+    source_lib.write_text(Path("examples/modules/basic/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
+    source_main.write_text(Path("examples/modules/basic/main.sa").read_text(encoding="utf-8"), encoding="utf-8")
     return source_lib, source_main
 
 
 def test_user_module_project_generates_headers_and_split_c() -> None:
     with TemporaryDirectory(prefix="sonalgebraic-test-") as temp:
         out_dir = Path(temp) / "out"
-        plan = compile_project(Path("examples/use_user_module.sa"), out_dir)
+        plan = compile_project(Path("examples/modules/basic/main.sa"), out_dir)
         generated = "\n".join(path.read_text(encoding="utf-8") for path in plan.c_files + plan.headers if path.exists())
         assert (out_dir / "sa_runtime.h").exists()
         assert (out_dir / "sa_user_mathlib.h").exists()
@@ -132,15 +132,15 @@ def test_check_source_accepts_user_module() -> None:
             '10 USE MATHLIB AS LIB\n20 DIM result AS NUM AS DOUBLE AS VAR\n30 SUB main AS PUBLIC AS VOID\n40 result = CALL LIB.twice(2.0)\n50 .ENDSUB\n60 CALL main\n70 END\n',
             encoding="utf-8",
         )
-        (temp_dir / "mathlib.sa").write_text(Path("examples/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
+        (temp_dir / "mathlib.sa").write_text(Path("examples/modules/basic/mathlib.sa").read_text(encoding="utf-8"), encoding="utf-8")
 
         check_source(temp_dir / "main.sa")
 
 
 def test_samath_module_exports_native_math_wrappers() -> None:
-    check_program(parse_program(Path("examples/samath.sa").read_text(encoding="utf-8")), require_main=False)
+    check_program(parse_program(Path("examples/modules/native_math/samath.sa").read_text(encoding="utf-8")), require_main=False)
     with TemporaryDirectory(prefix="sonalgebraic-test-") as temp:
-        plan = compile_project(Path("examples/use_samath.sa"), Path(temp) / "out")
+        plan = compile_project(Path("examples/modules/native_math/main.sa"), Path(temp) / "out")
         generated = "\n".join(path.read_text(encoding="utf-8") for path in plan.c_files + plan.headers if path.exists())
         assert "sa_mod_samath_sub_pow" in generated
         assert "sa_mod_samath_sub_gaussian_pdf" in generated
@@ -152,8 +152,8 @@ def test_samath_source_slib_can_be_used_without_source() -> None:
         temp_dir = Path(temp)
         source_lib = temp_dir / "samath.sa"
         source_main = temp_dir / "use_samath.sa"
-        source_lib.write_text(Path("examples/samath.sa").read_text(encoding="utf-8"), encoding="utf-8")
-        source_main.write_text(Path("examples/use_samath.sa").read_text(encoding="utf-8"), encoding="utf-8")
+        source_lib.write_text(Path("examples/modules/native_math/samath.sa").read_text(encoding="utf-8"), encoding="utf-8")
+        source_main.write_text(Path("examples/modules/native_math/main.sa").read_text(encoding="utf-8"), encoding="utf-8")
         build_slib(source_lib, temp_dir / "samath.slib")
         source_lib.unlink()
 

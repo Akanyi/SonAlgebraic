@@ -11,13 +11,14 @@
     { "include": "#block-end" },
     { "include": "#declaration-keywords" },
     { "include": "#control-keywords" },
+    { "include": "#builtin-functions" },
     { "include": "#type-keywords" },
     { "include": "#modifier-keywords" },
     { "include": "#operator-keywords" },
-    { "include": "#builtin-functions" },
     { "include": "#constants" },
     { "include": "#number" },
     { "include": "#operators" },
+    { "include": "#module-call" },
     { "include": "#module-member" },
     { "include": "#identifier" }
   ],
@@ -39,20 +40,25 @@
     },
     "fstring": {
       "comment": "F-string，{} 内是表达式",
-      "begin": "F\"",
-      "end": "\"",
+      "begin": "\\b[Ff]([\"'])",
+      "end": "(?<!\\\\)\\1",
       "name": "string.interpolated.sonalgebraic",
       "patterns": [
+        { "match": "\\\\.|\\{\\{|\\}\\}", "name": "constant.character.escape.sonalgebraic" },
         {
-          "begin": "\\{",
+          "begin": "(?<!\\\\)\\{(?!\\{)",
           "end": "\\}",
           "name": "meta.embedded.expression.sonalgebraic",
           "patterns": [
-            { "include": "#operator-keywords" },
+            { "include": "#string" },
+            { "include": "#control-keywords" },
             { "include": "#builtin-functions" },
+            { "include": "#type-keywords" },
+            { "include": "#operator-keywords" },
             { "include": "#constants" },
             { "include": "#number" },
             { "include": "#operators" },
+            { "include": "#module-call" },
             { "include": "#module-member" },
             { "include": "#identifier" }
           ]
@@ -60,28 +66,31 @@
       ]
     },
     "string": {
-      "begin": "\"",
-      "end": "\"",
-      "name": "string.quoted.double.sonalgebraic"
+      "begin": "([\"'])",
+      "end": "(?<!\\\\)\\1",
+      "name": "string.quoted.sonalgebraic",
+      "patterns": [
+        { "match": "\\\\.", "name": "constant.character.escape.sonalgebraic" }
+      ]
     },
     "block-end": {
-      "match": "(?<=^|\\s)\\.(ENDSUB|ENDIF|ENDENTITY|ENDENUM|ENDFOR|ENDWHILE|ENDTRY)\\b",
+      "match": "(?<!\\S)\\.(ENDSUB|ENDIF|ENDENTITY|ENDENUM|ENDFOR|ENDWHILE|ENDTRY)\\b",
       "name": "keyword.control.end-block.sonalgebraic"
     },
     "declaration-keywords": {
-      "match": "\\b(DIM|CONST|SUB|USE|USEC|USELIB|DECLARE C|DECLARE|ENTITY|ENUM|FOR ENTITY)\\b",
+      "match": "\\b(ASYNC\\s+SUB|NEW\\s+SUB|FOR\\s+ENTITY|DECLARE\\s+C|DIM|CONST|SUB|USEC|USELIB|USE|DECLARE|ENTITY|ENUM)\\b",
       "name": "storage.type.declaration.sonalgebraic"
     },
     "control-keywords": {
-      "match": "\\b(IF|THEN|ELSE IF|ELSE|END IF|FOR|TO|STEP|WHILE|GOTO|GOSUB|RETURN|CALL|TRY|CATCH|TRACEBACK|THROW|NEW|END|CLS|PRINT|INPUT)\\b",
+      "match": "\\b(ELSE\\s+IF|END\\s+IF|CALLRET|GOSUB|AWAIT|SYNC|IF|THEN|ELSE|FOR|TO|STEP|WHILE|GOTO|RETURN|CALL|TRY|CATCH|TRACEBACK|THROW|NEW|END|CLS|PRINT|INPUT)\\b",
       "name": "keyword.control.sonalgebraic"
     },
     "type-keywords": {
-      "match": "\\b(NUM|STRING|BOOL|ERROR|SYMBOL|HANDLE|CPTR|PTR|VOID|LONG|DOUBLE|FLOAT|LIST|STR_LIST|MAP|STR_MAP|BUFFER|FILE|NET_STREAM|TCP_LISTENER|UDP_SOCKET)\\b",
+      "match": "\\b(PROMISE|NUM|STRING|BOOL|ERROR|SYMBOL|HANDLE|CPTR|PTR|SUB|VOID|LONG|DOUBLE|FLOAT|LIST|STR_LIST|MAP|STR_MAP|BUFFER|FILE|NET_STREAM|TCP_LISTENER|UDP_SOCKET)\\b",
       "name": "support.type.sonalgebraic"
     },
     "modifier-keywords": {
-      "match": "\\b(AS|VAR|REF|PUBLIC|PRIVATE)\\b",
+      "match": "\\b(AS|VAR|REF|PUBLIC|PRIVATE|FROM|OF)\\b",
       "name": "storage.modifier.sonalgebraic"
     },
     "operator-keywords": {
@@ -102,12 +111,19 @@
       "name": "constant.numeric.sonalgebraic"
     },
     "operators": {
-      "match": "\\*\\*|<=|>=|<>|==|!=|[-+*/<>=^@]",
+      "match": "\\b[fm]=|\\*\\*|<=|>=|<>|==|!=|[-+*/%<>=^@]",
       "name": "keyword.operator.sonalgebraic"
+    },
+    "module-call": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\.([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+      "captures": {
+        "1": { "name": "entity.name.namespace.sonalgebraic" },
+        "2": { "name": "support.function.sonalgebraic" }
+      }
     },
     "module-member": {
       "comment": "模块成员访问，如 L.PUSH、SYS.MATH",
-      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\.([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": { "name": "entity.name.namespace.sonalgebraic" },
         "2": { "name": "variable.other.member.sonalgebraic" }

@@ -311,7 +311,7 @@ STRING key 的哈希映射（链地址法，负载超 1 自动翻倍 rehash）�
 | `STREAM_RECV_BUFFER(stream, maxBytes)` | `NET_STREAM, LONG -> BUFFER` | 二进制接收 |
 | `STREAM_CLOSE(stream)` | `NET_STREAM -> BOOL` | 关闭；TLS 会发 close_notify |
 
-客户端示例见 `examples/net_tls.sa`。服务端示例见 `examples/web_server.sa`——一个完整的迷你 HTTP server，`TCP_LISTEN` + `TCP_ACCEPT` 循环 + 按路径路由。
+客户端示例见 `examples/network/tls_client.sa`。服务端示例见 `examples/network/http_server.sa`——一个完整的迷你 HTTP server，`TCP_LISTEN` + `TCP_ACCEPT` 循环 + 按路径路由。
 
 ### UDP
 
@@ -358,7 +358,10 @@ STRING key 的哈希映射（链地址法，负载超 1 自动翻倍 rehash）�
 
 ## SYS.GUI 窗口界面
 
-SA 没有函数指针，经典的「回调注册」式 GUI 表达不了。`SYS.GUI` 走复古轮询路线：控件创建时带一个数字 control id，`WAIT_EVENT()` 阻塞取事件并返回被点击的 id，SA 侧用 `WHILE` 或 `GOTO` 加 `IF` 分发——这同时也是 Win32 `WM_COMMAND` 的原生模式。
+控件创建时带一个数字 control id，按钮被点击时这个 id 进入事件队列。取事件有两种方式，共用同一个队列：
+
+- **轮询**：`WAIT_EVENT()` 阻塞取事件，返回被点击的 id，SA 侧用 `WHILE` 或 `GOTO` 加 `IF` 分发。这也是 Win32 `WM_COMMAND` 的原生模式。
+- **回调**：`ON_CLICK(button, handler)` 给按钮挂一个 callable，`RUN()` 替你循环取事件、调用对应的回调，所有窗口关闭后返回。
 
 | 函数 | 签名 | 说明 |
 |---|---|---|
@@ -370,6 +373,8 @@ SA 没有函数指针，经典的「回调注册」式 GUI 表达不了。`SYS.G
 | `GET_TEXT(widget)` | `WIDGET -> STRING` | 读控件文本（UTF-8） |
 | `WAIT_EVENT()` | `-> LONG` | 阻塞直到事件：>0 为被点击按钮的 id，0 表示所有窗口已关闭 |
 | `CLOSE(win)` | `WINDOW -> BOOL` | 关闭窗口（等价于点 X） |
+| `ON_CLICK(button, handler)` | `WIDGET, SUB(id AS NUM AS LONG) AS VOID -> BOOL` | 给按钮挂点击回调；传 `NULL` 摘掉。只对 `BUTTON` 有效 |
+| `RUN()` | `-> BOOL` | 事件循环：取事件、派发回调，所有窗口关闭后返回 |
 | `LAST_ERROR()` | `-> STRING` | 最近一次错误 |
 
 ```basic
@@ -401,6 +406,36 @@ SA 没有函数指针，经典的「回调注册」式 GUI 表达不了。`SYS.G
 - WIDGET 随窗口销毁，无需显式关闭；窗口点 X 或 `CLOSE` 之后句柄自动失效。
 - 事件循环建议以 `WAIT_EVENT() = 0`（全部窗口已关闭）作为退出条件。
 - 这个示例会开真窗口并进事件循环，没人点就不退出——不要在无人值守的环境里跑。
+
+回调版本：
+
+```basic
+10 USE SYS.GUI AS G
+20 DIM win AS HANDLE AS WINDOW AS VAR
+30 DIM box AS HANDLE AS WIDGET AS VAR
+40 DIM btn AS HANDLE AS WIDGET AS VAR
+50 DIM ok AS BOOL AS VAR
+60 SUB onOk(id AS NUM AS LONG) AS VOID
+70 PRINT G.GET_TEXT(box)
+80 ok = G.CLOSE(win)
+90 .ENDSUB
+100 SUB main AS PUBLIC AS VOID
+110 win = G.WINDOW("Demo", 300, 120)
+120 box = G.TEXTBOX(win, 10, 10, 200, 24)
+130 btn = G.BUTTON(win, 1, "OK", 10, 44, 60, 26)
+140 NEW SUB handler FROM @onOk()
+150 ok = G.ON_CLICK(btn, handler)
+160 ok = G.RUN()
+170 .ENDSUB
+180 CALL main
+190 END
+```
+
+- 回调签名固定为 `SUB(id AS NUM AS LONG) AS VOID`，`id` 是被点击按钮的 control id，几个按钮可以共用一个回调。
+- 按钮持有回调的一份引用计数：`handler` 在 `main` 结束时释放自己那份，按钮那份随控件销毁释放，不用手工摘。
+- 回调不是在系统消息处理函数里直接调的，而是 `RUN` 从队列取出事件后在自己的栈帧里调用。所以回调里 `THROW` 是安全的，异常从 `RUN` 抛出，`TRY CALL` 包住调用 `RUN` 的那个 `SUB` 就能接住。
+- 派发器临时持有回调的一份引用，正常返回和异常退出都会归还；回调中关窗也不会提前销毁正在执行的 callable。异常清理后原样重抛，保留错误类型、消息和源码位置。
+- `ON_CLICK` / `RUN` 在 C 和 native 后端都可使用。
 
 ## SYS.LINT 编译期语法糖
 

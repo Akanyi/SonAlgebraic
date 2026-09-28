@@ -46,7 +46,7 @@ def test_fstring_interpolation_allows_brace_inside_string() -> None:
 
 
 def test_fstring_interpolation_keeps_legacy_escaped_quotes() -> None:
-    # 旧写法 \"..\"（examples/net_tls.sa 在用）必须继续可解析
+    # 旧写法 \"..\"（examples/network/tls_client.sa 在用）必须继续可解析
     expr = parse_expr('F"tls={f(resp, \\"HTTP/\\") = 0} end"', 10)
     binary = expr.parts[1]
     assert isinstance(binary, ast.Binary) and binary.op == "="

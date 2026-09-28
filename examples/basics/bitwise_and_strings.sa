@@ -1,4 +1,4 @@
-10 REM 第三批特性验证：位运算 + SYS.STRING 字符串操作
+10 REM 位运算权限标志与 SYS.STRING 字符串操作
 20 USE SYS.STRING AS STR
 30 DIM flags AS NUM AS LONG AS VAR
 40 DIM name AS STRING AS VAR

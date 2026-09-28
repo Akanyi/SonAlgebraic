@@ -1,0 +1,35 @@
+10 REM 用给定多项式验证 PDE 残差：先求偏导，再检查方程两边之差。
+20 REM SYMBOL 捕获变量名；EVAL 前显式代入系数与坐标。
+30 DIM x AS NUM AS DOUBLE AS VAR
+40 DIM y AS NUM AS DOUBLE AS VAR
+50 DIM t AS NUM AS DOUBLE AS VAR
+60 DIM alpha AS NUM AS DOUBLE AS VAR
+70 DIM speed AS NUM AS DOUBLE AS VAR
+80 DIM u AS SYMBOL AS VAR
+90 DIM residual AS SYMBOL AS VAR
+100 DIM value AS NUM AS DOUBLE AS VAR
+
+110 SUB main AS PUBLIC AS VOID
+120     REM 热方程 u_t = alpha * u_xx：取 u = x² + 2*alpha*t。
+130     u = x ** 2 + 2 * alpha * t
+140     residual = DERIV(u, "t") - alpha * DERIV(DERIV(u, "x"), "x")
+145     residual = SIMPLIFY(residual)
+150     value = EVAL(SUBST(SUBST(SUBST(residual, "alpha", 0.1), "x", 2), "t", 3))
+160     PRINT F"heat residual = {value}"
+
+170     REM 波方程 u_tt = speed² * u_xx：取 u = (x - speed*t)²。
+180     u = (x - speed * t) ** 2
+190     residual = DERIV(DERIV(u, "t"), "t") - speed ** 2 * DERIV(DERIV(u, "x"), "x")
+195     residual = SIMPLIFY(residual)
+200     value = EVAL(SUBST(SUBST(SUBST(residual, "speed", 2), "x", 3), "t", 1))
+210     PRINT F"wave residual = {value}"
+
+220     REM 拉普拉斯方程 u_xx + u_yy = 0：取调和多项式 u = x² - y²。
+230     u = x ** 2 - y ** 2
+240     residual = DERIV(DERIV(u, "x"), "x") + DERIV(DERIV(u, "y"), "y")
+245     residual = SIMPLIFY(residual)
+250     value = EVAL(SUBST(SUBST(residual, "x", 2), "y", 3))
+260     PRINT F"laplace residual = {value}"
+270 .ENDSUB
+280 CALL main
+290 END

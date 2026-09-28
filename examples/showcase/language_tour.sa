@@ -1,4 +1,4 @@
-10 REM SonAlgebraic all-in-one smoke example
+10 REM 语言综合演示：控制流、数据、符号代数、所有权、异常与 FFI
 20 USE SYS.MATH AS M
 30 USE SYS.STRING AS STR
 40 USEC "stdio.h" AS STDIO

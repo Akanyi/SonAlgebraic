@@ -179,7 +179,7 @@ def test_nested_entity_string_fields_are_managed() -> None:
     assert "free(sa_second.name.text);" in c
 
 
-def test_entity_symbol_fields_are_not_deep_copied_without_clone_support() -> None:
+def test_entity_symbol_fields_are_deep_copied_and_freed() -> None:
     source = '''10 FOR ENTITY AS FormulaBox
 20 DIM expr AS SYMBOL AS VAR
 30 .ENDENTITY
@@ -192,8 +192,10 @@ def test_entity_symbol_fields_are_not_deep_copied_without_clone_support() -> Non
 100 END
 '''
     c = compile_c(source)
-    assert "sa_symbol_free(sa_first.expr);" not in c
-    assert "sa_symbol_free(sa_second.expr);" not in c
+    # runtime 已提供 clone：实体字段与独立 SYMBOL 一样持有自己的树。
+    assert "sa_symbol_clone(sa_first.expr)" in c
+    assert "sa_symbol_free(sa_first.expr);" in c
+    assert "sa_symbol_free(sa_second.expr);" in c
 
 
 def test_try_catch_throw_generates_setjmp_flow() -> None:

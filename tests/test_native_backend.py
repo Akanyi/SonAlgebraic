@@ -84,7 +84,7 @@ def test_native_ir_generates_minimal_program() -> None:
     assert "call i32 (ptr, ...) @printf(ptr @.sa_fmt_i64" in ir
 
 
-# GOTO 标签循环。以前这条测试直接拿 examples/hello.sa 当素材，结果那个入门示例
+# GOTO 标签循环。以前这条测试直接拿 examples/basics/hello.sa 当素材，结果那个入门示例
 # 被简化成七行之后，测的东西（br / label 的生成）就跟着一起没了。控制流是这里要
 # 守的能力，素材得自己带，不能指望入门示例恰好含有循环。
 _GOTO_LOOP_SOURCE = """10 DIM counter AS NUM AS LONG AS VAR
@@ -121,7 +121,7 @@ def test_native_backend_hello_runs() -> None:
     """native 后端也能真编真跑仓库入门示例，断言与 C 后端的 e2e 保持对称。"""
     with native_temp("sonalgebraic-native-test-") as temp:
         exe = Path(temp) / "hello_native.exe"
-        build_exe(Path("examples/hello.sa"), exe, keep_c=False, backend="native")
+        build_exe(Path("examples/basics/hello.sa"), exe, keep_c=False, backend="native")
         proc = subprocess.run([str(exe)], text=True, capture_output=True)
         assert proc.returncode == 0
         assert proc.stdout.strip() == "Hello World!"

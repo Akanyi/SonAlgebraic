@@ -6,13 +6,11 @@
 60 REM ================================================
 70 REM 超越函数 - 正弦函数（泰勒级数）
 80 REM ================================================
-90 SUB sin_approx AS PUBLIC AS NUM AS DOUBLE
-100 DIM x AS NUM AS DOUBLE AS VAR
+90 SUB sin_approx(x AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 110 DIM result AS NUM AS DOUBLE AS VAR
 120 DIM term AS NUM AS DOUBLE AS VAR
 130 DIM n AS NUM AS LONG AS VAR
 140 DIM x_sq AS NUM AS DOUBLE AS VAR
-150 x = 0.5
 160 x_sq = x * x
 170 result = x
 180 term = x
@@ -26,13 +24,11 @@
 260 REM ================================================
 270 REM 超越函数 - 余弦函数（泰勒级数）
 280 REM ================================================
-290 SUB cos_approx AS PUBLIC AS NUM AS DOUBLE
-300 DIM y AS NUM AS DOUBLE AS VAR
+290 SUB cos_approx(y AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 310 DIM result AS NUM AS DOUBLE AS VAR
 320 DIM term AS NUM AS DOUBLE AS VAR
 330 DIM n AS NUM AS LONG AS VAR
 340 DIM y_sq AS NUM AS DOUBLE AS VAR
-350 y = 0.5
 360 y_sq = y * y
 370 result = 1.0
 380 term = 1.0
@@ -46,12 +42,10 @@
 460 REM ================================================
 470 REM 超越函数 - 指数函数（泰勒级数）
 480 REM ================================================
-490 SUB exp_approx AS PUBLIC AS NUM AS DOUBLE
-500 DIM z AS NUM AS DOUBLE AS VAR
+490 SUB exp_approx(z AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 510 DIM result AS NUM AS DOUBLE AS VAR
 520 DIM term AS NUM AS DOUBLE AS VAR
 530 DIM n AS NUM AS LONG AS VAR
-540 z = 1.0
 550 result = 1.0
 560 term = 1.0
 570 FOR n = 1 TO 15 STEP 1
@@ -64,11 +58,15 @@
 640 REM ================================================
 650 REM 超越函数 - 平方根（牛顿法）
 660 REM ================================================
-670 SUB sqrt_newton AS PUBLIC AS NUM AS DOUBLE
-680 DIM x AS NUM AS DOUBLE AS VAR
+670 SUB sqrt_newton(x AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 690 DIM result AS NUM AS DOUBLE AS VAR
 700 DIM iter AS NUM AS LONG AS VAR
-710 x = 2.0
+710 IF x < 0 THEN
+712 THROW NEW ERR_DOMAIN, "sqrt requires a non-negative value"
+714 END IF
+716 IF x = 0 THEN
+718 RETURN 0.0
+719 END IF
 720 result = 1.0
 730 FOR iter = 0 TO 10 STEP 1
 740 result = (result + x / result) / 2.0
@@ -79,26 +77,18 @@
 790 REM ================================================
 800 REM 矩阵运算 - 2x2 行列式
 810 REM ================================================
-820 SUB det_2x2 AS PUBLIC AS NUM AS DOUBLE
-830 DIM a AS NUM AS DOUBLE AS VAR
-840 DIM b AS NUM AS DOUBLE AS VAR
-850 DIM c AS NUM AS DOUBLE AS VAR
-860 DIM d AS NUM AS DOUBLE AS VAR
-870 a = 1.0
-880 b = 2.0
-890 c = 3.0
-900 d = 4.0
+820 SUB det_2x2(a AS NUM AS DOUBLE, b AS NUM AS DOUBLE, c AS NUM AS DOUBLE, d AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 910 RETURN a * d - b * c
 920 .ENDSUB
 930 REM
 940 REM ================================================
-950 REM 矩阵运算 - 2x2 矩阵求逆
+950 REM 行列式倒数是构造逆矩阵的系数，不是完整逆矩阵
 960 REM ================================================
-970 SUB inv_2x2 AS PUBLIC AS NUM AS DOUBLE
+970 SUB reciprocal_det(a AS NUM AS DOUBLE, b AS NUM AS DOUBLE, c AS NUM AS DOUBLE, d AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 980 DIM det_val AS NUM AS DOUBLE AS VAR
-990 det_val = CALL det_2x2
+990 det_val = CALL det_2x2(a, b, c, d)
 1000 IF det_val = 0 THEN
-1010 RETURN 0.0
+1010 THROW NEW ERR_SINGULAR, "matrix determinant is zero"
 1020 END IF
 1030 RETURN 1.0 / det_val
 1040 .ENDSUB
@@ -106,24 +96,14 @@
 1060 REM ================================================
 1070 REM 矩阵运算 - 矩阵迹（2x2）
 1080 REM ================================================
-1090 SUB trace_2x2 AS PUBLIC AS NUM AS DOUBLE
-1100 DIM a AS NUM AS DOUBLE AS VAR
-1110 DIM d AS NUM AS DOUBLE AS VAR
-1120 a = 1.0
-1130 d = 4.0
+1090 SUB trace_2x2(a AS NUM AS DOUBLE, d AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 1140 RETURN a + d
 1150 .ENDSUB
 1160 REM
 1170 REM ================================================
 1180 REM 辅助函数 - 值域限制
 1190 REM ================================================
-1200 SUB clamp_val AS PUBLIC AS NUM AS DOUBLE
-1210 DIM val AS NUM AS DOUBLE AS VAR
-1220 DIM minv AS NUM AS DOUBLE AS VAR
-1230 DIM maxv AS NUM AS DOUBLE AS VAR
-1240 val = 0.5
-1250 minv = 0.0
-1260 maxv = 1.0
+1200 SUB clamp_val(val AS NUM AS DOUBLE, minv AS NUM AS DOUBLE, maxv AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 1270 IF val < minv THEN
 1280 RETURN minv
 1290 END IF
@@ -136,16 +116,7 @@
 1360 REM ================================================
 1370 REM 辅助函数 - 线性插值
 1380 REM ================================================
-1390 SUB lerp AS PUBLIC AS NUM AS DOUBLE
-1400 DIM a AS NUM AS DOUBLE AS VAR
-1410 DIM b AS NUM AS DOUBLE AS VAR
-1420 DIM t AS NUM AS DOUBLE AS VAR
-1430 a = 1.0
-1440 b = 5.0
-1450 t = 0.5
+1390 SUB lerp(a AS NUM AS DOUBLE, b AS NUM AS DOUBLE, t AS NUM AS DOUBLE) AS PUBLIC AS NUM AS DOUBLE
 1460 RETURN a * (1.0 - t) + b * t
 1470 .ENDSUB
 1480 REM
-1490 SUB main AS PUBLIC AS VOID
-1500 REM 这是模块的入口点，作为库使用时不会被调用
-1510 .ENDSUB
