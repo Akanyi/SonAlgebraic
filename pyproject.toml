@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sonalgebraic"
-version = "0.2.0"
+version = "0.2.1"
 description = "SonAlgebraic：强制行号的小语言，稳定 C 后端与实验 native/LLVM 后端平行开发"
 requires-python = ">=3.10"
 dependencies = [

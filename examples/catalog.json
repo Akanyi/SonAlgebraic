@@ -3,6 +3,7 @@
   "examples": [
     {"path": "basics/hello.sa", "title": "变量与输出", "kind": "program", "run": "auto", "expect": ["Hello World!"]},
     {"path": "basics/functions.sa", "title": "返回值与引用参数", "kind": "program", "run": "auto", "expect": ["area=12, counter=11"]},
+    {"path": "basics/function_values.sa", "title": "函数引用、callable 与 CALLRET", "kind": "program", "run": "auto", "expect": ["reference=42", "callable=42"]},
     {"path": "basics/conditions_and_literals.sa", "title": "分支、布尔与数值字面量", "kind": "program", "run": "auto"},
     {"path": "basics/arrays_and_loops.sa", "title": "数组与循环", "kind": "program", "run": "auto", "expect": ["total = 100", "first=0 last=40"]},
     {"path": "basics/bitwise_and_strings.sa", "title": "位运算与字符串", "kind": "program", "run": "auto"},
@@ -12,6 +13,7 @@
     {"path": "basics/console_input.sa", "title": "交互式控制台输入", "kind": "program", "run": "manual", "reason": "INPUT 等待用户输入姓名"},
     {"path": "data/entity.sa", "title": "实体字段与引用参数", "kind": "program", "run": "auto", "expect": ["hero=(3.5, 5)"]},
     {"path": "data/entity_strings.sa", "title": "嵌套实体深拷贝", "kind": "program", "run": "auto", "expect": ["LANS: 99", "SA: 100"]},
+    {"path": "data/ownership.sa", "title": "复制、借用与移动赋值", "kind": "program", "run": "auto", "expect": ["copy=beta moved=alpha", "borrow=alpha", "entity-copy=payload"]},
     {"path": "data/lists.sa", "title": "数值与字符串列表", "kind": "program", "run": "auto", "expect": ["len=3", "alpha,middle,beta"]},
     {"path": "data/maps.sa", "title": "字典与键遍历", "kind": "program", "run": "auto", "expect": ["alice", "nihao"]},
     {"path": "pointers/basic.sa", "title": "取址与解引用", "kind": "program", "run": "auto", "expect": ["42", "100"]},
@@ -35,9 +37,11 @@
     {"path": "platform/file_io.sa", "title": "文件写入与读取", "kind": "program", "run": "auto", "effect": "在运行工作目录写入 sa-note.txt", "expect": ["hello from SonAlgebraic"]},
     {"path": "platform/desktop.sa", "title": "剪贴板与系统消息框", "kind": "program", "run": "manual", "reason": "改写剪贴板并弹出消息框，需要桌面会话和人工操作"},
     {"path": "platform/gui_hello.sa", "title": "窗口控件与事件循环", "kind": "program", "run": "manual", "reason": "打开窗口并等待交互，需用户关闭窗口"},
+    {"path": "platform/gui_callbacks.sa", "title": "GUI 托管按钮回调", "kind": "program", "run": "manual", "reason": "打开窗口并等待点击按钮或关闭窗口，需要桌面会话"},
     {"path": "network/tls_client.sa", "title": "TLS 客户端", "kind": "program", "run": "manual", "reason": "连接外网 example.com:443，需要网络及目标平台 TLS 依赖"},
     {"path": "network/http_server.sa", "title": "同步 HTTP 服务端", "kind": "program", "run": "manual", "reason": "监听 127.0.0.1:8080 等待请求，访问 /quit 退出"},
     {"path": "async/basics.sa", "title": "Promise 启动与并发等待", "kind": "program", "run": "auto", "expect": ["60"]},
+    {"path": "async/error_propagation.sa", "title": "异步错误跨 Promise 传播", "kind": "program", "run": "auto", "expect": ["caught=task failed"]},
     {"path": "async/echo_server.sa", "title": "异步 TCP 回显服务端", "kind": "program", "run": "manual", "reason": "监听 127.0.0.1:8090，处理一条客户端连接后退出"},
     {"path": "showcase/language_tour.sa", "title": "语言综合演示", "kind": "program", "run": "auto", "expect": ["derivative f'", "caught error", "ffi puts ok"]},
     {"path": "showcase/symbols_errors_pointers.sa", "title": "符号、异常与指针组合", "kind": "program", "run": "auto", "expect": ["指针修改后的 x = 300"]}

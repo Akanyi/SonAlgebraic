@@ -297,7 +297,7 @@ def check_cli_surface(report: Report, sonc: Path, app: Path) -> None:
     with check(report, "sonc doctor 认出自己是安装包"):
         # 守 sdk_env.sdk_home() 的 bin 布局判定：认错了会给出方向相反的补救提示
         out = assert_ok(run([str(sonc), "doctor"], timeout=120), "doctor")
-        assert str(app) in out, f"doctor 没报出安装目录:\n{out}"
+        assert str(app).casefold() in out.casefold(), f"doctor 没报出安装目录:\n{out}"
 
     with check(report, "未知子命令退出码非 0"):
         proc = run([str(sonc), "definitely-not-a-command"], timeout=120)
@@ -492,7 +492,7 @@ def check_toolchain_isolation(report: Report, sonc: Path, app: Path, work: Path)
     with check(report, "屏蔽系统 PATH 后仍能找到自带 zig"):
         proc = run([str(sonc), "doctor"], timeout=180, env=env)
         assert_ok(proc, "doctor（隔离 PATH）")
-        assert str(toolchain) in proc.stdout, f"doctor 没报出自带工具链:\n{proc.stdout}"
+        assert str(toolchain).casefold() in proc.stdout.casefold(), f"doctor 没报出自带工具链:\n{proc.stdout}"
         # 确认 PATH 真被隔离了，否则下面那条"只靠自带 zig"其实是系统 gcc 在干活
         assert re.search(r"^\s*gcc\s+未找到", proc.stdout, re.MULTILINE), (
             f"PATH 没被真正隔离，还能看到系统 gcc:\n{proc.stdout}"

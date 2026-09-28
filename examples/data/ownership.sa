@@ -1,0 +1,28 @@
+10 REM = 深拷贝；m= 转移所有权；f= 只在当前块内借用。
+20 FOR ENTITY AS Note
+30 DIM text AS STRING AS VAR
+40 .ENDENTITY
+50 SUB main AS PUBLIC AS VOID
+60 DIM original AS STRING AS VAR
+70 DIM copied AS STRING AS VAR
+80 DIM moved AS STRING AS VAR
+90 original = "alpha"
+100 copied = original
+110 copied = "beta"
+120 moved m= original
+130 PRINT F"copy={copied} moved={moved}"
+140 IF moved <> "" THEN
+150 DIM view AS STRING AS VAR
+160 view f= moved
+170 PRINT F"borrow={view}"
+180 .ENDIF
+190 moved = "gamma"
+200 DIM first AS ENTITY AS Note AS VAR
+210 DIM second AS ENTITY AS Note AS VAR
+220 first.text = "payload"
+230 second = first
+240 first.text = "changed"
+250 PRINT F"entity-copy={second.text}"
+260 .ENDSUB
+270 CALL main
+280 END

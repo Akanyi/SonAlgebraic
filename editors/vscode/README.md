@@ -7,13 +7,13 @@
 把 `sonalgebraic/` 目录整个复制到 VSCode 扩展目录后重启 VSCode：
 
 ```powershell
-Copy-Item -Recurse editors/vscode/sonalgebraic "$env:USERPROFILE\.vscode\extensions\sonalgebraic-0.2.0"
+Copy-Item -Recurse editors/vscode/sonalgebraic "$env:USERPROFILE\.vscode\extensions\sonalgebraic-0.2.1"
 ```
 
 Linux / macOS：
 
 ```bash
-cp -r editors/vscode/sonalgebraic ~/.vscode/extensions/sonalgebraic-0.2.0
+cp -r editors/vscode/sonalgebraic ~/.vscode/extensions/sonalgebraic-0.2.1
 ```
 
 之后打开任意 `.sa` 文件即可。要打包成 `.vsix` 分发的话装 `vsce` 再 `vsce package`。

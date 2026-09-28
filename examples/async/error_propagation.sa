@@ -1,0 +1,16 @@
+10 REM Promise 失败时保留 THROW 的原始错误类型，在同步边界捕获。
+20 ASYNC SUB fail() AS VOID
+30 THROW NEW ERR_SAMPLE, "task failed"
+40 .ENDSUB
+50 SUB wait_for_task() AS VOID
+60 SYNC fail()
+70 .ENDSUB
+80 SUB main AS PUBLIC AS VOID
+90 DIM trap AS ERROR AS VAR
+100 TRY CALL wait_for_task() TRACEBACK ERROR AS trap
+110 CATCH ERR_SAMPLE AS caught
+120 PRINT F"caught={caught}"
+130 .ENDTRY
+140 .ENDSUB
+150 CALL main
+160 END

@@ -4,10 +4,10 @@
 
 ## 推荐顺序
 
-1. [变量与输出](basics/hello.sa) → [子程序与引用参数](basics/functions.sa)。
+1. [变量与输出](basics/hello.sa) → [子程序与引用参数](basics/functions.sa) → [函数引用与 callable](basics/function_values.sa)。
 2. [分支与字面量](basics/conditions_and_literals.sa) → [数组与循环](basics/arrays_and_loops.sa)。
-3. [实体深拷贝](data/entity_strings.sa) → [符号代数](symbolic/algebra_and_enums.sa)。
-4. [模块项目](modules/basic/main.sa) → [Promise 与 AWAIT](async/basics.sa)。
+3. [实体深拷贝](data/entity_strings.sa) → [复制、借用、移动](data/ownership.sa) → [符号代数](symbolic/algebra_and_enums.sa)。
+4. [模块项目](modules/basic/main.sa) → [Promise 与 AWAIT](async/basics.sa) → [异步错误传播](async/error_propagation.sa)。
 5. [语言综合演示](showcase/language_tour.sa)。
 
 ```powershell
@@ -26,6 +26,7 @@ python -m sonalgebraic check examples/showcase/language_tour.sa
 |---|---|---|
 | [hello.sa](basics/hello.sa) | 最小变量与输出 | 自动，输出 `Hello World!` |
 | [functions.sa](basics/functions.sa) | 返回值、参数、AS REF | 自动 |
+| [function_values.sa](basics/function_values.sa) | `@SUB()` 函数引用、`NEW SUB` callable、`CALLRET`、`f=` / `m=` | 自动，输出两个 `42` |
 | [conditions_and_literals.sa](basics/conditions_and_literals.sa) | IF/ELSE、BOOL、NULL、十六进制与科学计数法 | 自动 |
 | [arrays_and_loops.sa](basics/arrays_and_loops.sa) | 定长数组、FOR/WHILE、负步长 | 自动 |
 | [bitwise_and_strings.sa](basics/bitwise_and_strings.sa) | 位运算权限标志、SYS.STRING | 自动 |
@@ -40,6 +41,7 @@ python -m sonalgebraic check examples/showcase/language_tour.sa
 |---|---|
 | [entity.sa](data/entity.sa) | 实体字段和引用参数 |
 | [entity_strings.sa](data/entity_strings.sa) | 嵌套实体的字符串深拷贝 |
+| [ownership.sa](data/ownership.sa) | `=` 复制、`f=` 借用、`m=` 移动及实体深拷贝 |
 | [lists.sa](data/lists.sa) | 数值/字符串列表与显式关闭 |
 | [maps.sa](data/maps.sa) | 数值/字符串字典、KEYS 列表 |
 
@@ -95,6 +97,7 @@ python -m sonalgebraic pack examples/modules/basic/mathlib.sa -o build/mathlib.s
 | [file_io.sa](platform/file_io.sa) | 自动；在**进程工作目录**写入/覆盖 `sa-note.txt` |
 | [desktop.sa](platform/desktop.sa) | 手动；改写剪贴板并弹出消息框，需要桌面会话 |
 | [gui_hello.sa](platform/gui_hello.sa) | 手动；打开窗口与控件，关闭窗口后退出；POSIX 真窗口需要 GTK 环境 |
+| [gui_callbacks.sa](platform/gui_callbacks.sa) | 手动；`ON_CLICK` 托管按钮回调与 `RUN` 派发，点击 Greet 后关闭窗口；POSIX 真窗口需要 GTK 环境 |
 
 ### 网络与异步
 
@@ -103,6 +106,7 @@ python -m sonalgebraic pack examples/modules/basic/mathlib.sa -o build/mathlib.s
 | [network/tls_client.sa](network/tls_client.sa) | 手动；连接 `example.com:443`，POSIX 需要 OpenSSL 开发库 |
 | [network/http_server.sa](network/http_server.sa) | 手动；监听 `127.0.0.1:8080`，浏览器访问 `/quit` 结束 |
 | [async/basics.sa](async/basics.sa) | 自动；纯计算 Promise 启动与并发等待，输出 `60` |
+| [async/error_propagation.sa](async/error_propagation.sa) | 自动；`THROW` 跨 Promise 传播并在 `SYNC` 边界捕获原错误 |
 | [async/echo_server.sa](async/echo_server.sa) | 手动；监听 `127.0.0.1:8090`，接收并回显一条连接的数据后退出 |
 
 异步支持 C/native；native 的平台与类型边界见[异步章节](../docs/12-async.md#126-native-后端的实现与边界)。

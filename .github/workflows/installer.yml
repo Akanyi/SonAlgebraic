@@ -87,10 +87,11 @@ jobs:
             SonAlgebraic SDK ${{ steps.meta.outputs.version }} Windows 安装包。无需安装 Python。
 
             **本版更新**
-            - C/native 双后端支持手写无栈异步状态机、Promise、AWAIT/SYNC 和异步网络，错误及资源生命周期更完整。
-            - 支持函数引用、callable、CALLRET、ENTITY 托管字段与 GUI 回调等语言能力。
-            - 40 个示例按主题整理；安装包附带 [示例导航](https://github.com/Akanyi/SonAlgebraic/blob/v${{ steps.meta.outputs.version }}/examples/README.md) 和完整清单。
-            - 内置 VSCode 语法扩展更新至 ${{ steps.meta.outputs.version }}，支持异步、函数引用、callable、`f=` / `m=` 与插值高亮。
+            - 修复 Windows 安装目录和自带工具链路径的大小写差异导致的 smoke 误报，恢复安装包发布验证。
+            - 补齐函数引用/callable、复制/借用/移动、异步错误传播和 GUI 托管回调四个示例。
+            - 44 个示例按主题整理；安装包附带 [示例导航](https://github.com/Akanyi/SonAlgebraic/blob/v${{ steps.meta.outputs.version }}/examples/README.md) 和完整清单，交互示例明确标记为手动运行。
+            - 延续 0.2 系列能力：C/native 双后端无栈协程、Promise、AWAIT/SYNC、异步网络，以及函数引用、CALLRET、ENTITY 托管字段和 GUI 回调。
+            - 编译器、Python 包和内置 VSCode 语法扩展版本统一为 ${{ steps.meta.outputs.version }}。
 
             安装后运行 `sonc doctor` 检查 C 工具链，入门示例为 `sonc run examples\basics\hello.sa`。
 

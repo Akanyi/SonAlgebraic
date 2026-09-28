@@ -1,0 +1,21 @@
+10 REM ON_CLICK 把 callable 交给按钮持有；RUN 负责派发，关闭窗口后返回。
+20 USE SYS.GUI AS G
+30 DIM win AS HANDLE AS WINDOW AS VAR
+40 DIM box AS HANDLE AS WIDGET AS VAR
+50 DIM button AS HANDLE AS WIDGET AS VAR
+60 DIM ok AS BOOL AS VAR
+70 SUB greet(id AS NUM AS LONG) AS VOID
+80 PRINT F"clicked={id} name={G.GET_TEXT(box)}"
+90 ok = G.CLOSE(win)
+100 .ENDSUB
+110 SUB main AS PUBLIC AS VOID
+120 win = G.WINDOW("SonAlgebraic callbacks", 320, 120)
+130 box = G.TEXTBOX(win, 12, 12, 210, 24)
+140 button = G.BUTTON(win, 1, "Greet", 230, 12, 75, 26)
+150 NEW SUB handler FROM @greet()
+160 ok = G.ON_CLICK(button, handler)
+170 ok = G.RUN()
+180 PRINT "window closed"
+190 .ENDSUB
+200 CALL main
+210 END

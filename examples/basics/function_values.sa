@@ -1,0 +1,22 @@
+10 REM 函数引用不持有资源；NEW SUB 将引用变为可传递的托管 callable。
+20 SUB add_one(x AS NUM AS LONG) AS NUM AS LONG
+30 RETURN x + 1
+40 .ENDSUB
+50 SUB double(x AS NUM AS LONG) AS NUM AS LONG
+60 RETURN x * 2
+70 .ENDSUB
+80 SUB apply(op AS SUB(x AS NUM AS LONG) AS NUM AS LONG, value AS NUM AS LONG) AS NUM AS LONG
+90 CALLRET op(value)
+100 .ENDSUB
+110 SUB main AS PUBLIC AS VOID
+120 DIM ref AS PTR TO SUB(x AS NUM AS LONG) AS NUM AS LONG AS VAR
+130 ref = @add_one()
+140 PRINT F"reference={ref(41)}"
+150 ref f= @double()
+160 NEW SUB handler FROM ref
+170 DIM saved AS SUB(x AS NUM AS LONG) AS NUM AS LONG AS VAR
+180 saved m= handler
+190 PRINT F"callable={apply(saved, 21)}"
+200 .ENDSUB
+210 CALL main
+220 END

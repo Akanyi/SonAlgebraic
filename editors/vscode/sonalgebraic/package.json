@@ -2,7 +2,7 @@
   "name": "sonalgebraic",
   "displayName": "SonAlgebraic",
   "description": "Syntax highlighting for the SonAlgebraic (.sa) language",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "sonalgebraic",
   "engines": {
     "vscode": "^1.75.0"
