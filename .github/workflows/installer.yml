@@ -88,6 +88,7 @@ jobs:
 
             **本版更新**
             - 修复 Windows 安装目录和自带工具链路径的大小写差异导致的 smoke 误报，恢复安装包发布验证。
+            - 修复 `handler` / `sigaction` 生成名与 POSIX 系统宏冲突导致的 Linux C 编译失败。
             - 补齐函数引用/callable、复制/借用/移动、异步错误传播和 GUI 托管回调四个示例。
             - 44 个示例按主题整理；安装包附带 [示例导航](https://github.com/Akanyi/SonAlgebraic/blob/v${{ steps.meta.outputs.version }}/examples/README.md) 和完整清单，交互示例明确标记为手动运行。
             - 延续 0.2 系列能力：C/native 双后端无栈协程、Promise、AWAIT/SYNC、异步网络，以及函数引用、CALLRET、ENTITY 托管字段和 GUI 回调。

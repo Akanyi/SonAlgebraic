@@ -4,7 +4,12 @@ from pathlib import Path
 
 
 def c_ident(name: str) -> str:
-    return "sa_" + name.lower().replace(".", "_")
+    ident = name.lower().replace(".", "_")
+    # POSIX signal.h 把 sa_handler / sa_sigaction 定义成字段访问宏。
+    # 普通标识符始终小写，冲突名改用大写尾部，既避开宏也不会撞上其他用户名字。
+    if ident in {"handler", "sigaction"}:
+        ident = ident.upper()
+    return "sa_" + ident
 
 
 def entity_c_name(name: str) -> str:
