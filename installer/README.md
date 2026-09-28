@@ -58,7 +58,8 @@ URL、SHA-256 和字节数都在 `sadk.iss` 顶部的 `#define` 里，**那是�
 `.github/workflows/installer.yml` 在 Windows runner 上把两种形态都构一遍：
 
 - push / PR：产物作为 artifact 上传
-- 打 `v*` tag：额外传到 GitHub Release
+- 手动触发 workflow：额外验证离线包的安装、编译运行和卸载，供打标签前验收
+- 打 `v*` tag：离线包实装验证通过后，额外传到 GitHub Release
 - zig 归档用 `actions/cache` 缓存，缓存键是 `sadk.iss` 的哈希，所以升级 zig 会自然让键失效
 
 ## 文件

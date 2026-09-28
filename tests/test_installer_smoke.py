@@ -1,5 +1,6 @@
-"""Windows 会规范化路径大小写；smoke 应接受同一路径，但仍拒绝错误目录。"""
+"""smoke 应接受大小写、目录别名和 Windows 短路径差异，但仍拒绝错误目录。"""
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -7,10 +8,37 @@ import pytest
 from installer import smoke
 
 
+@pytest.fixture(params=["plain", "parent-alias", "windows-short"])
+def app_path(request: pytest.FixtureRequest, tmp_path: Path) -> Path:
+    app = tmp_path / "SADK installation"
+    app.mkdir()
+    if request.param == "plain":
+        return app
+    if request.param == "parent-alias":
+        return tmp_path / ".." / tmp_path.name / app.name
+    if sys.platform != "win32":
+        pytest.skip("Windows 8.3 短路径只在 Windows 上有意义")
+
+    import ctypes
+    from ctypes import wintypes
+
+    get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+    get_short_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_short_path.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_short_path(str(app), buffer, len(buffer))
+    assert 0 < length < len(buffer), ctypes.get_last_error()
+    short_path = Path(buffer.value)
+    if str(short_path).casefold() == str(app).casefold():
+        pytest.skip("当前文件系统未生成 8.3 短路径")
+    assert short_path.samefile(app)
+    return short_path
+
+
 @pytest.mark.parametrize("wrong_path", [False, True], ids=["different-case", "wrong-directory"])
-def test_cli_surface_checks_install_path_case_insensitively(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wrong_path: bool) -> None:
-    app = tmp_path / "SADK"
-    reported = tmp_path / "OTHER" if wrong_path else app
+def test_cli_surface_checks_install_path_case_insensitively(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, app_path: Path, wrong_path: bool) -> None:
+    app = app_path
+    reported = tmp_path / "OTHER" if wrong_path else app.resolve()
 
     def fake_run(command, *, timeout):
         output = {
@@ -31,12 +59,12 @@ def test_cli_surface_checks_install_path_case_insensitively(monkeypatch: pytest.
 
 
 @pytest.mark.parametrize("wrong_path", [False, True], ids=["different-case", "wrong-directory"])
-def test_toolchain_isolation_checks_path_case_insensitively(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wrong_path: bool) -> None:
-    app = tmp_path / "SADK"
+def test_toolchain_isolation_checks_path_case_insensitively(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, app_path: Path, wrong_path: bool) -> None:
+    app = app_path
     toolchain = app / "toolchain"
     toolchain.mkdir(parents=True)
     (toolchain / "zig.exe").touch()
-    reported = tmp_path / "OTHER" if wrong_path else toolchain
+    reported = tmp_path / "OTHER" if wrong_path else toolchain.resolve()
     isolated_env = {"PATH": "isolated"}
 
     def fake_run(command, *, timeout, env, cwd=None):
