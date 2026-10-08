@@ -1,13 +1,119 @@
 """内置模块调用映射：SYMBOL 代数、STRING、NET、FILE、DESKTOP、BINARY、LIST、MAP、GUI。"""
 from __future__ import annotations
 
+from ...analysis.builtin_effects import ArgumentEffect, builtin_effect
+from ...analysis.resource_traits import handle_close_owned_function, handle_drop_prefix
+from ...analysis.typesys import c_type, is_managed_resource, is_string, resolve_managed_container_function
 from ...core import ast
+from ...core.errors import SonCompileError
 from ...core.names import split_module_member
 from .base import c_string, CGenBase
 
 
+# 这些成员的参数只有句柄、下标和 key，runtime 函数名就是 `<前缀>_<成员名小写>`。
+_CONTAINER_PLAIN_MEMBERS = {"LENGTH", "CLEAR", "CLOSE", "REMOVE", "HAS"}
+
+# 元素要进容器的成员：最后一个参数走 void*，得先落到临时量再取址。复制形态和移动形态
+# 共用同一套发射，差别只在 runtime 那头——copy 读它，move 读完再把它清空。
+_CONTAINER_ELEMENT_IN_MEMBERS = {"PUSH", "PUSH_MOVE", "INSERT", "INSERT_MOVE", "SET", "SET_MOVE"}
+
+# 元素要出容器的成员：runtime 把值写进调用方给的槽位，返回的是成功标志而不是元素本身。
+_CONTAINER_ELEMENT_OUT_MEMBERS = {"GET", "TAKE"}
+
+
 class BuiltinsMixin(CGenBase):
     """SYS.* 内置模块函数 -> 运行时调用的映射表。每个函数返回 None 表示「不归我管」，由 call_expr 逐个试。"""
+
+    def managed_first_arg_call(self, expr: ast.CallExpr, call: str, args: list[str]) -> str | None:
+        """首参是托管资源的内置调用。CLOSE 换成清空槽位的版本，免得变量留着已失效的 token；
+        其余调用也要先落到临时量——句柄可能在同一语句的后续求值里被改写，内联会把求值顺序算错。"""
+        if not expr.args:
+            return None
+        kind = self.type_of(expr.args[0])
+        if not is_managed_resource(kind):
+            return None
+        effect = builtin_effect(expr.name, self.checked.uses)
+        if effect is not None and effect.argument(0) is ArgumentEffect.CONSUME:
+            call = f"{handle_close_owned_function(kind)}(&{args[0]})"
+        temp = self.next_temp()
+        self.add_prelude(f"long long {temp} = {call};")
+        return temp
+
+    def managed_container_call(self, expr: ast.CallExpr) -> str | None:
+        """托管容器的成员调用。
+
+        必须排在旧 SYS.LIST／SYS.MAP 发射之前：两条路的成员名大量重名，落到旧表就会对着
+        托管容器的句柄发 `sa_list_push`——那是另一张槽位表，kind 校验拒得掉，但错误只在
+        运行时现形。
+        """
+        signature = resolve_managed_container_function(expr, self.checked.uses, self.symbols, self.checked.entities)
+        if signature is None:
+            return None
+        member = (split_module_member(expr.name) or ("", ""))[1].upper()
+        args = [self.expr(arg) for arg in expr.args]
+        # 前缀就是析构函数那套名字的来源（sa_vec / sa_dict），容器的全部 API 共用它
+        prefix = handle_drop_prefix(self.type_of(expr.args[0]))
+        if member in _CONTAINER_ELEMENT_OUT_MEMBERS:
+            return self.container_element_out(prefix, member, signature[1], args)
+        if member == "BORROW":
+            return self.container_element_borrow(prefix, signature[1], args)
+        if member in _CONTAINER_ELEMENT_IN_MEMBERS:
+            # runtime 收 void*，所以元素得先落到一块能取址的内存——表达式本身不一定有地址
+            # （字面量尤其没有）。临时量的类型直接取这个参数位的类型，ops 表的 size 就是按
+            # 它算的。不加 const：移动形态要靠这块内存回写清空。
+            temp = self.next_temp()
+            self.add_prelude(f"{c_type(signature[0][-1])} {temp} = {args[-1]};")
+            args = [*args[:-1], f"&{temp}"]
+        elif member not in _CONTAINER_PLAIN_MEMBERS:
+            # 不能静默交回旧表：那会生成一个函数名对得上、槽位表却错的调用。
+            raise SonCompileError(f"{expr.name} 作用在托管容器上的代码生成还没接入", expr.line_no)
+        call = f"{prefix}_{member.lower()}({', '.join(args)})"
+        return self.managed_first_arg_call(expr, call, args) or call
+
+    def container_element_out(self, prefix: str, member: str, element: ast.TypeSpec, args: list[str]) -> str:
+        """GET／TAKE：元素落到临时量，所有权归调用方。
+
+        两者的发射完全同构——GET 让 ops 的 copy 产出一份副本，TAKE 把容器那格搬走再清零，
+        调用方拿到的都是一个得自己负责释放的拥有值，所以一律登记清理。登记用的是声明局部
+        变量那套释放行，`adopt_temp_cleanup` 才认得出来：`DIM s AS STRING = L.GET(...)`
+        能直接接管这一份，不必再 strdup 一次。
+        """
+        temp = self.next_temp()
+        ctype = c_type(element)
+        init = self.zero_init_value(element)
+        if init.startswith("{"):
+            init = f"({ctype}){init}"
+        self.add_prelude(f"{ctype} {temp} = {init};")
+        call = f"{prefix}_{member.lower()}({', '.join([*args, f'&{temp}'])})"
+        if is_string(element):
+            # 下标越界时 runtime 完全不碰 out，而 STRING 的零值是 NULL——交给 printf 是 UB。
+            # 补一份空串和旧 sa_strlist_get 越界时的行为一致，错因去 LAST_ERROR 查。
+            self.add_prelude(f'if (!{call}) {{ {temp} = sa_strdup(""); }}')
+        else:
+            # 其余元素类型的零值本身就是合理的失败结果：数值是 0，SYMBOL／callable 是 NULL，
+            # ERROR 是 ERR_NONE，嵌套容器是空句柄——释放它们全是空操作。
+            self.add_prelude(f"{call};")
+        for line in self.local_resource_cleanup_lines([(temp, element)], 0):
+            self.add_cleanup(line)
+        return temp
+
+    def container_element_borrow(self, prefix: str, element: ast.TypeSpec, args: list[str]) -> str:
+        """BORROW：容器里那一格的视图，**不登记清理**——所有权一直在容器手里。
+
+        runtime 给的是槽位内部的地址，所以解引用读到的就是容器那份本体；语义层只让它落到
+        `f=` 的右侧，ownership 在借用存续期间冻结容器，realloc 搬走这块地址的路都被堵住。
+        越界／key 不存在时 runtime 返回 NULL，这里退回零值——STRING 用静态空串而不是
+        `sa_strdup("")`：借用不分配，这个值也没有谁会来释放它。失败原因照旧查 LAST_ERROR。
+        """
+        ctype = c_type(element)
+        slot = self.next_temp()
+        temp = self.next_temp()
+        self.add_prelude(f"void* {slot} = {prefix}_borrow({', '.join(args)});")
+        empty = '(char*)""' if is_string(element) else self.zero_init_value(element)
+        if empty.startswith("{"):
+            empty = f"({ctype}){empty}"
+        self.add_prelude(f"{ctype} {temp} = {slot} ? *({ctype}*){slot} : {empty};")
+        return temp
 
     def symbol_algebra_call(self, expr: ast.CallExpr) -> str | None:
         """SYMBOL 代数内置函数 -> runtime 调用。"""
@@ -152,7 +258,8 @@ class BuiltinsMixin(CGenBase):
             "CONNECT_ASYNC": "sa_net_connect_promise",
         }
         if member in direct:
-            return f"{direct[member]}({', '.join(args)})"
+            call = f"{direct[member]}({', '.join(args)})"
+            return self.managed_first_arg_call(expr, call, args) or call
         if member in {"STREAM_RECV", "UDP_RECV"}:
             temp = self.next_temp()
             fn = "sa_net_stream_recv" if member == "STREAM_RECV" else "sa_net_udp_recv"
@@ -185,7 +292,8 @@ class BuiltinsMixin(CGenBase):
             "MKDIR": "sa_file_mkdir",
         }
         if member in direct:
-            return f"{direct[member]}({', '.join(args)})"
+            call = f"{direct[member]}({', '.join(args)})"
+            return self.managed_first_arg_call(expr, call, args) or call
         heap = {
             "READ": "sa_file_read",
             "READ_TEXT": "sa_file_read_text",
@@ -252,7 +360,8 @@ class BuiltinsMixin(CGenBase):
             "CHECKSUM8": "sa_binary_checksum8",
         }
         if member in direct:
-            return f"{direct[member]}({', '.join(args)})"
+            call = f"{direct[member]}({', '.join(args)})"
+            return self.managed_first_arg_call(expr, call, args) or call
         heap = {
             "HEX_ENCODE": "sa_binary_hex_encode",
             "LAST_ERROR": "sa_binary_last_error_copy",
@@ -361,7 +470,8 @@ class BuiltinsMixin(CGenBase):
             "RUN": "sa_gui_run",
         }
         if member in direct:
-            return f"{direct[member]}({', '.join(args)})"
+            call = f"{direct[member]}({', '.join(args)})"
+            return self.managed_first_arg_call(expr, call, args) or call
         heap = {
             "GET_TEXT": "sa_gui_get_text",
             "LAST_ERROR": "sa_gui_last_error_copy",

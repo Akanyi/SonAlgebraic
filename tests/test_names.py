@@ -59,3 +59,45 @@ def test_signal_macro_names_compile_and_run() -> None:
         result = subprocess.run([str(exe)], cwd=root, text=True, capture_output=True, timeout=30)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "42"
+
+
+def test_value_ops_names_are_injective_over_element_types() -> None:
+    """ops 符号名必须一类型一名字：撞名意味着两张不兼容的元素操作表共用一个符号，
+    链接期不报错，运行到那一格才按错的字节步长读写。"""
+    from sonalgebraic.analysis.typesys import describe_type
+    from sonalgebraic.core import ast
+    from sonalgebraic.core.names import value_ops_c_name
+
+    string = ast.TypeSpec("STRING")
+    types = [
+        string,
+        ast.TypeSpec("SYMBOL"),
+        ast.TypeSpec("ERROR"),
+        ast.TypeSpec("BOOL"),
+        ast.TypeSpec("NUM", "LONG"),
+        ast.TypeSpec("NUM", "DOUBLE"),
+        ast.TypeSpec("NUM", "FLOAT"),
+        ast.TypeSpec("HANDLE", "FILE"),
+        ast.TypeSpec("HANDLE", "FILE", managed=True),
+        ast.TypeSpec("ENTITY", "Bag"),
+        ast.TypeSpec("ENTITY", "bag"),
+        ast.TypeSpec("ENTITY", "mymod.Bag"),
+        ast.TypeSpec("PTR", inner=string),
+        ast.TypeSpec("LIST", inner=string, managed=True),
+        ast.TypeSpec("MAP", inner=string, managed=True),
+        ast.TypeSpec("LIST", inner=ast.TypeSpec("LIST", inner=string, managed=True), managed=True),
+        ast.TypeSpec("MAP", inner=ast.TypeSpec("LIST", inner=string, managed=True), managed=True),
+    ]
+    seen: dict[str, str] = {}
+    for kind in types:
+        described = describe_type(kind)
+        name = value_ops_c_name(described)
+        # 合法 C 标识符：只有字母数字下划线，且不以数字开头
+        assert name.replace("_", "").isalnum() and not name[0].isdigit(), name
+        # 撞名只在「同一个类型的两种写法」时才允许。ENTITY AS Bag 与 ENTITY AS bag
+        # 指的是同一个实体（实体名大小写不敏感），共用一张 ops 表是对的。
+        if name in seen:
+            assert seen[name].lower() == described.lower(), f"{name} 同时属于 {seen[name]} 和 {described}"
+        seen[name] = described
+    # 17 个输入里只有那一对实体同名，其余两两不同
+    assert len(seen) == len(types) - 1

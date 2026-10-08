@@ -4,9 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 
-from ...analysis.typesys import is_error, is_sub_type, is_symbol
+from ...analysis.resource_traits import handle_drop_function
+from ...analysis.typesys import is_error, is_managed_resource, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
+from ...core.scopes import ScopeGraph
 from .base import LLVMValue, NativeGenBase, VarSlot, sub_gosub_lines
 
 
@@ -46,29 +48,12 @@ class CoroutinesMixin(NativeGenBase):
             self.require_async_frame_type(field_type, line_no, seen | {kind.subtype})
 
     def validate_async_jumps(self, sub: ast.Subroutine) -> None:
-        labels: dict[str, tuple[int, ...]] = {}
-        jumps: list[tuple[ast.Goto | ast.Gosub, tuple[int, ...]]] = []
-
-        def visit(body: list[ast.Stmt], scope: tuple[int, ...]) -> None:
-            for stmt in body:
-                if isinstance(stmt, ast.Label):
-                    labels[stmt.name.lower()] = scope
-                elif isinstance(stmt, ast.Goto | ast.Gosub):
-                    jumps.append((stmt, scope))
-                elif isinstance(stmt, ast.If):
-                    visit(stmt.body, (*scope, id(stmt.body)))
-                    for branch in stmt.elifs:
-                        visit(branch.body, (*scope, id(branch.body)))
-                    visit(stmt.else_body, (*scope, id(stmt.else_body)))
-                elif isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-                    visit(stmt.body, (*scope, id(stmt.body)))
-                elif isinstance(stmt, ast.TryCatch):
-                    for branch in stmt.catches:
-                        visit(branch.body, (*scope, id(branch.body)))
-
-        visit(sub.body, ())
-        for stmt, scope in jumps:
-            if labels.get(stmt.label.lower()) != scope:
+        graph = self.checked.scope_graphs.get(sub.name.lower()) or ScopeGraph.for_body(sub.body)
+        if graph.protected:
+            return
+        for stmt in graph.jumps:
+            target = graph.labels.get(stmt.label.lower())
+            if target is None or graph.paths[target.line_no] != graph.paths[stmt.line_no]:
                 raise SonCompileError("native ASYNC SUB 的 GOTO/GOSUB 暂不支持跨 IF/FOR/WHILE/TRY 作用域跳转", stmt.line_no)
 
     def stmt(self, stmt: ast.Stmt) -> None:
@@ -100,12 +85,6 @@ class CoroutinesMixin(NativeGenBase):
             if resource is not None:
                 # GOTO 回到声明也会重新初始化；旧实例必须先释放，不能覆盖堆指针。
                 self.lines.insert(start, f"  call void @{resource.cleanup_name}(ptr %sa_frame)")
-
-    def run_block(self, body: list[ast.Stmt]) -> None:
-        saved = self.slots.copy() if self.async_context is not None else None
-        super().run_block(body)
-        if saved is not None:
-            self.slots = saved
 
     def alloca(self, llvm_type: str, name: str | None = None) -> str:
         ctx = self.async_context
@@ -263,7 +242,7 @@ class CoroutinesMixin(NativeGenBase):
         self.begin_stmt()
         value = None
         if stmt.expr is not None:
-            value = self.owned_return_value(stmt.expr, kind) if self.is_string_scalar(kind) else self.cast_value(self.expr(stmt.expr), kind)
+            value = self.owned_return_value(stmt.expr, kind) if self.is_string_scalar(kind) or is_managed_resource(kind) else self.cast_value(self.expr(stmt.expr), kind)
         self.end_stmt()
         handle = self.next_temp()
         self.emit(f"  {handle} = load i64, ptr %sa_coro_self")
@@ -273,6 +252,11 @@ class CoroutinesMixin(NativeGenBase):
         elif self.is_string_scalar(kind):
             suffix = "str"
             args += f", ptr {value.value}"
+        elif is_managed_resource(kind):
+            suffix = "owned_handle"
+            drop = f"{handle_drop_function(kind)}_value"
+            self.use_runtime(drop)
+            args += f", i64 {value.value}, ptr @{drop}"
         elif kind.name == "HANDLE":
             suffix = "handle"
             args += f", i64 {value.value}"

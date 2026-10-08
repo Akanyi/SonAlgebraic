@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...analysis.typesys import callable_symbol_type, is_bool, is_error, is_numeric, is_sub_ptr, is_sub_type, is_symbol, same_type_spec, sub_signature
+from ...analysis.typesys import callable_symbol_type, is_bool, is_error, is_managed_resource, is_numeric, is_sub_ptr, is_sub_type, is_symbol, same_type_spec, sub_signature
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import LLVMValue, NativeGenBase, VarSlot
@@ -72,6 +72,11 @@ class StmtsMixin(NativeGenBase):
             return
         if isinstance(stmt, ast.Goto):
             self.emit(self.source_comment(stmt.line_no))
+            graph = self.checked.scope_graphs.get(self.current_sub.name.lower()) if self.current_sub else None
+            depth = graph.exit_depths.get(stmt.line_no, 0) if graph is not None else 0
+            if depth:
+                for resources in reversed(self.scope_resources[-depth:]):
+                    self.emit_scope_cleanup(resources)
             self.emit(f"  br label %{self.label_name(stmt.label)}")
             self.terminated = True
             return
@@ -84,6 +89,10 @@ class StmtsMixin(NativeGenBase):
             self.emit(self.source_comment(stmt.line_no))
             self.emit(f"{self.label_name(stmt.name)}:")
             self.terminated = False
+            return
+        if isinstance(stmt, ast.Scope):
+            self.emit(self.source_comment(stmt.line_no))
+            self.run_block(stmt.body)
             return
         if isinstance(stmt, ast.If):
             self.if_stmt(stmt)
@@ -162,12 +171,12 @@ class StmtsMixin(NativeGenBase):
                 self.end_stmt()
             return
         self.emit(f"  store {self.llvm_type(stmt.type_spec)} {self.default_value(stmt.type_spec)}, ptr {ptr}")
-        if stmt.type_spec.name == "PROMISE":
+        if stmt.type_spec.name == "PROMISE" or is_managed_resource(stmt.type_spec):
             self.register_owned(slot)
         if stmt.expr is not None:
             self.begin_stmt()
             value = self.cast_value(self.expr(stmt.expr), stmt.type_spec)
-            if stmt.type_spec.name == "PROMISE":
+            if stmt.type_spec.name == "PROMISE" or is_managed_resource(stmt.type_spec):
                 self.adopt_temp_cleanup(value.value, stmt.type_spec)
             self.emit(f"  store {self.llvm_type(stmt.type_spec)} {value.value}, ptr {ptr}")
             self.end_stmt()
@@ -210,7 +219,11 @@ class StmtsMixin(NativeGenBase):
             value = self.cast_value(self.expr(stmt.expr), target_type)
             target_ptr = self.next_temp()
             self.emit(f"  {target_ptr} = load ptr, ptr {saved_target}")
-            if self.is_string_scalar(target_type):
+            if is_managed_resource(target_type):
+                self.adopt_temp_cleanup(value.value, target_type)
+                self.emit_free_slot(VarSlot("", target_type, target_ptr))
+                self.emit(f"  store i64 {value.value}, ptr {target_ptr}")
+            elif self.is_string_scalar(target_type):
                 self.store_string(target_ptr, value)
             else:
                 self.emit(f"  store {self.llvm_type(target_type)} {value.value}, ptr {target_ptr}")
@@ -241,7 +254,10 @@ class StmtsMixin(NativeGenBase):
             self.store_entity(target_ptr, stmt.expr, target_type)
             return
         value = self.cast_value(self.expr(stmt.expr), target_type)
-        if target_type.name == "PROMISE":
+        if is_managed_resource(target_type):
+            self.adopt_temp_cleanup(value.value, target_type)
+            self.emit_free_slot(VarSlot("", target_type, target_ptr))
+        elif target_type.name == "PROMISE":
             self.adopt_temp_cleanup(value.value, target_type)
         if self.is_string_scalar(target_type):
             self.store_string(target_ptr, value)
@@ -672,6 +688,10 @@ class StmtsMixin(NativeGenBase):
             self.emit(f"  {value} = load {llvm_ty}, ptr {ptr}")
             self.emit(f"  store {llvm_ty} {'null' if llvm_ty == 'ptr' else 'zeroinitializer'}, ptr {ptr}")
             return LLVMValue(llvm_ty, value, return_type)
+        if is_managed_resource(return_type):
+            value = self.cast_value(self.expr(expr), return_type)
+            self.adopt_temp_cleanup(value.value, return_type)
+            return value
         if is_symbol(return_type):
             # symbol_expr 自己分辨：变量→clone，临时树→接管，数字/串→常量节点
             return self.symbol_expr(expr)

@@ -8,23 +8,24 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ...analysis.semantics import CheckedProgram, Symbol
-from ...analysis.typesys import c_type, callable_symbol_type, is_error, is_handle, is_numeric, is_promise, is_string, is_sub_ptr, is_sub_type, is_symbol, runtime_features_for_program, sub_signature, type_of
+from ...analysis.resource_traits import handle_drop_function
+from ...analysis.typesys import c_type, callable_symbol_type, is_cptr, is_error, is_handle, is_managed_resource, is_numeric, is_promise, is_ptr, is_string, is_sub_ptr, is_sub_type, is_symbol, runtime_features_for_program, sub_signature, type_of
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import entity_c_name, c_ident as make_c_ident, module_symbol_prefix, split_module_member
+from ...core.walk import walk_statements
 
 
 @dataclass
 class AsyncFrameCtx:
-    """一个 ASYNC SUB 的协程帧生成上下文。生成 resume 体前压栈、生成完出栈。
+    """一个 ASYNC SUB 的协程帧生成上下文。
 
-    frame_vars 是提升进帧的变量名集合（参数 + 所有局部，首期无脑全提升）。codegen 的
-    标识符解析（c_value）命中它就把名字重写成 `f-><c_ident>`——这是把同步 codegen 复用
-    到协程体的唯一闸口。resume_points 按源码顺序给每个 AWAIT 分配恢复点编号，最后拼成
-    resume 顶部的 switch 派发表（照抄 GOSUB 的返回地址 switch）。 """
+    frame_vars 按名字和声明身份映射到独立帧字段，兄弟块同名不能复用拥有槽。
+    resume_points 记录挂起后的恢复入口。
+    """
     sub: ast.Subroutine
     frame_type: str
-    frame_vars: set[str]
+    frame_vars: dict[tuple[str, int | None], str]
     resume_points: list[int] = field(default_factory=list)
     # FOR 循环的上界/步长也要提升进帧（按 line_no 记）：循环体含 AWAIT 时，resume 用 goto
     # 跳进体中间，会跳过栈上的上界/步长初始化，留下垃圾值让循环失控。提升进帧才能在挂起—
@@ -108,7 +109,7 @@ class CGenBase:
             if is_string(type_spec):
                 self.local_resource_stack[-1].append((name, type_spec))
             return
-        if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or is_sub_type(type_spec) or (type_spec.name == "ENTITY" and self.type_has_managed_resources(type_spec)):
+        if is_managed_resource(type_spec) or is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or is_sub_type(type_spec) or (type_spec.name == "ENTITY" and self.type_has_managed_resources(type_spec)):
             self.local_resource_stack[-1].append((name, type_spec))
 
     def unregister_local_resource(self, name: str) -> None:
@@ -145,7 +146,7 @@ class CGenBase:
             return [f"{pad}{source} = (SaError){{0, \"ERR_NONE\", NULL, 0, NULL}};"]
         if type_spec.name == "ENTITY":
             return [f"{pad}memset(&{source}, 0, sizeof({source}));"]
-        if is_promise(type_spec):
+        if is_promise(type_spec) or is_managed_resource(type_spec):
             return [f"{pad}{source} = 0;"]
         return [f"{pad}{source} = NULL;"]
 
@@ -167,7 +168,9 @@ class CGenBase:
                     lines.append(f"{pad}    free({name}[{idx}]);")
                     lines.append(f"{pad}}}")
                 continue
-            if is_string(type_spec):
+            if is_managed_resource(type_spec):
+                lines.append(f"{pad}{handle_drop_function(type_spec)}({name});")
+            elif is_string(type_spec):
                 lines.append(f"{pad}free({name});")
             elif is_symbol(type_spec):
                 lines.append(f"{pad}sa_symbol_free({name});")
@@ -223,6 +226,7 @@ class CGenBase:
         prelude_all: list[str] = []
         cleanup_all: list[str] = []
         values: list[str] = []
+        self.cleanup_stack.append(cleanup_all)
         for arg, param in zip(args, params):
             if param.by_ref:
                 if not isinstance(arg, ast.VarRef):
@@ -235,6 +239,7 @@ class CGenBase:
             if is_handle(param.type_spec) and isinstance(arg, ast.NullLiteral):
                 value = "0"
             values.append(value)
+        self.cleanup_stack.pop()
         return prelude_all, values, cleanup_all
 
     def callable_var_type(self, name: str) -> ast.TypeSpec | None:
@@ -296,6 +301,7 @@ class CGenBase:
         prelude_all: list[str] = []
         cleanup_all: list[str] = []
         values: list[str] = []
+        self.cleanup_stack.append(cleanup_all)
         for arg, param in zip(args, c_func.params):
             if param.by_ref:
                 if not isinstance(arg, ast.VarRef):
@@ -308,6 +314,7 @@ class CGenBase:
             prelude_all.extend(prelude)
             cleanup_all.extend(cleanup)
             values.append(self.c_cast_arg(value, param.type_spec, self.type_of(arg)))
+        self.cleanup_stack.pop()
         return prelude_all, values, cleanup_all
 
     def c_cast_arg(self, value: str, param_type: ast.TypeSpec, arg_type: ast.TypeSpec) -> str:
@@ -376,6 +383,23 @@ class CGenBase:
     def default_value(self, type_spec: ast.TypeSpec) -> str:
         if is_string(type_spec):
             return '""'
+        return "0"
+
+    def zero_init_value(self, type_spec: ast.TypeSpec) -> str:
+        """声明这个类型的变量时那个「还没持有任何东西」的初值。
+
+        和 default_value 不是一回事：那个给的是能当返回值用的现成值（STRING 给静态空串），
+        这个给的是等着被写入的空槽。两者对 STRING 恰好相反——`""` 不能 free，NULL 不能 PRINT。
+        所以零初始化之后必须有人负责填上有效值：声明处紧跟一行 sa_strdup("")，容器取值靠
+        runtime 写入、只在失败路径上补。顺序反过来就会漏掉先填进去那一份。
+        """
+        if is_error(type_spec):
+            return '{0, "ERR_NONE", NULL, 0, NULL}'
+        if type_spec.name == "ENTITY":
+            return "{0}"
+        if (is_string(type_spec) or is_cptr(type_spec) or is_ptr(type_spec)
+                or is_symbol(type_spec) or is_sub_type(type_spec)):
+            return "NULL"
         return "0"
 
     def c_unary_op(self, op: str) -> str:
@@ -488,6 +512,7 @@ class CGenBase:
             "binary": "#define SA_ENABLE_BINARY",
             "list": "#define SA_ENABLE_LIST",
             "map": "#define SA_ENABLE_MAP",
+            "container": "#define SA_ENABLE_CONTAINER",
             "gui": "#define SA_ENABLE_GUI",
             "async": "#define SA_ENABLE_ASYNC",
         }
@@ -528,59 +553,12 @@ def c_comment_text(value: str) -> str:
 
 
 def stmt_has_gosub(stmt: ast.Stmt) -> bool:
-    if isinstance(stmt, ast.Gosub):
-        return True
-    if isinstance(stmt, ast.If):
-        in_body = any(stmt_has_gosub(inner) for inner in stmt.body)
-        in_elifs = any(stmt_has_gosub(inner) for branch in stmt.elifs for inner in branch.body)
-        in_else = any(stmt_has_gosub(inner) for inner in stmt.else_body)
-        return in_body or in_elifs or in_else
-    if isinstance(stmt, ast.TryCatch):
-        return any(stmt_has_gosub(inner) for branch in stmt.catches for inner in branch.body)
-    if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-        return any(stmt_has_gosub(inner) for inner in stmt.body)
-    return False
+    return any(isinstance(inner, ast.Gosub) for inner in walk_statements([stmt]))
 
 
 def stmt_has_goto(stmt: ast.Stmt) -> bool:
-    # 保守判定：SUB 内任意位置（含嵌套块、CATCH 块内）出现 GOTO，就认为存在跨块跳转风险，
-    # 据此把 CATCH 变量提升到函数作用域并在 SUB 末尾兜底清理。
-    if isinstance(stmt, ast.Goto):
-        return True
-    if isinstance(stmt, ast.If):
-        in_body = any(stmt_has_goto(inner) for inner in stmt.body)
-        in_elifs = any(stmt_has_goto(inner) for branch in stmt.elifs for inner in branch.body)
-        in_else = any(stmt_has_goto(inner) for inner in stmt.else_body)
-        return in_body or in_elifs or in_else
-    if isinstance(stmt, ast.TryCatch):
-        return any(stmt_has_goto(inner) for branch in stmt.catches for inner in branch.body)
-    if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-        return any(stmt_has_goto(inner) for inner in stmt.body)
-    return False
+    return any(isinstance(inner, ast.Goto) for inner in walk_statements([stmt]))
 
 
 def stmt_gosub_lines(stmt: ast.Stmt) -> list[int]:
-    if isinstance(stmt, ast.Gosub):
-        return [stmt.line_no]
-    if isinstance(stmt, ast.If):
-        lines: list[int] = []
-        for inner in stmt.body:
-            lines.extend(stmt_gosub_lines(inner))
-        for branch in stmt.elifs:
-            for inner in branch.body:
-                lines.extend(stmt_gosub_lines(inner))
-        for inner in stmt.else_body:
-            lines.extend(stmt_gosub_lines(inner))
-        return lines
-    if isinstance(stmt, ast.TryCatch):
-        lines: list[int] = []
-        for branch in stmt.catches:
-            for inner in branch.body:
-                lines.extend(stmt_gosub_lines(inner))
-        return lines
-    if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-        lines: list[int] = []
-        for inner in stmt.body:
-            lines.extend(stmt_gosub_lines(inner))
-        return lines
-    return []
+    return [inner.line_no for inner in walk_statements([stmt]) if isinstance(inner, ast.Gosub)]

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import re
 
-from ...analysis.typesys import is_error, is_handle, is_promise, is_string, is_sub_type, is_symbol
+from ...analysis.resource_traits import handle_drop_function
+from ...analysis.typesys import is_error, is_handle, is_managed_resource, is_promise, is_string, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
+from ...core.walk import child_bodies, walk_statements
 from .base import AsyncFrameCtx, CGenBase
 
 
@@ -62,6 +64,7 @@ class CoroutinesMixin(CGenBase):
             code = re.sub(r"\b(sa_tmp_\d+)\s*=\s*(?=\{)", lambda m: f"{m[1]} = ({fields[m[1]]})" if m[1] in fields else m[0], code)
             # 真正执行释放的位置清空指针；别名中间量没有清理登记，不进入兜底集合。
             code = re.sub(r"\b(free|sa_symbol_free|sa_callable_release)\((sa_tmp_\d+(?:_result)?(?:\.\w+)*)\);", lambda m: f"{m[0]} {m[2]} = NULL;", code)
+            code = re.sub(r"\b(sa_\w+_drop)\((sa_tmp_\d+(?:_result)?(?:\.\w+)*)\);", lambda m: f"{m[0]} {m[2]} = 0;", code)
             code = re.sub(r"\bsa_tmp_\d+(?:_result)?\b", lambda m: f"f->{m[0]}" if m[0] in fields else m[0], code)
             tokens[i] = code
         cleanup: list[str] = []
@@ -101,49 +104,16 @@ class CoroutinesMixin(CGenBase):
         result: list[ast.LocalDeclaration] = []
         if isinstance(stmt, ast.LocalDeclaration):
             result.append(stmt)
-        elif isinstance(stmt, ast.If):
-            for inner in stmt.body:
-                result.extend(self._collect_local_decls(inner))
-            for branch in stmt.elifs:
-                for inner in branch.body:
-                    result.extend(self._collect_local_decls(inner))
-            for inner in stmt.else_body:
-                result.extend(self._collect_local_decls(inner))
-        elif isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-            for inner in stmt.body:
-                result.extend(self._collect_local_decls(inner))
-        elif isinstance(stmt, ast.TryCatch):
+        if isinstance(stmt, ast.TryCatch):
             for branch in stmt.catches:
                 result.append(ast.LocalDeclaration(branch.line_no, branch.alias, ast.TypeSpec("ERROR"), False, None))
-                for inner in branch.body:
-                    result.extend(self._collect_local_decls(inner))
+        for body in child_bodies(stmt):
+            for inner in body:
+                result.extend(self._collect_local_decls(inner))
         return result
 
     def _collect_for_loops(self, stmt: ast.Stmt) -> list[ast.ForLoop]:
-        """递归收集一条语句里的所有 FOR（含嵌套），用于给 async 帧预留上界/步长字段。
-        覆盖面必须和 for_stmt 生成时会遇到的 FOR 一致——两处都以本函数收集的 line_no
-        集合为准，天然对齐，漏收的 FOR 两边都退回栈局部（那种只可能在 TRY 内，其中禁 AWAIT）。"""
-        result: list[ast.ForLoop] = []
-        if isinstance(stmt, ast.ForLoop):
-            result.append(stmt)
-            for inner in stmt.body:
-                result.extend(self._collect_for_loops(inner))
-        elif isinstance(stmt, ast.WhileLoop):
-            for inner in stmt.body:
-                result.extend(self._collect_for_loops(inner))
-        elif isinstance(stmt, ast.If):
-            for inner in stmt.body:
-                result.extend(self._collect_for_loops(inner))
-            for branch in stmt.elifs:
-                for inner in branch.body:
-                    result.extend(self._collect_for_loops(inner))
-            for inner in stmt.else_body:
-                result.extend(self._collect_for_loops(inner))
-        elif isinstance(stmt, ast.TryCatch):
-            for branch in stmt.catches:
-                for inner in branch.body:
-                    result.extend(self._collect_for_loops(inner))
-        return result
+        return [inner for inner in walk_statements([stmt]) if isinstance(inner, ast.ForLoop)]
 
     def _collect_for_loops_in_sub(self, sub: ast.Subroutine) -> list[ast.ForLoop]:
         result: list[ast.ForLoop] = []
@@ -156,26 +126,32 @@ class CoroutinesMixin(CGenBase):
         `sa_floop_` 前缀不与用户变量撞车。"""
         return f"sa_floop_end_{line_no}", f"sa_floop_step_{line_no}"
 
-    def async_frame_fields(self, sub: ast.Subroutine) -> list[tuple[str, ast.TypeSpec]]:
-        """帧字段 = 参数 + 所有局部（首期无脑全提升，不做活跃变量分析：正确性无损、帧略大）。"""
-        fields: list[tuple[str, ast.TypeSpec]] = [(p.name, p.type_spec) for p in sub.params]
+    def async_frame_bindings(self, sub: ast.Subroutine) -> list[tuple[str, int | None, ast.TypeSpec, str]]:
+        bindings: list[tuple[str, int | None, ast.TypeSpec, str]] = [
+            (p.name, None, p.type_spec, self.c_ident(p.name)) for p in sub.params
+        ]
         seen = {p.name.lower() for p in sub.params}
         for stmt in sub.body:
             for decl in self._collect_local_decls(stmt):
-                if decl.name.lower() not in seen:
-                    seen.add(decl.name.lower())
-                    fields.append((decl.name, decl.type_spec))
-        return fields
+                field = self.c_ident(decl.name) if decl.name.lower() not in seen else f"sa_SCOPE_{decl.line_no}"
+                seen.add(decl.name.lower())
+                bindings.append((decl.name, decl.line_no, decl.type_spec, field))
+        return bindings
+
+    def async_frame_fields(self, sub: ast.Subroutine) -> list[tuple[str, ast.TypeSpec]]:
+        return [(field, kind) for _, _, kind, field in self.async_frame_bindings(sub)]
 
     def async_frame_field(self, root: str) -> str | None:
-        """命中当前协程帧变量集合的标识符 -> f-><c_ident>；否则 None（走普通解析）。"""
-        if self.async_frame_stack and root.lower() in self.async_frame_stack[-1].frame_vars:
-            return f"f->{self.c_ident(root)}"
+        symbol = self.symbols.get(root.lower())
+        if self.async_frame_stack and symbol is not None:
+            field = self.async_frame_stack[-1].frame_vars.get((root.lower(), symbol.declaration_id))
+            if field is not None:
+                return f"f->{field}"
         return None
 
     def _is_managed_type(self, type_spec: ast.TypeSpec) -> bool:
         return (
-            is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or is_sub_type(type_spec)
+            is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_promise(type_spec) or is_sub_type(type_spec) or is_managed_resource(type_spec)
             or (type_spec.name == "ENTITY" and self.type_has_managed_resources(type_spec))
         )
 
@@ -193,9 +169,9 @@ class CoroutinesMixin(CGenBase):
             lines = ["typedef struct {", "    SaCoroBase base;"]
             for name, type_spec in self.async_frame_fields(sub):
                 suffix = f"[{type_spec.array_size}]" if type_spec.array_size is not None else ""
-                lines.append(f"    {self.c_type(type_spec)} {self.c_ident(name)}{suffix};")
+                lines.append(f"    {self.c_type(type_spec)} {name}{suffix};")
                 if self._is_managed_type(type_spec):
-                    lines.append(f"    int sa_borrowed_{self.c_ident(name)};")
+                    lines.append(f"    int sa_borrowed_{name};")
             lines.extend(f"    {kind} {name};" for kind, name in self._async_temp_fields[sub.name])
             for loop in self._collect_for_loops_in_sub(sub):
                 end_name, step_name = self._for_frame_names(loop.line_no)
@@ -214,7 +190,10 @@ class CoroutinesMixin(CGenBase):
             return self._async_generated[sub.name]
         frame_type = self.async_frame_type(sub.name)
         fields = self.async_frame_fields(sub)
-        ctx = AsyncFrameCtx(sub, frame_type, {name.lower() for name, _ in fields})
+        ctx = AsyncFrameCtx(sub, frame_type, {
+            (name.lower(), declaration_id): field
+            for name, declaration_id, _, field in self.async_frame_bindings(sub)
+        })
         ctx.for_frame_lines = {loop.line_no for loop in self._collect_for_loops_in_sub(sub)}
 
         self.async_frame_stack.append(ctx)
@@ -243,8 +222,8 @@ class CoroutinesMixin(CGenBase):
         cleanup_body = []
         for name, kind in reversed(fields):
             if self._is_managed_type(kind):
-                cleanup_body.append(f"    if (!f->sa_borrowed_{self.c_ident(name)}) {{")
-                cleanup_body.extend(self.local_resource_cleanup_lines([(f"f->{self.c_ident(name)}", kind)], 2))
+                cleanup_body.append(f"    if (!f->sa_borrowed_{name}) {{")
+                cleanup_body.extend(self.local_resource_cleanup_lines([(f"f->{name}", kind)], 2))
                 cleanup_body.append("    }")
 
         body_lines, temp_cleanup, temp_fields = self.hoist_async_temporaries(body_lines, ctx)
@@ -374,6 +353,10 @@ class CoroutinesMixin(CGenBase):
             lines.append(f"{pad}char* sa_result = {temp};")
             lines.append(f"{pad}{temp} = NULL;")
             lines.append(f"{pad}sa_promise_fulfill_str(f->base.self, sa_result);")
+        elif is_managed_resource(return_type):
+            lines.append(f"{pad}SaHandle sa_result = {temp};")
+            lines.append(f"{pad}{temp} = 0;")
+            lines.append(f"{pad}sa_promise_fulfill_owned_handle(f->base.self, sa_result, {handle_drop_function(return_type)}_value);")
         else:
             lines.append(f"{pad}{self.async_fulfill_call(return_type, temp)};")
         lines.append(f"{pad}return;")
@@ -459,4 +442,7 @@ class CoroutinesMixin(CGenBase):
         temp = self.next_temp()
         self.add_prelude(f"{self.c_type(inner)} {temp} = {take};")
         self.add_cleanup(f"sa_promise_release({promise_expr});")
+        if is_managed_resource(inner):
+            for line in self.local_resource_cleanup_lines([(temp, inner)], 0):
+                self.add_cleanup(line)
         return temp

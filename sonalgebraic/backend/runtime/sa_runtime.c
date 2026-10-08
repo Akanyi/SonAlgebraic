@@ -16,7 +16,11 @@ enum {
     SA_HANDLE_STR_MAP = 9,
     SA_HANDLE_GUI_WINDOW = 10,
     SA_HANDLE_GUI_WIDGET = 11,
-    SA_HANDLE_PROMISE = 12
+    SA_HANDLE_PROMISE = 12,
+    /* 托管容器另起 kind：旧 LIST/MAP 的槽位里只有 double 和 char*，没有「元素析构」这回事。
+       共用 kind 就意味着同一张表上两套所有权模型，漏释放时分不清该追谁。 */
+    SA_HANDLE_VEC = 13,
+    SA_HANDLE_DICT = 14
 };
 
 SaHandle sa_handle_make(unsigned int kind, uint32_t generation, size_t index) {
@@ -33,6 +37,32 @@ int sa_handle_parse(SaHandle handle, unsigned int kind, size_t count, size_t* in
 }
 
 char* sa_strdup(const char* value);
+
+/* 托管句柄的三件套：作用域析构、通用指针 ABI 析构、显式 CLOSE 后清空槽位。
+ * 析构不是用户发起的操作，所以要还原 LAST_ERROR 和 errno——不能让自动清理踩掉正在诊断的现场。
+ * 各 kind 的关闭函数签名一致，用宏展开省掉六份只差名字的拷贝；函数名整个传进来，
+ * 这样 grep 和头文件一致性检查仍然能看见它们。 */
+#define SA_DEFINE_HANDLE_DROP(drop_fn, drop_value_fn, close_owned_fn, closer, last_error) \
+    void drop_fn(SaHandle handle) {                                       \
+        if (!handle) return;                                              \
+        char saved_error[sizeof(last_error)];                             \
+        int saved_errno = errno;                                          \
+        memcpy(saved_error, last_error, sizeof(saved_error));             \
+        closer(handle);                                                   \
+        memcpy(last_error, saved_error, sizeof(saved_error));             \
+        errno = saved_errno;                                              \
+    }                                                                     \
+    void drop_value_fn(void* value) {                                     \
+        SaHandle* slot = (SaHandle*)value;                                \
+        SaHandle owned = *slot;                                           \
+        *slot = 0;                                                        \
+        drop_fn(owned);                                                   \
+    }                                                                     \
+    int close_owned_fn(SaHandle* slot) {                                  \
+        SaHandle owned = *slot;                                           \
+        *slot = 0;                                                        \
+        return closer(owned);                                             \
+    }
 
 void* sa_try_push_env(void) {
     if (sa_try_top >= 64) {
@@ -150,6 +180,8 @@ int sa_binary_close(SaHandle handle) {
     slot->generation++;
     return 1;
 }
+
+SA_DEFINE_HANDLE_DROP(sa_binary_drop, sa_binary_drop_value, sa_binary_close_owned, sa_binary_close, sa_binary_last_error)
 
 long long sa_binary_length(SaHandle handle) {
     sa_binary_clear_error();
@@ -839,6 +871,581 @@ int sa_map_close_impl(SaHandle handle, unsigned int kind) {
 
 int sa_map_close(SaHandle handle) { return sa_map_close_impl(handle, SA_HANDLE_MAP); }
 int sa_strmap_close(SaHandle handle) { return sa_map_close_impl(handle, SA_HANDLE_STR_MAP); }
+#endif
+
+#ifdef SA_ENABLE_CONTAINER
+/* 托管容器只负责搬字节，元素的值语义由编译器填进 SaValueOps（定义在前导区）。
+   元素连续存放，所以 BORROW 返回的是槽位内部地址，扩容会让它失效——借用期间冻结容器
+   是静态检查的事，运行时这层只保证不越界、不重复释放。 */
+#define SA_VEC_SLOT_COUNT 128
+typedef struct {
+    unsigned char* data;
+    size_t length;
+    size_t capacity;
+    /* ops 非空即活槽位。再单独留一个 live 标志只会多出一处可能和 ops 不一致的状态。 */
+    const SaValueOps* ops;
+    uint32_t generation;
+} SaVecSlot;
+
+SaVecSlot sa_vec_slots[SA_VEC_SLOT_COUNT];
+char sa_container_last_error[512] = "";
+int sa_container_cleanup_registered = 0;
+
+void sa_container_clear_error(void) { sa_container_last_error[0] = '\0'; }
+void sa_container_set_error(const char* message) {
+    snprintf(sa_container_last_error, sizeof(sa_container_last_error), "%s", message ? message : "container error");
+}
+char* sa_container_last_error_copy(void) { return sa_strdup(sa_container_last_error); }
+
+unsigned char* sa_vec_at(SaVecSlot* slot, size_t index) {
+    return slot->data + index * slot->ops->size;
+}
+
+void sa_vec_drop_range(SaVecSlot* slot, size_t from, size_t count) {
+    if (!slot->ops->drop) return;
+    for (size_t i = 0; i < count; i++) slot->ops->drop(sa_vec_at(slot, from + i));
+}
+
+void sa_vec_slot_free(SaVecSlot* slot) {
+    if (!slot->ops) return;
+    sa_vec_drop_range(slot, 0, slot->length);
+    free(slot->data);
+    slot->data = NULL;
+    slot->length = 0;
+    slot->capacity = 0;
+    slot->ops = NULL;
+}
+
+void sa_vec_close_all(void) {
+    for (size_t i = 0; i < SA_VEC_SLOT_COUNT; i++) {
+        sa_vec_slot_free(&sa_vec_slots[i]);
+        sa_vec_slots[i].generation++;
+    }
+}
+
+SaVecSlot* sa_vec_slot(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_VEC, SA_VEC_SLOT_COUNT, &index, &generation)) return NULL;
+    SaVecSlot* slot = &sa_vec_slots[index];
+    return slot->ops && slot->generation == generation ? slot : NULL;
+}
+
+SaVecSlot* sa_vec_checked(SaHandle handle) {
+    SaVecSlot* slot = sa_vec_slot(handle);
+    if (!slot) sa_container_set_error("invalid or closed container handle");
+    return slot;
+}
+
+SaHandle sa_vec_new(const SaValueOps* ops) {
+    sa_container_clear_error();
+    if (!ops || ops->size == 0) { sa_container_set_error("container element ops missing"); return 0; }
+    for (size_t i = 0; i < SA_VEC_SLOT_COUNT; i++) {
+        SaVecSlot* slot = &sa_vec_slots[i];
+        if (slot->ops) continue;
+        if (++slot->generation == 0) slot->generation = 1;
+        /* 空容器不预分配：元素大小是运行期才知道的，推迟到第一次插入省掉一次猜测性 malloc。 */
+        slot->data = NULL;
+        slot->length = 0;
+        slot->capacity = 0;
+        slot->ops = ops;
+        if (!sa_container_cleanup_registered) {
+            atexit(sa_vec_close_all);
+            sa_container_cleanup_registered = 1;
+        }
+        return sa_handle_make(SA_HANDLE_VEC, slot->generation, i);
+    }
+    sa_container_set_error("too many live containers");
+    return 0;
+}
+
+/* 容量先备好再提交所有权转移：移动插入要是卡在这一步，源还没被清空，调用方不会丢值。 */
+void sa_vec_reserve(SaVecSlot* slot, size_t needed) {
+    if (needed <= slot->capacity) return;
+    size_t capacity = slot->capacity ? slot->capacity * 2 : 8;
+    while (capacity < needed) capacity *= 2;
+    /* 字节数乘法要先查溢出：越界乘法是 UB，realloc 看到的会是个被截断的小尺寸。 */
+    if (capacity > (size_t)-1 / slot->ops->size) { fputs("SonAlgebraic runtime: container too large\n", stderr); exit(1); }
+    unsigned char* grown = (unsigned char*)realloc(slot->data, capacity * slot->ops->size);
+    if (!grown) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    slot->data = grown;
+    slot->capacity = capacity;
+}
+
+int sa_vec_index_ok(SaVecSlot* slot, long long index, int allow_end) {
+    long long limit = (long long)slot->length + (allow_end ? 1 : 0);
+    if (index >= 0 && index < limit) return 1;
+    sa_container_set_error("container index out of range");
+    return 0;
+}
+
+/* 复制进出容器前确认元素真的可复制。静态检查是主防线，这里兜住 FFI 和生成器的漏网之鱼。 */
+int sa_value_copy_allowed(const SaValueOps* ops) {
+    if (ops->copyable) return 1;
+    sa_container_set_error("container element is move-only; use the MOVE form");
+    return 0;
+}
+
+void sa_value_copy(const SaValueOps* ops, void* target, const void* source) {
+    if (ops->copy) ops->copy(target, source);
+    else memcpy(target, source, ops->size);
+}
+
+long long sa_vec_length(SaHandle handle) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    return slot ? (long long)slot->length : -1;
+}
+
+/* value 指向容器自己的元素时 memmove 会让它失效（例如把某个元素再插回同一个容器）。
+   借用存续期间容器被冻结，这条路径到不了生成代码里，所以运行时不另做别名检测。 */
+int sa_vec_insert(SaHandle handle, long long index, const void* value) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_value_copy_allowed(slot->ops) || !sa_vec_index_ok(slot, index, 1)) return 0;
+    sa_vec_reserve(slot, slot->length + 1);
+    unsigned char* at = sa_vec_at(slot, (size_t)index);
+    memmove(at + slot->ops->size, at, (slot->length - (size_t)index) * slot->ops->size);
+    sa_value_copy(slot->ops, at, value);
+    slot->length++;
+    return 1;
+}
+
+int sa_vec_insert_move(SaHandle handle, long long index, void* value) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_vec_index_ok(slot, index, 1)) return 0;
+    sa_vec_reserve(slot, slot->length + 1);
+    unsigned char* at = sa_vec_at(slot, (size_t)index);
+    memmove(at + slot->ops->size, at, (slot->length - (size_t)index) * slot->ops->size);
+    memcpy(at, value, slot->ops->size);
+    /* 搬完才清源。全 0 是所有元素类型的安全空值（指针 NULL、句柄 0），
+       调用方万一漏了重置，析构也不会第二次释放同一份资源。 */
+    memset(value, 0, slot->ops->size);
+    slot->length++;
+    return 1;
+}
+
+int sa_vec_push(SaHandle handle, const void* value) {
+    SaVecSlot* slot = sa_vec_slot(handle);
+    return sa_vec_insert(handle, slot ? (long long)slot->length : 0, value);
+}
+
+int sa_vec_push_move(SaHandle handle, void* value) {
+    SaVecSlot* slot = sa_vec_slot(handle);
+    return sa_vec_insert_move(handle, slot ? (long long)slot->length : 0, value);
+}
+
+int sa_vec_get(SaHandle handle, long long index, void* out) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_value_copy_allowed(slot->ops) || !sa_vec_index_ok(slot, index, 0)) return 0;
+    /* out 只写不读：调用方给的是一个还没持有资源的槽位，容器不负责释放它的旧值。 */
+    sa_value_copy(slot->ops, out, sa_vec_at(slot, (size_t)index));
+    return 1;
+}
+
+void* sa_vec_borrow(SaHandle handle, long long index) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_vec_index_ok(slot, index, 0)) return NULL;
+    return sa_vec_at(slot, (size_t)index);
+}
+
+int sa_vec_take(SaHandle handle, long long index, void* out) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_vec_index_ok(slot, index, 0)) return 0;
+    unsigned char* at = sa_vec_at(slot, (size_t)index);
+    memcpy(out, at, slot->ops->size);
+    memmove(at, at + slot->ops->size, (slot->length - (size_t)index - 1) * slot->ops->size);
+    slot->length--;
+    /* 腾出来的尾槽清零：这份值的所有权已经交出去了，残留字节会让下一次 drop 重复释放。 */
+    memset(sa_vec_at(slot, slot->length), 0, slot->ops->size);
+    return 1;
+}
+
+int sa_vec_set(SaHandle handle, long long index, const void* value) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_value_copy_allowed(slot->ops) || !sa_vec_index_ok(slot, index, 0)) return 0;
+    unsigned char* at = sa_vec_at(slot, (size_t)index);
+    if ((const void*)at == value) return 1;
+    /* 先把新值备在暂存区再释放旧值：源可能是同一个容器里的另一个元素，
+       反过来做会在复制之前就把它释放掉。 */
+    unsigned char* staging = (unsigned char*)malloc(slot->ops->size);
+    if (!staging) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    sa_value_copy(slot->ops, staging, value);
+    sa_vec_drop_range(slot, (size_t)index, 1);
+    memcpy(at, staging, slot->ops->size);
+    free(staging);
+    return 1;
+}
+
+int sa_vec_set_move(SaHandle handle, long long index, void* value) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_vec_index_ok(slot, index, 0)) return 0;
+    unsigned char* at = sa_vec_at(slot, (size_t)index);
+    if ((void*)at == value) return 1;
+    sa_vec_drop_range(slot, (size_t)index, 1);
+    memcpy(at, value, slot->ops->size);
+    memset(value, 0, slot->ops->size);
+    return 1;
+}
+
+int sa_vec_remove(SaHandle handle, long long index) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot || !sa_vec_index_ok(slot, index, 0)) return 0;
+    sa_vec_drop_range(slot, (size_t)index, 1);
+    unsigned char* at = sa_vec_at(slot, (size_t)index);
+    memmove(at, at + slot->ops->size, (slot->length - (size_t)index - 1) * slot->ops->size);
+    slot->length--;
+    memset(sa_vec_at(slot, slot->length), 0, slot->ops->size);
+    return 1;
+}
+
+int sa_vec_clear(SaHandle handle) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot) return 0;
+    sa_vec_drop_range(slot, 0, slot->length);
+    if (slot->length) memset(slot->data, 0, slot->length * slot->ops->size);
+    slot->length = 0;
+    return 1;
+}
+
+int sa_vec_close(SaHandle handle) {
+    sa_container_clear_error();
+    SaVecSlot* slot = sa_vec_checked(handle);
+    if (!slot) return 0;
+    sa_vec_slot_free(slot);
+    slot->generation++;
+    return 1;
+}
+
+SA_DEFINE_HANDLE_DROP(sa_vec_drop, sa_vec_drop_value, sa_vec_close_owned, sa_vec_close, sa_container_last_error)
+
+/* STRING key 的托管关联容器：链地址哈希，负载超过桶数就翻倍。结构照旧 MAP，
+   区别是值走 SaValueOps，key 的副本始终由容器自己持有。 */
+#define SA_DICT_SLOT_COUNT 128
+typedef struct SaDictEntry {
+    char* key;
+    struct SaDictEntry* next;
+    size_t hash;
+    /* 值紧跟条目尾部，省掉每个条目的第二次 malloc。前三个成员都是指针宽度，
+       value 的起始偏移天然按 8 对齐——SA 全部元素类型（含 ENTITY 聚合）的对齐上限也是 8。 */
+    unsigned char value[];
+} SaDictEntry;
+
+typedef struct {
+    SaDictEntry** buckets;
+    size_t bucket_count;
+    size_t length;
+    const SaValueOps* ops;
+    uint32_t generation;
+} SaDictSlot;
+
+SaDictSlot sa_dict_slots[SA_DICT_SLOT_COUNT];
+int sa_dict_cleanup_registered = 0;
+
+size_t sa_dict_hash(const char* key) {
+    /* FNV-1a。旧 MAP 里有一份一模一样的，但它在 SA_ENABLE_MAP 区内，
+       引用它就等于把整个旧 map 实现拖进来。 */
+    unsigned int hash = 2166136261u;
+    const unsigned char* p = (const unsigned char*)(key ? key : "");
+    while (*p) {
+        hash ^= (unsigned int)(*p++);
+        hash *= 16777619u;
+    }
+    return (size_t)hash;
+}
+
+void sa_dict_entry_free(SaDictSlot* slot, SaDictEntry* entry) {
+    if (slot->ops->drop) slot->ops->drop(entry->value);
+    free(entry->key);
+    free(entry);
+}
+
+void sa_dict_slot_free(SaDictSlot* slot) {
+    if (!slot->ops) return;
+    for (size_t i = 0; i < slot->bucket_count; i++) {
+        SaDictEntry* entry = slot->buckets[i];
+        while (entry) {
+            SaDictEntry* next = entry->next;
+            sa_dict_entry_free(slot, entry);
+            entry = next;
+        }
+    }
+    free(slot->buckets);
+    slot->buckets = NULL;
+    slot->bucket_count = 0;
+    slot->length = 0;
+    slot->ops = NULL;
+}
+
+void sa_dict_close_all(void) {
+    for (size_t i = 0; i < SA_DICT_SLOT_COUNT; i++) {
+        sa_dict_slot_free(&sa_dict_slots[i]);
+        sa_dict_slots[i].generation++;
+    }
+}
+
+SaDictSlot* sa_dict_slot(SaHandle handle) {
+    size_t index = 0;
+    uint32_t generation = 0;
+    if (!sa_handle_parse(handle, SA_HANDLE_DICT, SA_DICT_SLOT_COUNT, &index, &generation)) return NULL;
+    SaDictSlot* slot = &sa_dict_slots[index];
+    return slot->ops && slot->generation == generation ? slot : NULL;
+}
+
+SaDictSlot* sa_dict_checked(SaHandle handle) {
+    SaDictSlot* slot = sa_dict_slot(handle);
+    if (!slot) sa_container_set_error("invalid or closed dict handle");
+    return slot;
+}
+
+SaHandle sa_dict_new(const SaValueOps* ops) {
+    sa_container_clear_error();
+    if (!ops || ops->size == 0) { sa_container_set_error("container element ops missing"); return 0; }
+    for (size_t i = 0; i < SA_DICT_SLOT_COUNT; i++) {
+        SaDictSlot* slot = &sa_dict_slots[i];
+        if (slot->ops) continue;
+        if (++slot->generation == 0) slot->generation = 1;
+        slot->bucket_count = 16;
+        slot->length = 0;
+        slot->buckets = (SaDictEntry**)calloc(slot->bucket_count, sizeof(SaDictEntry*));
+        if (!slot->buckets) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+        slot->ops = ops;
+        if (!sa_dict_cleanup_registered) {
+            atexit(sa_dict_close_all);
+            sa_dict_cleanup_registered = 1;
+        }
+        return sa_handle_make(SA_HANDLE_DICT, slot->generation, i);
+    }
+    sa_container_set_error("too many live dicts");
+    return 0;
+}
+
+SaDictEntry* sa_dict_find(SaDictSlot* slot, const char* key) {
+    const char* safe = key ? key : "";
+    size_t hash = sa_dict_hash(safe);
+    SaDictEntry* entry = slot->buckets[hash % slot->bucket_count];
+    while (entry) {
+        if (entry->hash == hash && strcmp(entry->key, safe) == 0) return entry;
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+void sa_dict_rehash(SaDictSlot* slot) {
+    if (slot->length <= slot->bucket_count) return;
+    size_t count = slot->bucket_count * 2;
+    SaDictEntry** grown = (SaDictEntry**)calloc(count, sizeof(SaDictEntry*));
+    if (!grown) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    for (size_t i = 0; i < slot->bucket_count; i++) {
+        SaDictEntry* entry = slot->buckets[i];
+        while (entry) {
+            SaDictEntry* next = entry->next;
+            size_t target = entry->hash % count;
+            entry->next = grown[target];
+            grown[target] = entry;
+            entry = next;
+        }
+    }
+    free(slot->buckets);
+    slot->buckets = grown;
+    slot->bucket_count = count;
+}
+
+/* 挂一个值位全零的新条目，由调用方决定是复制还是移动进去。链接和 rehash 都在这里做完：
+   rehash 只重排桶数组、不搬动条目本身，所以返回的指针在调用方写值之前不会失效。 */
+SaDictEntry* sa_dict_insert_slot(SaDictSlot* slot, const char* key) {
+    const char* safe = key ? key : "";
+    SaDictEntry* entry = (SaDictEntry*)malloc(sizeof(SaDictEntry) + slot->ops->size);
+    if (!entry) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    entry->key = sa_strdup(safe);
+    entry->hash = sa_dict_hash(safe);
+    memset(entry->value, 0, slot->ops->size);
+    size_t target = entry->hash % slot->bucket_count;
+    entry->next = slot->buckets[target];
+    slot->buckets[target] = entry;
+    slot->length++;
+    sa_dict_rehash(slot);
+    return entry;
+}
+
+/* 按 key 摘链但不释放：调用方决定这份值是释放掉还是交出去。 */
+SaDictEntry* sa_dict_unlink(SaDictSlot* slot, const char* key) {
+    const char* safe = key ? key : "";
+    size_t hash = sa_dict_hash(safe);
+    SaDictEntry** link = &slot->buckets[hash % slot->bucket_count];
+    while (*link) {
+        SaDictEntry* entry = *link;
+        if (entry->hash == hash && strcmp(entry->key, safe) == 0) {
+            *link = entry->next;
+            slot->length--;
+            return entry;
+        }
+        link = &entry->next;
+    }
+    return NULL;
+}
+
+long long sa_dict_length(SaHandle handle) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    return slot ? (long long)slot->length : -1;
+}
+
+int sa_dict_has(SaHandle handle, const char* key) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    return slot && sa_dict_find(slot, key) != NULL;
+}
+
+int sa_dict_set(SaHandle handle, const char* key, const void* value) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot || !sa_value_copy_allowed(slot->ops)) return 0;
+    SaDictEntry* entry = sa_dict_find(slot, key);
+    if (!entry) {
+        sa_value_copy(slot->ops, sa_dict_insert_slot(slot, key)->value, value);
+        return 1;
+    }
+    if ((const void*)entry->value == value) return 1;
+    /* 和 vec 一样先把新值备在暂存区：源可能是同一容器里的另一个值，
+       反过来做会在复制之前就把它释放掉。 */
+    unsigned char* staging = (unsigned char*)malloc(slot->ops->size);
+    if (!staging) { fputs("SonAlgebraic runtime: out of memory\n", stderr); exit(1); }
+    sa_value_copy(slot->ops, staging, value);
+    if (slot->ops->drop) slot->ops->drop(entry->value);
+    memcpy(entry->value, staging, slot->ops->size);
+    free(staging);
+    return 1;
+}
+
+int sa_dict_set_move(SaHandle handle, const char* key, void* value) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot) return 0;
+    SaDictEntry* entry = sa_dict_find(slot, key);
+    if (!entry) {
+        entry = sa_dict_insert_slot(slot, key);
+    } else if ((void*)entry->value == value) {
+        return 1;
+    } else if (slot->ops->drop) {
+        slot->ops->drop(entry->value);
+    }
+    memcpy(entry->value, value, slot->ops->size);
+    /* 搬完才清源，理由同 sa_vec_insert_move。 */
+    memset(value, 0, slot->ops->size);
+    return 1;
+}
+
+int sa_dict_get(SaHandle handle, const char* key, void* out) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot || !sa_value_copy_allowed(slot->ops)) return 0;
+    SaDictEntry* entry = sa_dict_find(slot, key);
+    if (!entry) { sa_container_set_error("dict key not found"); return 0; }
+    sa_value_copy(slot->ops, out, entry->value);
+    return 1;
+}
+
+void* sa_dict_borrow(SaHandle handle, const char* key) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot) return NULL;
+    SaDictEntry* entry = sa_dict_find(slot, key);
+    if (!entry) { sa_container_set_error("dict key not found"); return NULL; }
+    return entry->value;
+}
+
+int sa_dict_take(SaHandle handle, const char* key, void* out) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot) return 0;
+    SaDictEntry* entry = sa_dict_unlink(slot, key);
+    if (!entry) { sa_container_set_error("dict key not found"); return 0; }
+    memcpy(out, entry->value, slot->ops->size);
+    /* 值的所有权转给了调用方，所以这里只回收条目本身，不走 drop。 */
+    free(entry->key);
+    free(entry);
+    return 1;
+}
+
+int sa_dict_remove(SaHandle handle, const char* key) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot) return 0;
+    SaDictEntry* entry = sa_dict_unlink(slot, key);
+    if (!entry) { sa_container_set_error("dict key not found"); return 0; }
+    sa_dict_entry_free(slot, entry);
+    return 1;
+}
+
+/* key 的副本交给调用方给的 STRING ops：STRING 胶水由后端按实际类型生成，
+   不预置在这块里，免得容器一启用就连带拖上别的运行时。 */
+SaHandle sa_dict_keys(SaHandle handle, const SaValueOps* string_ops) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot) return 0;
+    SaHandle keys = sa_vec_new(string_ops);
+    if (!keys) return 0;
+    for (size_t i = 0; i < slot->bucket_count; i++) {
+        for (SaDictEntry* entry = slot->buckets[i]; entry; entry = entry->next) {
+            if (!sa_vec_push(keys, &entry->key)) {
+                sa_vec_close(keys);
+                sa_container_set_error("dict keys need a copyable STRING ops table");
+                return 0;
+            }
+        }
+    }
+    return keys;
+}
+
+int sa_dict_clear(SaHandle handle) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot) return 0;
+    for (size_t i = 0; i < slot->bucket_count; i++) {
+        SaDictEntry* entry = slot->buckets[i];
+        while (entry) {
+            SaDictEntry* next = entry->next;
+            sa_dict_entry_free(slot, entry);
+            entry = next;
+        }
+        slot->buckets[i] = NULL;
+    }
+    slot->length = 0;
+    return 1;
+}
+
+int sa_dict_close(SaHandle handle) {
+    sa_container_clear_error();
+    SaDictSlot* slot = sa_dict_checked(handle);
+    if (!slot) return 0;
+    sa_dict_slot_free(slot);
+    slot->generation++;
+    return 1;
+}
+
+SA_DEFINE_HANDLE_DROP(sa_dict_drop, sa_dict_drop_value, sa_dict_close_owned, sa_dict_close, sa_container_last_error)
+
+/* 零依赖的元素操作：标量按字节复制、不需要析构。STRING、SYMBOL、ENTITY 和托管句柄元素的
+   胶水由后端按实际类型生成——预置在这里会让任何用到容器的程序都拖上整段 SYMBOL 或
+   callable 运行时，因为 feature 区是整块取舍的。 */
+const SaValueOps sa_ops_long = { sizeof(long long), 1, NULL, NULL };
+const SaValueOps sa_ops_double = { sizeof(double), 1, NULL, NULL };
+const SaValueOps sa_ops_float = { sizeof(float), 1, NULL, NULL };
+const SaValueOps sa_ops_bool = { sizeof(int), 1, NULL, NULL };
+const SaValueOps sa_ops_handle = { sizeof(SaHandle), 1, NULL, NULL };
+const SaValueOps sa_ops_pointer = { sizeof(void*), 1, NULL, NULL };
+/* 容器套容器：元素就是子容器句柄，只能移动，析构转交给子容器自己的 drop。 */
+const SaValueOps sa_ops_vec = { sizeof(SaHandle), 0, NULL, sa_vec_drop_value };
+const SaValueOps sa_ops_dict = { sizeof(SaHandle), 0, NULL, sa_dict_drop_value };
 #endif
 
 #ifdef _WIN32
@@ -2254,6 +2861,8 @@ int sa_net_tcp_listener_close(SaHandle handle) {
     return 1;
 }
 
+SA_DEFINE_HANDLE_DROP(sa_net_tcp_listener_drop, sa_net_tcp_listener_drop_value, sa_net_tcp_listener_close_owned, sa_net_tcp_listener_close, sa_net_last_error)
+
 long long sa_net_send_bytes(SaSocket socket_value, const unsigned char* data, size_t length) {
     size_t sent = 0;
     while (sent < length) {
@@ -2359,6 +2968,8 @@ int sa_net_stream_close(SaHandle handle) {
     slot->generation++;
     return 1;
 }
+
+SA_DEFINE_HANDLE_DROP(sa_net_stream_drop, sa_net_stream_drop_value, sa_net_stream_close_owned, sa_net_stream_close, sa_net_last_error)
 
 long long sa_net_socket_local_port(SaSocket socket_value) {
     struct sockaddr_storage address;
@@ -2569,6 +3180,8 @@ int sa_net_udp_close(SaHandle handle) {
     slot->generation++;
     return 1;
 }
+
+SA_DEFINE_HANDLE_DROP(sa_net_udp_drop, sa_net_udp_drop_value, sa_net_udp_close_owned, sa_net_udp_close, sa_net_last_error)
 
 long long sa_net_udp_local_port(SaHandle handle) {
     sa_net_clear_error();
@@ -3319,6 +3932,8 @@ int sa_file_close(SaHandle handle) {
     return 1;
 }
 
+SA_DEFINE_HANDLE_DROP(sa_file_drop, sa_file_drop_value, sa_file_close_owned, sa_file_close, sa_file_last_error)
+
 char* sa_file_read_text(const char* path) {
     SaHandle handle = sa_file_open(path, "READ");
     if (!handle) return sa_strdup("");
@@ -4009,6 +4624,8 @@ int sa_gui_close(SaHandle window) {
 #endif
 }
 
+SA_DEFINE_HANDLE_DROP(sa_gui_window_drop, sa_gui_window_drop_value, sa_gui_window_close_owned, sa_gui_close, sa_gui_last_error)
+
 #if defined(_WIN32) || defined(SA_ENABLE_GUI_GTK)
 SaGuiWidgetSlot* sa_gui_live_widget_slot(SaHandle handle) {
     size_t index = 0;
@@ -4154,9 +4771,8 @@ typedef struct {
     int live;
     uint32_t generation;
     int status;
-    /* 结果类型在编译期已知、运行时不记，只需一个标志区分「result 里躺着的是不是需要
-     * free 的堆字符串」——NUM/HANDLE 是值语义，STRING 是 move 进来的独占指针。 */
-    int has_string_result;
+    /* 析构器使用指针 ABI；取走结果时摘除，未取走就释放时按实际拥有类型销毁。 */
+    void (*result_drop)(void*);
     union {
         double d;
         long long i;
@@ -4204,7 +4820,7 @@ SaAsyncSlot* sa_async_slot(SaHandle handle) {
 
 /* 释放槽位持有的资源。已 CONSUMED 的字符串结果所有权已交出，这里不能再碰。 */
 void sa_async_slot_dispose(SaAsyncSlot* slot) {
-    if (slot->has_string_result && slot->status == SA_PROMISE_FULFILLED) free(slot->result.s);
+    if (slot->result_drop && slot->status == SA_PROMISE_FULFILLED) slot->result_drop(&slot->result);
     sa_error_clear(&slot->error);
     free(slot->io_data);
     sa_net_io_abandon(slot);   /* CONNECT 的游离 fd 在这里关掉；其他 op 的 fd 归句柄所有，不碰 */
@@ -4216,7 +4832,7 @@ void sa_async_slot_dispose(SaAsyncSlot* slot) {
     }
     slot->live = 0;
     slot->status = SA_PROMISE_PENDING;
-    slot->has_string_result = 0;
+    slot->result_drop = NULL;
     slot->result.s = NULL;
     slot->error = (SaError){0};
     slot->waiter = 0;
@@ -4239,7 +4855,7 @@ SaHandle sa_promise_alloc(SaCoroBase* coro) {
         if (++slot->generation == 0) slot->generation = 1;
         slot->live = 1;
         slot->status = SA_PROMISE_PENDING;
-        slot->has_string_result = 0;
+        slot->result_drop = NULL;
         slot->result.i = 0;
         slot->error = (SaError){0};
         slot->coro = coro;
@@ -4301,13 +4917,30 @@ void sa_promise_fulfill_handle(SaHandle promise, SaHandle value) {
     sa_promise_settle(slot, SA_PROMISE_FULFILLED);
 }
 
+void sa_promise_fulfill_owned_handle(SaHandle promise, SaHandle value, void (*drop)(void*)) {
+    SaAsyncSlot* slot = sa_async_slot(promise);
+    if (!slot || slot->status != SA_PROMISE_PENDING) {
+        if (drop) drop(&value);
+        return;
+    }
+    slot->result.h = value;
+    slot->result_drop = drop;
+    sa_promise_settle(slot, SA_PROMISE_FULFILLED);
+}
+
+void sa_promise_drop_string(void* value) {
+    char** text = (char**)value;
+    free(*text);
+    *text = NULL;
+}
+
 /* STRING 结果：接管 value 的所有权（move）。协程帧清理时已把这个指针排除在外，故不会
  * double-free；slot 持有它直到被 take 走或 promise 销毁。 */
 void sa_promise_fulfill_str(SaHandle promise, char* value) {
     SaAsyncSlot* slot = sa_async_slot(promise);
     if (!slot || slot->status != SA_PROMISE_PENDING) { free(value); return; }
     slot->result.s = value;
-    slot->has_string_result = 1;
+    slot->result_drop = sa_promise_drop_string;
     sa_promise_settle(slot, SA_PROMISE_FULFILLED);
 }
 
@@ -4372,6 +5005,8 @@ double sa_promise_take_double(SaHandle promise) {
 SaHandle sa_promise_take_handle(SaHandle promise) {
     SaAsyncSlot* slot = sa_promise_require(promise);
     SaHandle value = slot->result.h;
+    slot->result.h = 0;
+    slot->result_drop = NULL;
     slot->status = SA_PROMISE_CONSUMED;
     return value;
 }
@@ -4381,13 +5016,15 @@ char* sa_promise_take_str(SaHandle promise) {
     SaAsyncSlot* slot = sa_promise_require(promise);
     char* value = slot->result.s;
     slot->result.s = NULL;
-    slot->has_string_result = 0;
+    slot->result_drop = NULL;
     slot->status = SA_PROMISE_CONSUMED;
     return value;
 }
 
 void sa_promise_take_void(SaHandle promise) {
     SaAsyncSlot* slot = sa_promise_require(promise);
+    if (slot->result_drop) slot->result_drop(&slot->result);
+    slot->result_drop = NULL;
     slot->status = SA_PROMISE_CONSUMED;
 }
 

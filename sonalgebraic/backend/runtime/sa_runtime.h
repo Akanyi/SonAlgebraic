@@ -135,6 +135,17 @@ typedef SaSymbolNode* SaSymbol;
 
 typedef uint64_t SaHandle;
 
+/* 托管容器只管搬字节，元素的值语义由编译器按实际类型填进这张表。
+ * copyable == 0 的元素（文件、socket、嵌套容器）只能移动进出，复制接口会在运行时报错——
+ * 静态检查是主防线，这里是安全网。copy 为 NULL 且 copyable != 0 表示按字节复制；
+ * drop 为 NULL 表示无需析构，否则它要把元素置成安全空值，免得容器缩容后重复释放。 */
+typedef struct {
+    size_t size;
+    int copyable;
+    void (*copy)(void* target, const void* source);
+    void (*drop)(void* value);
+} SaValueOps;
+
 /* 函数引用在 C 里统一擦成 SaSubFn，调用点按 SA 签名强转回真实类型；callable 实体是带
  * 引用计数的堆对象，将来 Lambda 要捕获的环境也挂在这个结构上，函数引用本身保持瘦指针。 */
 typedef void (*SaSubFn)(void);
@@ -222,12 +233,18 @@ SaHandle sa_net_tls_connect(const char* host, long long port, long long timeout_
 SaHandle sa_net_tcp_listen(const char* bind_host, long long port, long long backlog);
 SaHandle sa_net_tcp_accept(SaHandle listener, long long timeout_ms);
 int sa_net_tcp_listener_close(SaHandle listener);
+void sa_net_tcp_listener_drop(SaHandle listener);
+void sa_net_tcp_listener_drop_value(void* value);
+int sa_net_tcp_listener_close_owned(SaHandle* listener);
 long long sa_net_tcp_listener_local_port(SaHandle listener);
 long long sa_net_stream_send(SaHandle stream, const char* text);
 char* sa_net_stream_recv(SaHandle stream, long long max_bytes);
 long long sa_net_stream_send_buffer(SaHandle stream, SaHandle buffer, long long offset, long long count);
 SaHandle sa_net_stream_recv_buffer(SaHandle stream, long long max_bytes);
 int sa_net_stream_close(SaHandle stream);
+void sa_net_stream_drop(SaHandle stream);
+void sa_net_stream_drop_value(void* value);
+int sa_net_stream_close_owned(SaHandle* stream);
 SaHandle sa_net_udp_open(void);
 int sa_net_udp_bind(SaHandle socket_handle, const char* bind_host, long long port);
 int sa_net_udp_connect(SaHandle socket_handle, const char* host, long long port);
@@ -238,9 +255,15 @@ long long sa_net_udp_send_buffer(SaHandle socket_handle, SaHandle buffer, long l
 long long sa_net_udp_send_buffer_to(SaHandle socket_handle, const char* host, long long port, SaHandle buffer, long long offset, long long count);
 SaHandle sa_net_udp_recv_buffer(SaHandle socket_handle, long long max_bytes);
 int sa_net_udp_close(SaHandle socket_handle);
+void sa_net_udp_drop(SaHandle socket_handle);
+void sa_net_udp_drop_value(void* value);
+int sa_net_udp_close_owned(SaHandle* socket_handle);
 long long sa_net_udp_local_port(SaHandle socket_handle);
 SaHandle sa_binary_new(long long length);
 int sa_binary_close(SaHandle handle);
+void sa_binary_drop(SaHandle handle);
+void sa_binary_drop_value(void* value);
+int sa_binary_close_owned(SaHandle* handle);
 long long sa_binary_length(SaHandle handle);
 SaHandle sa_binary_slice(SaHandle handle, long long offset, long long count);
 int sa_binary_copy(SaHandle target, long long target_offset, SaHandle source, long long source_offset, long long count);
@@ -267,6 +290,9 @@ int sa_file_seek(SaHandle handle, long long offset, const char* origin);
 long long sa_file_tell(SaHandle handle);
 long long sa_file_size(SaHandle handle);
 int sa_file_close(SaHandle handle);
+void sa_file_drop(SaHandle handle);
+void sa_file_drop_value(void* value);
+int sa_file_close_owned(SaHandle* handle);
 char* sa_file_read_text(const char* path);
 int sa_file_write_text(const char* path, const char* text);
 int sa_file_append_text(const char* path, const char* text);
@@ -324,6 +350,47 @@ long long sa_strmap_length(SaHandle handle);
 SaHandle sa_strmap_keys(SaHandle handle);
 int sa_strmap_clear(SaHandle handle);
 int sa_strmap_close(SaHandle handle);
+SaHandle sa_vec_new(const SaValueOps* ops);
+int sa_vec_push(SaHandle handle, const void* value);
+int sa_vec_push_move(SaHandle handle, void* value);
+int sa_vec_insert(SaHandle handle, long long index, const void* value);
+int sa_vec_insert_move(SaHandle handle, long long index, void* value);
+long long sa_vec_length(SaHandle handle);
+int sa_vec_get(SaHandle handle, long long index, void* out);
+void* sa_vec_borrow(SaHandle handle, long long index);
+int sa_vec_take(SaHandle handle, long long index, void* out);
+int sa_vec_set(SaHandle handle, long long index, const void* value);
+int sa_vec_set_move(SaHandle handle, long long index, void* value);
+int sa_vec_remove(SaHandle handle, long long index);
+int sa_vec_clear(SaHandle handle);
+int sa_vec_close(SaHandle handle);
+void sa_vec_drop(SaHandle handle);
+void sa_vec_drop_value(void* value);
+int sa_vec_close_owned(SaHandle* handle);
+SaHandle sa_dict_new(const SaValueOps* ops);
+int sa_dict_set(SaHandle handle, const char* key, const void* value);
+int sa_dict_set_move(SaHandle handle, const char* key, void* value);
+int sa_dict_get(SaHandle handle, const char* key, void* out);
+void* sa_dict_borrow(SaHandle handle, const char* key);
+int sa_dict_take(SaHandle handle, const char* key, void* out);
+int sa_dict_has(SaHandle handle, const char* key);
+int sa_dict_remove(SaHandle handle, const char* key);
+long long sa_dict_length(SaHandle handle);
+SaHandle sa_dict_keys(SaHandle handle, const SaValueOps* string_ops);
+int sa_dict_clear(SaHandle handle);
+int sa_dict_close(SaHandle handle);
+void sa_dict_drop(SaHandle handle);
+void sa_dict_drop_value(void* value);
+int sa_dict_close_owned(SaHandle* handle);
+char* sa_container_last_error_copy(void);
+extern const SaValueOps sa_ops_long;
+extern const SaValueOps sa_ops_double;
+extern const SaValueOps sa_ops_float;
+extern const SaValueOps sa_ops_bool;
+extern const SaValueOps sa_ops_handle;
+extern const SaValueOps sa_ops_pointer;
+extern const SaValueOps sa_ops_vec;
+extern const SaValueOps sa_ops_dict;
 SaHandle sa_gui_window(const char* title, long long width, long long height);
 SaHandle sa_gui_button(SaHandle window, long long control_id, const char* text, long long x, long long y, long long width, long long height);
 SaHandle sa_gui_label(SaHandle window, const char* text, long long x, long long y, long long width, long long height);
@@ -332,6 +399,9 @@ int sa_gui_set_text(SaHandle widget, const char* text);
 char* sa_gui_get_text(SaHandle widget);
 long long sa_gui_wait_event(void);
 int sa_gui_close(SaHandle window);
+void sa_gui_window_drop(SaHandle window);
+void sa_gui_window_drop_value(void* value);
+int sa_gui_window_close_owned(SaHandle* window);
 int sa_gui_on_click(SaHandle widget, SaCallable* handler);
 int sa_gui_run(void);
 char* sa_gui_last_error_copy(void);
@@ -367,6 +437,7 @@ void sa_promise_reject_error(SaHandle promise, const SaError* error);
 void sa_promise_fulfill_long(SaHandle promise, long long value);
 void sa_promise_fulfill_double(SaHandle promise, double value);
 void sa_promise_fulfill_handle(SaHandle promise, SaHandle value);
+void sa_promise_fulfill_owned_handle(SaHandle promise, SaHandle value, void (*drop)(void*));
 void sa_promise_fulfill_str(SaHandle promise, char* value);
 void sa_promise_fulfill_void(SaHandle promise);
 long long sa_promise_take_long(SaHandle promise);

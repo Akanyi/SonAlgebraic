@@ -1,7 +1,8 @@
 """实体类型。"""
 from __future__ import annotations
 
-from ...analysis.typesys import is_error, is_string, is_sub_type, is_symbol
+from ...analysis.typesys import is_error, is_managed_resource, is_string, is_sub_type, is_symbol
+from ...analysis.resource_traits import handle_drop_function
 from ...core import ast
 from ...core.names import split_module_member
 from .base import CGenBase
@@ -26,7 +27,7 @@ class EntitiesMixin(CGenBase):
         return "\n".join(chunks).rstrip()
 
     def type_has_managed_resources(self, type_spec: ast.TypeSpec, inside_entity: bool = False) -> bool:
-        if is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_sub_type(type_spec):
+        if is_managed_resource(type_spec) or is_string(type_spec) or is_symbol(type_spec) or is_error(type_spec) or is_sub_type(type_spec):
             return True
         if type_spec.name != "ENTITY":
             return False
@@ -72,7 +73,9 @@ class EntitiesMixin(CGenBase):
         lines: list[str] = []
         for field in reversed(entity.fields):
             field_target = f"{target}.{field.name}"
-            if is_string(field.type_spec):
+            if is_managed_resource(field.type_spec):
+                lines.append(f"{pad}{handle_drop_function(field.type_spec)}({field_target});")
+            elif is_string(field.type_spec):
                 lines.append(f"{pad}free({field_target});")
             elif is_symbol(field.type_spec):
                 lines.append(f"{pad}sa_symbol_free({field_target});")
