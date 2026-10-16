@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from ...analysis.typesys import is_error, is_null, is_symbol
+from ...analysis.builtin_effects import builtin_effect
+from ...analysis.resource_traits import handle_close_owned_function
+from ...analysis.typesys import is_error, is_managed_resource, is_null, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import split_module_member
@@ -9,6 +11,19 @@ from .base import LLVMValue, NativeGenBase
 
 class BuiltinsMixin(NativeGenBase):
     """SYS.* 内建模块的函数调用发射（NET/FILE/LIST/MAP/GUI/BINARY 等）。"""
+
+    def close_call(self, expr: ast.CallExpr, raw_close: str, handle: str) -> LLVMValue:
+        """托管资源的 CLOSE 走清空槽位的版本，否则变量留着已失效的 token，作用域析构会再关一次。"""
+        kind = self.type_of_expr(expr.args[0])
+        raw = self.next_temp()
+        if is_managed_resource(kind):
+            owned = handle_close_owned_function(kind)
+            self.use_runtime(owned)
+            self.emit(f"  {raw} = call i32 @{owned}(ptr {self.lvalue_ptr(expr.args[0])})")
+        else:
+            self.use_runtime(raw_close)
+            self.emit(f"  {raw} = call i32 @{raw_close}(i64 {handle})")
+        return self.i32_status(raw)
 
     def is_math_function(self, name: str, function_name: str) -> bool:
         split = split_module_member(name)
@@ -285,10 +300,7 @@ class BuiltinsMixin(NativeGenBase):
                 "STREAM_CLOSE": "sa_net_stream_close",
                 "UDP_CLOSE": "sa_net_udp_close",
             }[member]
-            self.use_runtime(fn)
-            raw = self.next_temp()
-            self.emit(f"  {raw} = call i32 @{fn}(i64 {args[0].value})")
-            return self.i32_status(raw)
+            return self.close_call(expr, fn, args[0].value)
         if member in {"STREAM_SEND", "UDP_SEND"}:
             fn = "sa_net_stream_send" if member == "STREAM_SEND" else "sa_net_udp_send"
             self.use_runtime(fn)
@@ -391,10 +403,7 @@ class BuiltinsMixin(NativeGenBase):
             self.emit(f"  {temp} = call i64 @{fn}(i64 {handle})")
             return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
         if member == "CLOSE":
-            self.use_runtime("sa_file_close")
-            raw = self.next_temp()
-            self.emit(f"  {raw} = call i32 @sa_file_close(i64 {handle})")
-            return self.i32_status(raw)
+            return self.close_call(expr, "sa_file_close", handle)
         if member in {"WRITE_TEXT", "APPEND_TEXT"}:
             fn = "sa_file_write_text" if member == "WRITE_TEXT" else "sa_file_append_text"
             self.use_runtime(fn)
@@ -460,10 +469,7 @@ class BuiltinsMixin(NativeGenBase):
             self.emit(f"  {temp} = call i64 @sa_binary_new(i64 {length.value})")
             return LLVMValue("i64", temp, ast.TypeSpec("HANDLE", "BUFFER"))
         if member == "CLOSE":
-            self.use_runtime("sa_binary_close")
-            raw = self.next_temp()
-            self.emit(f"  {raw} = call i32 @sa_binary_close(i64 {args[0].value})")
-            return self.i32_status(raw)
+            return self.close_call(expr, "sa_binary_close", args[0].value)
         if member == "LENGTH":
             self.use_runtime("sa_binary_length")
             temp = self.next_temp()
@@ -763,10 +769,7 @@ class BuiltinsMixin(NativeGenBase):
             self.emit(f"  {temp} = call i64 @sa_gui_wait_event()")
             return LLVMValue("i64", temp, ast.TypeSpec("NUM", "LONG"))
         if member == "CLOSE":
-            self.use_runtime("sa_gui_close")
-            raw = self.next_temp()
-            self.emit(f"  {raw} = call i32 @sa_gui_close(i64 {args[0].value})")
-            return self.i32_status(raw)
+            return self.close_call(expr, "sa_gui_close", args[0].value)
         if member in {"GET_TEXT", "LAST_ERROR"}:
             fn = "sa_gui_get_text" if member == "GET_TEXT" else "sa_gui_last_error_copy"
             self.use_runtime(fn)

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 
 from typing import TYPE_CHECKING
 
 from ..core import ast
 from ..core.errors import SonCompileError
 from ..core.names import entity_c_name, split_module_member
+from ..core.scopes import FunctionBinding, resolve_function_binding
+from .resource_traits import resource_traits
 
 if TYPE_CHECKING:
     from ..core.module_model import ModuleExports
@@ -55,11 +57,42 @@ def runtime_features_for_uses(uses: dict[str, str]) -> set[str]:
     return features
 
 
+def managed_container_elements(program: ast.Program) -> list[ast.TypeSpec]:
+    """程序里出现的每个托管容器的元素类型，按规范描述去重并定序。
+
+    必须在发射任何用到 ops 表的代码之前一次算全：元素操作表是 `static const`，C 要求
+    它定义在使用之前，而 const 对象没法先声明后定义。所以不能边发射边登记。
+
+    走整棵 AST 的 dataclass 字段而不是只扫声明：容器类型还会出现在参数、返回类型、
+    ENTITY 字段和 `NEW LIST OF T` 节点上，漏掉任何一处就是少一张表、链接期才报错。
+    `TypeSpec.inner` 本身是字段，所以嵌套容器的内层元素顺带就收齐了。
+
+    只认 AST 里写出来的类型。等内置函数能返回容器（`MAP.KEYS` 产出 LIST OF STRING），
+    「推导出来但没写进声明」的元素类型也得算进来，那时这里要连内置返回类型一起走。
+    """
+    found: dict[str, ast.TypeSpec] = {}
+
+    def visit(value: object) -> None:
+        if isinstance(value, ast.TypeSpec) and value.name in {"LIST", "MAP"} and value.managed and value.inner is not None:
+            found.setdefault(describe_type(value.inner), value.inner)
+        if is_dataclass(value):
+            for item in fields(value):
+                visit(getattr(value, item.name))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    visit(program)
+    return [found[key] for key in sorted(found)]
+
+
 def runtime_features_for_program(program: ast.Program, uses: dict[str, str]) -> set[str]:
     features = runtime_features_for_uses(uses)
     net_aliases = {alias for alias, module in uses.items() if module == "SYS.NET"}
 
     def visit(value: object) -> None:
+        if isinstance(value, ast.TypeSpec) and value.managed:
+            features.update(resource_traits(value, {}, {}).features)
         if isinstance(value, ast.CallExpr):
             split = split_module_member(value.name)
             if split and split[0] in net_aliases:
@@ -144,6 +177,19 @@ def is_handle(type_spec: ast.TypeSpec) -> bool:
     return type_spec.name == "HANDLE"
 
 
+def is_managed_handle(type_spec: ast.TypeSpec) -> bool:
+    return is_handle(type_spec) and type_spec.managed and type_spec.array_size is None
+
+
+def is_managed_container(type_spec: ast.TypeSpec) -> bool:
+    return type_spec.name in {"LIST", "MAP"} and type_spec.managed and type_spec.array_size is None
+
+
+def is_managed_resource(type_spec: ast.TypeSpec) -> bool:
+    """底层都是独占的 SaHandle：作用域析构、移动、借用冻结走的是同一套规则。"""
+    return is_managed_handle(type_spec) or is_managed_container(type_spec)
+
+
 def is_promise(type_spec: ast.TypeSpec) -> bool:
     return type_spec.name == "PROMISE"
 
@@ -182,19 +228,12 @@ def sub_ref_type(
     line_no: int,
 ) -> ast.TypeSpec:
     """@name() 的类型：PTR TO SUB(被引用函数的签名)。查找顺序与普通调用一致。"""
-    sub = subs.get(name.lower())
-    if sub is None:
-        split = split_module_member(name)
-        module = external_modules.get(split[0]) if split is not None else None
-        if module is not None and split is not None:
-            sub = module.subs.get(split[1].lower())
-    if sub is not None:
-        if sub.is_async:
+    binding = resolve_function_binding(name, subs, external_modules, c_funcs)
+    if binding is not None:
+        declaration = binding.declaration
+        if isinstance(declaration, ast.Subroutine) and declaration.is_async:
             raise SonCompileError(f"不能对 ASYNC SUB 取函数引用: {name}（协程入口返回 PROMISE，签名与普通 SUB 不同）", line_no)
-        return ast.TypeSpec("PTR", inner=sub_type_for(sub.params, sub.return_type))
-    c_func = resolve_c_func(name, c_funcs)
-    if c_func is not None:
-        return ast.TypeSpec("PTR", inner=sub_type_for(c_func.params, c_func.return_type))
+        return ast.TypeSpec("PTR", inner=binding.signature)
     raise SonCompileError(f"@{name}() 找不到可取引用的 SUB 或 C 函数（内置模块函数不能取引用）", line_no)
 
 
@@ -218,8 +257,19 @@ def callable_symbol_type(
     return type_spec if is_callable_value(type_spec) and type_spec.array_size is None else None
 
 
+def callable_binding(
+    name: str, symbols: dict[str, Symbol], entities: dict[str, ast.EntityDef],
+    line_no: int, instance_name: str = "<main>",
+) -> FunctionBinding | None:
+    kind = callable_symbol_type(name, symbols, entities, line_no)
+    if kind is None:
+        return None
+    return FunctionBinding.callable(name, sub_signature(kind), instance_name)
+
+
 def same_handle_kind(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
-    return is_handle(left) and is_handle(right) and (left.subtype or "").lower() == (right.subtype or "").lower()
+    return (is_handle(left) and is_handle(right) and left.managed == right.managed
+            and (left.subtype or "").lower() == (right.subtype or "").lower())
 
 
 def same_type_spec(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
@@ -227,7 +277,7 @@ def same_type_spec(left: ast.TypeSpec, right: ast.TypeSpec) -> bool:
 
     给 REF 传参这类「共用同一块内存」的场景用；普通赋值仍走 require_assignable 的宽松规则。
     """
-    if left.name != right.name or left.array_size != right.array_size:
+    if left.name != right.name or left.array_size != right.array_size or left.managed != right.managed:
         return False
     if (left.subtype or "").lower() != (right.subtype or "").lower():
         return False
@@ -257,7 +307,11 @@ def describe_type(type_spec: ast.TypeSpec) -> str:
         ret = type_spec.inner or VOID
         text = f"SUB({params}) AS {describe_type(ret)}"
         return f"{text}[{type_spec.array_size}]" if type_spec.array_size is not None else text
-    text = type_spec.name
+    text = ("MANAGED " if type_spec.managed else "") + type_spec.name
+    if type_spec.name in {"LIST", "MAP", "PROMISE"} and type_spec.inner is not None:
+        # 这三个的源码写法是 `X OF T`。容器天生托管、源码里不写 MANAGED，诊断也别加上。
+        text = f"{type_spec.name} OF {describe_type(type_spec.inner)}"
+        return f"{text}[{type_spec.array_size}]" if type_spec.array_size is not None else text
     if type_spec.inner is not None:
         text = f"{text} TO {describe_type(type_spec.inner)}"
     elif type_spec.subtype:
@@ -321,12 +375,14 @@ def type_of(
         return sub_ref_type(expr.name, subs, external_modules, c_funcs, expr.line_no)
     if isinstance(expr, ast.Cast):
         return expr.type_spec
+    if isinstance(expr, ast.NewContainer):
+        return expr.type_spec
     if isinstance(expr, ast.Index):
         base_type = type_of(expr.base, symbols, subs, entities, uses, external_modules, c_funcs)
         if base_type.array_size is None:
             raise SonCompileError("下标访问只能用于数组", expr.line_no)
         # 元素类型 = 去掉 array_size 的同一类型
-        return ast.TypeSpec(base_type.name, base_type.subtype, base_type.inner)
+        return replace(base_type, array_size=None)
     if isinstance(expr, ast.Binary):
         if expr.op in {"=", "==", "!=", "<>", "<", "<=", ">", ">=", "AND", "OR"}:
             return BOOL
@@ -379,6 +435,9 @@ def type_of(
         binary_fn = resolve_binary_function(expr.name, uses)
         if binary_fn is not None:
             return binary_fn[1]
+        container_fn = resolve_managed_container_function(expr, uses, symbols, entities)
+        if container_fn is not None:
+            return container_fn[1]
         list_fn = resolve_list_function(expr.name, uses)
         if list_fn is not None:
             return list_fn[1]
@@ -429,6 +488,9 @@ def c_type(type_spec: ast.TypeSpec) -> str:
     if type_spec.name == "CPTR":
         return "void*"
     if type_spec.name == "HANDLE":
+        return "SaHandle"
+    if type_spec.name in {"LIST", "MAP"}:
+        # 托管容器同样使用句柄 ABI。
         return "SaHandle"
     if type_spec.name == "PROMISE":
         # PROMISE 底层就是协程实例的 SaHandle（uint64 槽位句柄）
@@ -483,15 +545,9 @@ def resolve_path_type(
 
 
 def resolve_external_sub_type(name: str, external_modules: dict[str, ModuleExports]) -> ast.TypeSpec | None:
-    split = split_module_member(name)
-    if split is None:
-        return None
-    alias, member = split
-    module = external_modules.get(alias)
-    if module is None:
-        return None
-    sub = module.subs.get(member.lower())
-    if sub is None:
+    binding = resolve_function_binding(name, {}, external_modules, {})
+    sub = binding.declaration if binding is not None else None
+    if not isinstance(sub, ast.Subroutine):
         return None
     # imported async sub 的调用同样产出 PROMISE OF <返回类型>（与本地 async 对齐），
     # 这样跨模块的 SYNC/AWAIT 语义检查（靠 is_promise 接住）和取现类型都自然成立——
@@ -804,6 +860,122 @@ def resolve_map_function(name: str, uses: dict[str, str]) -> tuple[list[ast.Type
     if uses.get(alias) != "SYS.MAP":
         return None
     return MAP_FUNCTIONS.get(member.upper())
+
+
+# 托管容器成员签名里的两个占位。签名没法写成静态表：元素类型只存在于实参的 inner 上，
+# 名字相同的成员在 `LIST OF STRING` 和 `LIST OF FILE` 上是两套完全不同的类型。
+# 名字带 @ 是为了泄漏时一眼看出是 bug——SA 源码里不可能出现这种类型名。
+_SELF = ast.TypeSpec("@SELF")
+_ELEMENT = ast.TypeSpec("@ELEMENT")
+
+# 托管 LIST 的成员。复制形态（PUSH/INSERT/SET/GET）和消费形态（_MOVE/TAKE）都列出来，
+# 元素可不可复制决定哪一套能用——那条分流按元素 traits 判，不在表里重复一遍。
+MANAGED_LIST_MEMBERS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
+    "PUSH": ([_SELF, _ELEMENT], BOOL),
+    "PUSH_MOVE": ([_SELF, _ELEMENT], BOOL),
+    "INSERT": ([_SELF, LONG, _ELEMENT], BOOL),
+    "INSERT_MOVE": ([_SELF, LONG, _ELEMENT], BOOL),
+    "GET": ([_SELF, LONG], _ELEMENT),
+    "BORROW": ([_SELF, LONG], _ELEMENT),
+    "TAKE": ([_SELF, LONG], _ELEMENT),
+    "SET": ([_SELF, LONG, _ELEMENT], BOOL),
+    "SET_MOVE": ([_SELF, LONG, _ELEMENT], BOOL),
+    "REMOVE": ([_SELF, LONG], BOOL),
+    "LENGTH": ([_SELF], LONG),
+    "CLEAR": ([_SELF], BOOL),
+    "CLOSE": ([_SELF], BOOL),
+}
+
+# 托管 MAP 的成员。key 始终是 STRING 且由容器持有副本，所以没有 key 的所有权形态。
+MANAGED_MAP_MEMBERS: dict[str, tuple[list[ast.TypeSpec], ast.TypeSpec]] = {
+    "SET": ([_SELF, STRING, _ELEMENT], BOOL),
+    "SET_MOVE": ([_SELF, STRING, _ELEMENT], BOOL),
+    "GET": ([_SELF, STRING], _ELEMENT),
+    "BORROW": ([_SELF, STRING], _ELEMENT),
+    "TAKE": ([_SELF, STRING], _ELEMENT),
+    "HAS": ([_SELF, STRING], BOOL),
+    "REMOVE": ([_SELF, STRING], BOOL),
+    "LENGTH": ([_SELF], LONG),
+    # KEYS 产出一个新的拥有型 LIST OF STRING，key 在里面是副本——容器自己那份不交出去。
+    "KEYS": ([_SELF], ast.TypeSpec("LIST", inner=STRING, managed=True)),
+    "CLEAR": ([_SELF], BOOL),
+    "CLOSE": ([_SELF], BOOL),
+}
+
+_MANAGED_CONTAINER_MEMBERS = {"LIST": MANAGED_LIST_MEMBERS, "MAP": MANAGED_MAP_MEMBERS}
+
+# KEYS 牵连两处别的改动，所以签名在表里但调用先挡住：key 列表的元素 ops 表在用户源码里
+# 没有对应的类型声明，要连 managed_container_elements 一起改；而旧裸句柄那条「LIST/MAP
+# 返回值必须显式 CLOSE」的守卫按静态表把它判成裸句柄返回值，也得一并放行。
+_DEFERRED_CONTAINER_MEMBERS = {"KEYS"}
+
+
+def container_signature(member: str, container: ast.TypeSpec) -> tuple[list[ast.TypeSpec], ast.TypeSpec] | None:
+    """把成员签名里的占位换成实际的容器类型和元素类型。"""
+    if not is_managed_container(container) or container.inner is None:
+        return None
+    found = _MANAGED_CONTAINER_MEMBERS[container.name].get(member.upper())
+    if found is None:
+        return None
+    element = container.inner
+
+    def fill(kind: ast.TypeSpec) -> ast.TypeSpec:
+        if kind is _SELF:
+            return container
+        return element if kind is _ELEMENT else kind
+
+    params, ret = found
+    return [fill(item) for item in params], fill(ret)
+
+
+def managed_container_argument(
+    expr: ast.CallExpr,
+    symbols: dict[str, Symbol],
+    entities: dict[str, ast.EntityDef],
+) -> ast.TypeSpec | None:
+    """调用的第一个实参是不是托管容器变量，是就给出它的类型。
+
+    只认变量和字段路径：容器操作改的是容器自身的状态，临时值上的改动没有接收方。这样也
+    不必在重载分流里递归推断整个实参表达式——根变量没声明时直接交回去，让该报的地方报。
+    """
+    first = expr.args[0] if expr.args else None
+    if not isinstance(first, ast.VarRef) or first.name.split(".")[0].lower() not in symbols:
+        return None
+    kind = resolve_path_type(first.name, symbols, entities, first.line_no)
+    return kind if is_managed_container(kind) else None
+
+
+def resolve_managed_container_function(
+    expr: ast.CallExpr,
+    uses: dict[str, str],
+    symbols: dict[str, Symbol],
+    entities: dict[str, ast.EntityDef],
+) -> tuple[list[ast.TypeSpec], ast.TypeSpec] | None:
+    """SYS.LIST／SYS.MAP 的成员落在托管容器上时的真实签名。
+
+    和旧 `HANDLE AS LIST` 共用模块别名，但不共用签名：运行时 kind 不同，静态表里的
+    `LIST_HANDLE`／`DOUBLE` 对托管容器一个都不对。所以这里不是在旧表上放宽类型检查，
+    而是真正按实参类型选另一套签名——模块对不上容器（`L.PUSH(myMap, …)`）就落回旧表，
+    由它报类型不匹配。
+    """
+    split = split_module_member(expr.name)
+    if split is None:
+        return None
+    module = uses.get(split[0])
+    if module not in {"SYS.LIST", "SYS.MAP"}:
+        return None
+    container = managed_container_argument(expr, symbols, entities)
+    if container is None or module != f"SYS.{container.name}":
+        return None
+    signature = container_signature(split[1], container)
+    if signature is None:
+        # 走到这儿说明模块和容器都对上了，只是成员名不在新表里。不能静默落回旧表——
+        # 那会报成「LIST_HANDLE 与 LIST OF STRING 不能隐式互转」，把人引向一个
+        # 根本不该用的旧句柄类型。
+        raise SonCompileError(f"{describe_type(container)} 没有 {split[1].upper()} 操作", expr.line_no)
+    if split[1].upper() in _DEFERRED_CONTAINER_MEMBERS:
+        raise SonCompileError(f"{describe_type(container)} 的 {split[1].upper()} 还没接入", expr.line_no)
+    return signature
 
 
 # 按钮点击回调的签名：SUB onClick(id AS NUM AS LONG)。id 就是 BUTTON 创建时给的 control id，

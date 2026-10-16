@@ -417,7 +417,7 @@ def _native_runtime_source(runtime_features: set[str] | None = None, ir_text: st
     from ..backend.c_runtime import RUNTIME_HEADER, RUNTIME_SOURCE
     from ..backend.runtime_slicer import runtime_impl_for, runtime_symbols_in
 
-    macros = {"net": "SA_ENABLE_NET", "tls": "SA_ENABLE_TLS", "file": "SA_ENABLE_FILE", "desktop": "SA_ENABLE_DESKTOP", "binary": "SA_ENABLE_BINARY", "list": "SA_ENABLE_LIST", "map": "SA_ENABLE_MAP", "gui": "SA_ENABLE_GUI", "async": "SA_ENABLE_ASYNC"}
+    macros = {"net": "SA_ENABLE_NET", "tls": "SA_ENABLE_TLS", "file": "SA_ENABLE_FILE", "desktop": "SA_ENABLE_DESKTOP", "binary": "SA_ENABLE_BINARY", "list": "SA_ENABLE_LIST", "map": "SA_ENABLE_MAP", "container": "SA_ENABLE_CONTAINER", "gui": "SA_ENABLE_GUI", "async": "SA_ENABLE_ASYNC"}
     features = runtime_features or set()
     lines = [f"#define {macros[feature]}" for feature in sorted(features) if feature in macros]
     prefix = "" if not lines else "\n".join(lines) + "\n"
@@ -513,7 +513,10 @@ def run_c_compiler(
     exe_path.parent.mkdir(parents=True, exist_ok=True)
     c_args = [str(path) for path in c_paths]
     lib_args = [str(path) for path in libs or []]
-    link_lib_args = _link_lib_args(link_libs or [], compiler)
+    # 和 native 那条同一条理由：Windows 的 CRT 提供数学函数，源码里的 USELIB "m" 不能
+    # 变成一个不存在的 m.lib —— MSVC ABI 压根没有它，lld-link 会直接报 could not open。
+    selected_link_libs = [lib for lib in link_libs or [] if lib != "m" or "windows" not in normalize_target(target)]
+    link_lib_args = _link_lib_args(selected_link_libs, compiler)
     include_args = [f"-I{include_dir}"] if include_dir is not None else []
     rpath_args = rpath_flags(libs or [], normalize_target(target))
     passthrough = extra_args or []
@@ -526,7 +529,10 @@ def run_c_compiler(
         # /OPT:REF 是链接器选项，必须排在 /link 之后并收尾
         command = [compiler, "/nologo", *gc_compile, *cl_include, *c_args, *lib_args, *link_lib_args, f"/Fe:{exe_path}", *gc_link]
     else:
-        command = [compiler, *c_args, *lib_args, "-O2", "-std=c11", *gc_compile, *include_args, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path), "-lm"]
+        # 和 native 那条同一条理由：MSVC ABI 没有 m.lib，给 clang 传 -lm 会让
+        # lld-link 直接报 "could not open 'm.lib'"（Windows 的 CRT 自带数学函数）。
+        math_lib = [] if "windows" in normalize_target(target) else ["-lm"]
+        command = [compiler, *c_args, *lib_args, "-O2", "-std=c11", *gc_compile, *include_args, *rpath_args, *link_lib_args, *gc_link, *passthrough, "-o", str(exe_path), *math_lib]
 
     proc = subprocess.run(command, text=True, capture_output=True)
     if proc.returncode != 0:

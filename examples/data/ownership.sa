@@ -11,11 +11,11 @@
 110 copied = "beta"
 120 moved m= original
 130 PRINT F"copy={copied} moved={moved}"
-140 IF moved <> "" THEN
+140 SCOPE
 150 DIM view AS STRING AS VAR
 160 view f= moved
 170 PRINT F"borrow={view}"
-180 .ENDIF
+180 .ENDSCOPE
 190 moved = "gamma"
 200 DIM first AS ENTITY AS Note AS VAR
 210 DIM second AS ENTITY AS Note AS VAR

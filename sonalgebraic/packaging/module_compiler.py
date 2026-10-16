@@ -197,7 +197,7 @@ def compile_module(
             dep = compile_module(dep_module, use.alias, dep_source_root, out_dir, module_units, target, dynamic, spkg_dirs, module_stack)
             dependency_exports[use.alias.lower()] = dep.exports
 
-        checked = check_program(program, external_modules=dependency_exports, require_main=False)
+        checked = check_program(program, external_modules=dependency_exports, require_main=False, instance_name=module)
         exports = collect_exports(module, program)
         header_path = out_dir / exports.header_name
         c_path = out_dir / f"sa_user_{module_c_name(module)}.c"
@@ -316,6 +316,7 @@ def _runtime_feature_prefix(features: set[str]) -> str:
         "binary": "SA_ENABLE_BINARY",
         "list": "SA_ENABLE_LIST",
         "map": "SA_ENABLE_MAP",
+        "container": "SA_ENABLE_CONTAINER",
         "gui": "SA_ENABLE_GUI",
         "async": "SA_ENABLE_ASYNC",
     }

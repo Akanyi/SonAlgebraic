@@ -4,10 +4,12 @@ from dataclasses import dataclass
 import struct
 
 from ...analysis.semantics import CheckedProgram, Symbol
-from ...analysis.typesys import is_error, is_sub_type, is_symbol
+from ...analysis.typesys import is_error, is_managed_resource, is_sub_type, is_symbol
+from ...analysis.resource_traits import handle_drop_function
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import c_ident as make_c_ident
+from ...core.walk import walk_statements
 from .runtime_decls import RUNTIME_SIGNATURES
 
 
@@ -70,21 +72,31 @@ class NativeGenBase:
         if self.temp_cleanup:
             self.temp_cleanup[-1].append(line)
 
-    def temp_cleanup_line(self, value: str, type_spec: ast.TypeSpec) -> str | None:
-        """STRING / SYMBOL 临时量的释放行。登记（内置函数、SUB 返回值）和接管（adopt）都以这一个文本为准。"""
+    def temp_cleanup_function(self, type_spec: ast.TypeSpec) -> str | None:
+        if is_managed_resource(type_spec):
+            return handle_drop_function(type_spec)
         if self.is_string_scalar(type_spec):
-            return f"  call void @free(ptr {value})"
+            return "free"
         if is_symbol(type_spec):
-            return f"  call void @sa_symbol_free(ptr {value})"
+            return "sa_symbol_free"
         if is_sub_type(type_spec):
-            return f"  call void @sa_callable_release(ptr {value})"
+            return "sa_callable_release"
         return None
+
+    def temp_cleanup_line(self, value: str, type_spec: ast.TypeSpec) -> str | None:
+        function = self.temp_cleanup_function(type_spec)
+        if function is None:
+            return None
+        argument_type = "i64" if is_managed_resource(type_spec) else "ptr"
+        return f"  call void @{function}({argument_type} {value})"
 
     def register_temp_cleanup(self, value: str, type_spec: ast.TypeSpec) -> None:
         """把一个刚算出来的托管堆值登记成本语句的临时量：语句结束没人接管就释放。"""
         line = self.temp_cleanup_line(value, type_spec)
         if line is not None:
-            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_callable_release" if is_sub_type(type_spec) else "sa_symbol_free")
+            function = self.temp_cleanup_function(type_spec)
+            assert function is not None
+            self.use_runtime(function)
             self.add_temp_cleanup(line)
             return
         ptr = self.aggregate_temp_ptr(value, type_spec)
@@ -100,7 +112,9 @@ class NativeGenBase:
         """当场释放一个按值拿着的托管临时量（被语句丢弃的 SUB 返回值）。"""
         line = self.temp_cleanup_line(value, type_spec)
         if line is not None:
-            self.use_runtime("free" if self.is_string_scalar(type_spec) else "sa_callable_release" if is_sub_type(type_spec) else "sa_symbol_free")
+            function = self.temp_cleanup_function(type_spec)
+            assert function is not None
+            self.use_runtime(function)
             self.emit(line)
             return
         ptr = self.aggregate_temp_ptr(value, type_spec)
@@ -144,6 +158,8 @@ class NativeGenBase:
         entry 就是固定帧槽，重复进入不累积，顺带让 mem2reg/SROA 还有机会介入。
         """
         ptr = name or self.next_temp()
+        if name is not None and any(line.startswith(f"  {name} = ") for line in self.entry_allocas):
+            ptr = self.next_temp()
         self.entry_allocas.append(f"  {ptr} = alloca {llvm_type}")
         return ptr
 
@@ -161,6 +177,14 @@ class NativeGenBase:
         return any(slot.name.lower() == key for resources in self.scope_resources for slot in resources)
 
     def emit_free_slot(self, slot: VarSlot) -> None:
+        if is_managed_resource(slot.type_spec):
+            value = self.next_temp()
+            drop = handle_drop_function(slot.type_spec)
+            self.use_runtime(drop)
+            self.emit(f"  {value} = load i64, ptr {slot.ptr}")
+            self.emit(f"  call void @{drop}(i64 {value})")
+            self.emit(f"  store i64 0, ptr {slot.ptr}")
+            return
         if slot.type_spec.name == "PROMISE":
             tmp = self.next_temp()
             self.use_runtime("sa_promise_release")
@@ -218,11 +242,12 @@ class NativeGenBase:
             self.emit_scope_cleanup(resources)
 
     def run_block(self, body: list[ast.Stmt]) -> None:
-        # IF/FOR/WHILE 体：压资源作用域，块正常退出时释放本层（循环内局部串每轮释放）
+        saved_slots = self.slots.copy()
         self.push_scope()
         for inner in body:
             self.stmt(inner)
         self.pop_scope_with_cleanup()
+        self.slots = saved_slots
 
     @property
     def source_lines(self) -> dict[int, str]:
@@ -338,21 +363,4 @@ def sub_gosub_lines(sub: ast.Subroutine) -> list[int]:
 
 
 def stmt_gosub_lines(stmt: ast.Stmt) -> list[int]:
-    if isinstance(stmt, ast.Gosub):
-        return [stmt.line_no]
-    if isinstance(stmt, ast.If):
-        lines: list[int] = []
-        for inner in stmt.body:
-            lines.extend(stmt_gosub_lines(inner))
-        for branch in stmt.elifs:
-            for inner in branch.body:
-                lines.extend(stmt_gosub_lines(inner))
-        for inner in stmt.else_body:
-            lines.extend(stmt_gosub_lines(inner))
-        return lines
-    if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-        lines: list[int] = []
-        for inner in stmt.body:
-            lines.extend(stmt_gosub_lines(inner))
-        return lines
-    return []
+    return [inner.line_no for inner in walk_statements([stmt]) if isinstance(inner, ast.Gosub)]

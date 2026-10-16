@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ...analysis.typesys import is_handle, is_promise, is_string
+from ...analysis.typesys import is_handle, is_managed_resource, is_promise, is_string
 from ...core import ast
 from ...core.errors import SonCompileError
 from .base import LLVMValue, NativeGenBase
@@ -143,6 +143,6 @@ class PromiseMixin(NativeGenBase):
             value = self.truthy(value)
         elif inner.name == "NUM" and inner.subtype == "FLOAT":
             value = self.cast_to_float(value)
-        if is_string(inner):
+        if is_string(inner) or is_managed_resource(inner):
             self.register_temp_cleanup(value.value, inner)
         return value

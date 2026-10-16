@@ -1,6 +1,7 @@
 """表达式发射。带 prelude / cleanup 的临时量协议在这里进出。"""
 from __future__ import annotations
 
+from ...analysis.resource_traits import container_new_function
 from ...analysis.typesys import is_cptr, is_error, is_handle, is_ptr, is_string, is_sub_ptr, is_symbol, resolve_builtin_const
 from ...core import ast
 from ...core.errors import SonCompileError
@@ -50,6 +51,8 @@ class ExprsMixin(CGenBase):
             return f"(&{self.c_value(expr.expr.name)})"
         if isinstance(expr, ast.Cast):
             return f"({self.c_type(expr.type_spec)})({self.expr(expr.expr)})"
+        if isinstance(expr, ast.NewContainer):
+            return self.new_container(expr)
         if isinstance(expr, ast.Binary):
             return self.binary(expr)
         if isinstance(expr, ast.Index):
@@ -64,6 +67,17 @@ class ExprsMixin(CGenBase):
             return self.sub_ref_value(expr)
         raise SonCompileError("未知表达式类型", expr.line_no)
 
+    def new_container(self, expr: ast.NewContainer) -> str:
+        """`NEW LIST OF T` → `sa_vec_new(&ops)`。
+
+        ops 表随构造存进容器自己身上，之后每次搬运元素都查它——所以元素类型必须在这里
+        就定下来，这也是 NewContainer 把类型写死在节点里的原因。
+        """
+        element = expr.type_spec.inner
+        if element is None:
+            raise SonCompileError(f"{expr.type_spec.name} 缺少元素类型", expr.line_no)
+        return f"{container_new_function(expr.type_spec)}({self.value_ops_ref(element)})"
+
     def sub_ref_value(self, expr: ast.SubRef) -> str:
         """@name() 的 C 值：被引用函数的地址擦成 SaSubFn。解析顺序与语义层 sub_ref_type 一致；
         C 函数直接取裸地址、不生成转接函数，这样它原样交回给 C 时仍是那个函数。"""
@@ -77,6 +91,20 @@ class ExprsMixin(CGenBase):
         raise SonCompileError(f"@{expr.name}() 找不到可取引用的 SUB 或 C 函数", expr.line_no)
 
     def binary(self, expr: ast.Binary) -> str:
+        if expr.op in {'AND', 'OR'}:
+            left_pre, left, left_cleanup = self.expr_with_prelude(expr.left)
+            right_pre, right, right_cleanup = self.expr_with_prelude(expr.right)
+            if left_pre or right_pre or left_cleanup or right_cleanup:
+                result = self.next_temp()
+                for line in [*left_pre, f"int {result} = !!({left});", *left_cleanup]:
+                    self.add_prelude(line)
+                test = result if expr.op == 'AND' else f'!{result}'
+                self.add_prelude(f"if ({test}) {{")
+                for line in [*right_pre, f"{result} = !!({right});", *right_cleanup]:
+                    self.add_prelude(f"    {line}")
+                self.add_prelude("}")
+                return result
+            return f"({left} {'&&' if expr.op == 'AND' else '||'} {right})"
         if expr.op == "**":
             return f"pow({self.expr(expr.left)}, {self.expr(expr.right)})"
         op = {
@@ -146,6 +174,9 @@ class ExprsMixin(CGenBase):
         binary_call = self.binary_function_call(expr)
         if binary_call is not None:
             return binary_call
+        container_call = self.managed_container_call(expr)
+        if container_call is not None:
+            return container_call
         list_call = self.list_function_call(expr)
         if list_call is not None:
             return list_call
@@ -191,18 +222,34 @@ class ExprsMixin(CGenBase):
         移出或拷了一份）：落到临时量并登记释放，语句结束时 free。要接管的消费者（STRING / ENTITY 赋值、
         RETURN、SYMBOL 建树）用 adopt_temp_cleanup 把释放行摘走就行，不必再拷。裸着返回调用文本的话，
         PRINT wrap() 这类用法会把返回值直接漏掉，entity_copy_lines 逐字段展开还会把调用重复执行好几遍。"""
-        if not self.type_has_managed_resources(return_type):
+        managed = self.type_has_managed_resources(return_type)
+        pending = [line for group in reversed(self.cleanup_stack) for line in reversed(group)]
+        if pending and not self.async_frame_stack:
+            # 语句外层的落地垫负责局部变量；这里只清当前表达式已经生成的临时资源。
+            # 参数求值尚未结束时，后一个调用失败也不能丢掉前一个调用交回的拥有值。
+            if return_type.name == 'VOID':
+                for line in self._wrap_throw_lines([f"{call};"], 0, [f"    {line}" for line in pending]):
+                    self.add_prelude(line)
+                return ''
+            temp = self.next_temp()
+            self.add_prelude(f"{self.c_type(return_type)} {temp};")
+            for line in self._wrap_throw_lines([f"{temp} = {call};"], 0, [f"    {line}" for line in pending]):
+                self.add_prelude(line)
+        elif managed:
+            temp = self.next_temp()
+            self.add_prelude(f"{self.c_type(return_type)} {temp} = {call};")
+        else:
             return call
-        temp = self.next_temp()
-        self.add_prelude(f"{self.c_type(return_type)} {temp} = {call};")
-        for line in self.local_resource_cleanup_lines([(temp, return_type)], 0):
-            self.add_cleanup(line)
+        if managed:
+            for line in self.local_resource_cleanup_lines([(temp, return_type)], 0):
+                self.add_cleanup(line)
         return temp
 
     def fstring(self, expr: ast.FString) -> str:
         temp = self.next_temp()
         self.add_prelude(f"SaStringBuilder {temp};")
         self.add_prelude(f"sa_sb_init(&{temp});")
+        self.add_cleanup(f"free({temp}.data);")
         for part in expr.parts:
             if isinstance(part, str):
                 self.add_prelude(f"sa_sb_append(&{temp}, {c_string(part)});")

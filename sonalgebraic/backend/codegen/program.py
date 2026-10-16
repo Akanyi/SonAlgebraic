@@ -1,7 +1,7 @@
 """程序级发射：generate() 的顶层编排与全局变量的初始化 / 释放。"""
 from __future__ import annotations
 
-from ...analysis.typesys import is_cptr, is_error, is_handle, is_ptr, is_string, is_sub_type, is_symbol
+from ...analysis.typesys import is_cptr, is_error, is_handle, is_managed_resource, is_ptr, is_string, is_sub_type, is_symbol
 from ...core import ast
 from ...core.names import module_header_name, module_symbol_prefix
 from ..c_runtime import RUNTIME_PRELUDE
@@ -15,7 +15,9 @@ class ProgramMixin(CGenBase):
     def generate(self) -> str:
         # 先生成用户代码，再据此决定注入哪些运行时片段。顺序不能反：
         # preamble 要知道 body 用到了哪些 sa_* 才能算依赖闭包。
-        body = ["", self.generate_entities(), "", self.generate_globals(), "", self.generate_async_frame_decls(), "", self.generate_prototypes(), ""]
+        # ops 表排在 entities 之后、globals 之前：它的胶水要用 SaEntity_* 类型，
+        # 而全局容器的初始化会引用它，而且它是 const，不能先声明后定义。
+        body = ["", self.generate_entities(), "", self.generate_value_ops(), "", self.generate_globals(), "", self.generate_async_frame_decls(), "", self.generate_prototypes(), ""]
         for sub in self.checked.program.subs:
             body.append(self.generate_sub(sub))
             body.append("")
@@ -183,7 +185,11 @@ class ProgramMixin(CGenBase):
             prelude, value, cleanup = self.expr_with_prelude(decl.expr)
             lines.append(self.source_comment(decl.line_no, 1))
             lines.extend(f"    {line}" for line in prelude)
-            if is_string(decl.type_spec):
+            if is_managed_resource(decl.type_spec):
+                if isinstance(decl.expr, ast.NullLiteral):
+                    value = "0"
+                lines.extend(self.handle_store_lines(self.global_c_name(decl), value, decl.type_spec, cleanup, 1))
+            elif is_string(decl.type_spec):
                 lines.append(f"    sa_set_string(&{self.global_c_name(decl)}, {value});")
             elif is_sub_type(decl.type_spec):
                 lines.append(f"    sa_callable_set(&{self.global_c_name(decl)}, {value});")
@@ -208,23 +214,5 @@ class ProgramMixin(CGenBase):
         return lines
 
     def free_string_globals(self) -> list[str]:
-        lines: list[str] = []
-        for decl in self.checked.program.declarations:
-            if is_string(decl.type_spec):
-                if decl.type_spec.array_size is not None:
-                    idx = self.next_temp()
-                    name = self.global_c_name(decl)
-                    lines.append(f"    for (long long {idx} = 0; {idx} < {decl.type_spec.array_size}; {idx}++) {{")
-                    lines.append(f"        free({name}[{idx}]);")
-                    lines.append(f"    }}")
-                else:
-                    lines.append(f"    free({self.global_c_name(decl)});")
-            elif is_error(decl.type_spec):
-                lines.append(f"    sa_error_clear(&{self.global_c_name(decl)});")
-            elif is_symbol(decl.type_spec):
-                lines.append(f"    sa_symbol_free({self.global_c_name(decl)});")
-            elif is_sub_type(decl.type_spec):
-                lines.append(f"    sa_callable_release({self.global_c_name(decl)});")
-            elif decl.type_spec.name == "ENTITY" and self.type_has_managed_resources(decl.type_spec):
-                lines.extend(self.entity_free_lines(self.global_c_name(decl), decl.type_spec, 1))
-        return lines
+        resources = [(self.global_c_name(decl), decl.type_spec) for decl in self.checked.program.declarations]
+        return self.local_resource_cleanup_lines(resources, 1)

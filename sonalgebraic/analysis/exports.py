@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..core import ast
 from ..core.module_model import ModuleExports
 from ..core.names import module_header_name
@@ -15,6 +17,6 @@ def collect_exports(module: str, program: ast.Program) -> ModuleExports:
             exports.consts[decl.name.lower()] = decl
     for sub in program.subs:
         if sub.visibility == "PUBLIC":
-            exports.subs[sub.name.lower()] = sub
+            exports.subs[sub.name.lower()] = replace(sub, body=[])
 
     return exports

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ...analysis.semantics import CheckedProgram
-from ...analysis.typesys import BUILTIN_MODULES, is_error, is_string, is_sub_ptr, is_sub_type, is_symbol
+from ...analysis.typesys import BUILTIN_MODULES, is_managed_resource, is_string, is_sub_ptr, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import module_symbol_prefix, split_module_member
@@ -162,7 +162,7 @@ class NativeLLVMGen(CoroutinesMixin, PromiseMixin, BuiltinsMixin, StmtsMixin, Ex
                 for inner in branch.body:
                     self.require_supported_stmt(inner)
             return
-        if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
+        if isinstance(stmt, ast.Scope | ast.ForLoop | ast.WhileLoop):
             for inner in stmt.body:
                 self.require_supported_stmt(inner)
             return
@@ -277,10 +277,6 @@ class NativeLLVMGen(CoroutinesMixin, PromiseMixin, BuiltinsMixin, StmtsMixin, Ex
             self.emit(f"  call void @{call}()")
         # 全局 STRING 初始化为 owned 空串（复刻 C 后端 init_string_globals）
         global_strings = [decl for decl in self.checked.program.declarations if is_string(decl.type_spec)]
-        global_symbols = [decl for decl in self.checked.program.declarations if is_symbol(decl.type_spec)]
-        global_callables = [decl for decl in self.checked.program.declarations if is_sub_type(decl.type_spec)]
-        global_errors = [decl for decl in self.checked.program.declarations if is_error(decl.type_spec)]
-        global_promises = [decl for decl in self.checked.program.declarations if decl.type_spec.name == "PROMISE"]
         global_entities = [decl for decl in self.checked.program.declarations if self.is_entity_scalar(decl.type_spec) and self.type_has_managed_resources(decl.type_spec)]
         for decl in global_strings:
             self.init_global_string(decl)
@@ -296,19 +292,8 @@ class NativeLLVMGen(CoroutinesMixin, PromiseMixin, BuiltinsMixin, StmtsMixin, Ex
                 self.end_stmt()
             elif isinstance(stmt, ast.End):
                 break
-        # 程序结束释放全局 STRING（复刻 C 后端 free_string_globals）
-        for decl in global_strings:
-            self.free_global_string(decl)
-        for decl in global_symbols:
-            self.free_global_symbol(decl)
-        for decl in global_callables:
+        for decl in reversed(self.checked.program.declarations):
             self.emit_free_slot(VarSlot(decl.name, decl.type_spec, f"@{self.c_ident(decl.name)}"))
-        for decl in global_errors:
-            self.free_global_error(decl)
-        for decl in global_promises:
-            self.emit_free_slot(VarSlot(decl.name, decl.type_spec, f"@{self.c_ident(decl.name)}"))
-        for decl in global_entities:
-            self.emit_entity_free(f"@{self.c_ident(decl.name)}", decl.type_spec)
         # 捕获过的最后一个运行时全局错误也持有 message 副本，C 后端 main 末尾同样清理。
         self.use_runtime("sa_current_error")
         self.use_runtime("sa_error_clear")
@@ -379,7 +364,7 @@ class NativeLLVMGen(CoroutinesMixin, PromiseMixin, BuiltinsMixin, StmtsMixin, Ex
             self.end_stmt()
             return
         value = self.cast_value(self.expr(decl.expr), decl.type_spec)
-        if decl.type_spec.name == "PROMISE":
+        if decl.type_spec.name == "PROMISE" or is_managed_resource(decl.type_spec):
             self.adopt_temp_cleanup(value.value, decl.type_spec)
         if self.is_string_scalar(decl.type_spec):
             self.store_string(target, value)

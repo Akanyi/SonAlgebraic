@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ...analysis.typesys import is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_promise, is_ptr, is_string, is_sub_ptr, is_sub_type, is_symbol, type_of
 from ...core import ast
 from ...core.errors import SonCompileError
@@ -10,7 +12,7 @@ class TypesMixin(NativeGenBase):
     """SA 类型系统到 LLVM 类型的映射，以及值的转换与真值判定。"""
 
     def array_element_type(self, type_spec: ast.TypeSpec) -> ast.TypeSpec:
-        return ast.TypeSpec(type_spec.name, type_spec.subtype, type_spec.inner)
+        return replace(type_spec, array_size=None)
 
     def is_string_array(self, type_spec: ast.TypeSpec) -> bool:
         return is_string(type_spec) and type_spec.array_size is not None

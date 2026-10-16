@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..core import ast
 from ..core.errors import SonCompileError
 from ..core.module_model import ModuleExports
 from ..core.names import split_module_member
 from ..core.lines import LINT_OPTIONS
-from .ownership import check_ownership, is_managed_type
-from .typesys import BUILTIN_MODULES, VOID, callable_symbol_type, describe_type, is_callable_value, is_sub_ptr, is_sub_type, sub_signature, is_bool, is_cptr, is_error, is_handle, is_null, is_numeric, is_promise, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
+from ..core.scopes import FunctionTable, InstanceScope, RuntimeScope, ScopeGraph, build_instance_scope, resolve_function_binding
+from ..core.walk import child_bodies as _child_bodies, walk_statements
+from .builtin_effects import builtin_effect
+from .resource_traits import element_copyable, handle_drop_function, has_explicit_resources, preset_value_ops, resource_traits
+from .ownership import check_ownership, is_managed_type, sub_has_explicit_resources
+from .typesys import BUILTIN_MODULES, VOID, callable_binding, callable_symbol_type, describe_type, is_callable_value, is_sub_ptr, is_sub_type, sub_signature, is_bool, is_cptr, is_error, is_handle, is_managed_handle, is_managed_resource, is_null, is_numeric, is_promise, is_ptr, is_string, is_symbol, resolve_binary_function, resolve_builtin_const, resolve_desktop_function, resolve_file_function, resolve_gui_function, resolve_list_function, resolve_managed_container_function, resolve_map_function, resolve_net_function, resolve_string_function, same_handle_kind, same_type_spec, type_of
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,7 @@ class Symbol:
     type_spec: ast.TypeSpec
     mutable: bool
     by_ref: bool = False
+    declaration_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -32,12 +37,16 @@ class CheckedProgram:
     c_funcs: dict[str, ast.CFunctionDecl]
     # 枚举成员值：键为 "enumname.member"（小写），值为自增整数
     enum_members: dict[str, int] = field(default_factory=dict)
+    scope_graphs: dict[str, ScopeGraph] = field(default_factory=dict)
+    runtime_scope: RuntimeScope | None = None
+    instance_scope: InstanceScope | None = None
 
 
 def check_program(
     program: ast.Program,
     external_modules: dict[str, ModuleExports] | None = None,
     require_main: bool = True,
+    instance_name: str = "<main>",
 ) -> CheckedProgram:
     external_modules = external_modules or {}
     uses = validate_uses(program, external_modules)
@@ -45,22 +54,27 @@ def check_program(
     c_libs = validate_c_libs(program)
     c_funcs = collect_c_funcs(program, c_headers)
     entities = collect_entities(program)
+    validate_managed_ffi(c_funcs, entities, external_modules)
     enum_members = collect_enums(program)
     symbols = collect_symbols(program, entities, uses, external_modules, c_funcs)
     inject_enum_symbols(symbols, enum_members)
     subs = collect_subs(program, uses, external_modules)
+    runtime_scope, instance_scope = build_instance_scope(program, external_modules, c_funcs, instance_name)
+    subs = FunctionTable(subs, instance_scope)
 
     if require_main and "main" not in {name.lower() for name in subs}:
         raise SonCompileError("程序必须定义 `SUB main AS PUBLIC AS VOID`")
 
+    scope_graphs: dict[str, ScopeGraph] = {}
     for sub in program.subs:
-        check_sub(sub, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        scope_graphs[sub.name.lower()] = check_sub(sub, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
     for stmt in program.top_level:
         if not isinstance(stmt, ast.Call | ast.End | ast.NoOp):
             raise SonCompileError("顶层只能放声明、SUB、CALL 和 END；可执行逻辑必须放进 SUB", stmt.line_no)
         check_stmt(stmt, symbols, subs, entities, uses, external_modules, set(), c_headers, c_libs, c_funcs)
 
-    return CheckedProgram(program, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs, enum_members)
+    return CheckedProgram(program, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs,
+                          enum_members, scope_graphs, runtime_scope, instance_scope)
 
 
 def collect_program_diagnostics(
@@ -79,6 +93,7 @@ def collect_program_diagnostics(
         c_libs = validate_c_libs(program)
         c_funcs = collect_c_funcs(program, c_headers)
         entities = collect_entities(program)
+        validate_managed_ffi(c_funcs, entities, external_modules)
         enum_members = collect_enums(program)
         symbols = collect_symbols(program, entities, uses, external_modules, c_funcs)
         inject_enum_symbols(symbols, enum_members)
@@ -127,6 +142,12 @@ def collect_sub_diagnostics(
     for param in sub.params:
         scope[param.name.lower()] = Symbol(param.name, param.type_spec, True, param.by_ref)
 
+    try:
+        ScopeGraph.for_body(sub.body, protected=sub_has_explicit_resources(sub, symbols, entities, external_modules))
+    except SonCompileError as exc:
+        if _add_diagnostic(diagnostics, exc, max_errors):
+            return
+
     labels: set[str] = set()
     try:
         labels = collect_labels(sub.body)
@@ -169,7 +190,7 @@ def collect_sub_diagnostics(
 
     # 所有权预检是顺序敏感的状态机，一处出错后面的状态就不可信，所以整个 SUB 只收一条
     try:
-        check_ownership(sub, symbols, subs, entities, external_modules, c_funcs)
+        check_ownership(sub, symbols, subs, entities, external_modules, c_funcs, uses)
     except SonCompileError as exc:
         if _add_diagnostic(diagnostics, exc, max_errors):
             return
@@ -248,6 +269,18 @@ def collect_c_funcs(program: ast.Program, c_headers: dict[str, ast.UseCHeader]) 
     return funcs
 
 
+def validate_managed_ffi(c_funcs: dict[str, ast.CFunctionDecl], entities: dict[str, ast.EntityDef],
+                         external_modules: dict[str, ModuleExports]) -> None:
+    def contains(kind: ast.TypeSpec) -> bool:
+        return has_explicit_resources(kind, entities, external_modules) or (
+            kind.inner is not None and contains(kind.inner)
+        ) or any(contains(param.type_spec) for param in kind.params or ())
+
+    for decl in c_funcs.values():
+        if any(contains(kind) for kind in [decl.return_type, *(param.type_spec for param in decl.params)]):
+            raise SonCompileError("DECLARE C 不能声明托管资源或其指针；FFI 请使用裸 HANDLE", decl.line_no)
+
+
 def collect_enums(program: ast.Program) -> dict[str, int]:
     """收集枚举成员值：键 `"enumname.member"`（小写），值从 0 自增。"""
     members: dict[str, int] = {}
@@ -309,7 +342,10 @@ def collect_symbols(
             check_expr(decl.expr, symbols, {}, entities, uses, external_modules, {}, {}, c_funcs or {})
             expr_type = type_of(decl.expr, symbols, {}, entities, uses, external_modules, c_funcs)
             reject_unowned_buffer_calls(decl.expr, uses, allow_root=owned_handle_root_ok(decl.type_spec, expr_type))
-            require_assignable(decl.type_spec, expr_type, decl.line_no)
+            require_store_assignable(decl.type_spec, expr_type, decl.expr, uses)
+            traits = resource_traits(decl.type_spec, entities, external_modules)
+            if traits.explicit and traits.move_only and not isinstance(decl.expr, ast.CallExpr | ast.NullLiteral):
+                raise SonCompileError("独占全局资源不能复制已有拥有者；请在 SUB 内 m= 移动或接管新资源", decl.line_no)
     return symbols
 
 
@@ -352,11 +388,12 @@ def check_sub(
     c_headers: dict[str, ast.UseCHeader],
     c_libs: dict[str, ast.UseLibrary],
     c_funcs: dict[str, ast.CFunctionDecl],
-) -> None:
+) -> ScopeGraph:
     scope = symbols.copy()
     for param in sub.params:
         scope[param.name.lower()] = Symbol(param.name, param.type_spec, True, param.by_ref)
 
+    graph = ScopeGraph.for_body(sub.body, protected=sub_has_explicit_resources(sub, symbols, entities, external_modules))
     labels = collect_labels(sub.body)
     reject_end_in_sub(sub.body)
     check_await_placement(sub.body, sub.is_async)
@@ -365,7 +402,7 @@ def check_sub(
         check_stmt(stmt, scope, subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
         check_return(stmt, sub.return_type, scope, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
     # 所有权预检放在逐句检查之后：它假定变量都已声明、类型都能解析，只管 f=/m= 的状态机
-    check_ownership(sub, symbols, subs, entities, external_modules, c_funcs)
+    check_ownership(sub, symbols, subs, entities, external_modules, c_funcs, uses)
 
     if sub.return_type.name != "VOID" and not has_required_return_path(sub.body):
         raise SonCompileError("非 VOID SUB 必须保证所有明显路径 RETURN 一个值", sub.line_no)
@@ -373,56 +410,29 @@ def check_sub(
     if sub.name.lower() == "main":
         if sub.visibility != "PUBLIC" or sub.return_type.name != "VOID":
             raise SonCompileError("主入口必须写成 `SUB main AS PUBLIC AS VOID`", sub.line_no)
+    return graph
 
 
 def collect_labels(body: list[ast.Stmt]) -> set[str]:
     labels: set[str] = set()
-    for stmt in body:
+    for stmt in walk_statements(body):
         if isinstance(stmt, ast.Label):
             key = stmt.name.lower()
             if key in labels:
                 raise SonCompileError(f"重复标签: {stmt.name}", stmt.line_no)
             labels.add(key)
-        elif isinstance(stmt, ast.If):
-            labels.update(collect_labels(stmt.body))
-            for branch in stmt.elifs:
-                labels.update(collect_labels(branch.body))
-            labels.update(collect_labels(stmt.else_body))
-        elif isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-            labels.update(collect_labels(stmt.body))
     return labels
 
 
 def reject_end_in_sub(body: list[ast.Stmt]) -> None:
-    for stmt in body:
+    for stmt in walk_statements(body):
         if isinstance(stmt, ast.End):
             raise SonCompileError("END 只能放在顶层；SUB 内请使用 RETURN", stmt.line_no)
-        if isinstance(stmt, ast.If):
-            reject_end_in_sub(stmt.body)
-            for branch in stmt.elifs:
-                reject_end_in_sub(branch.body)
-            reject_end_in_sub(stmt.else_body)
-        if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-            reject_end_in_sub(stmt.body)
 
 
 def collect_jump_targets(body: list[ast.Stmt]) -> set[str]:
     """收集 SUB 内被 GOTO / GOSUB 引用到的标签名（小写）。"""
-    targets: set[str] = set()
-    for stmt in body:
-        if isinstance(stmt, ast.Goto | ast.Gosub):
-            targets.add(stmt.label.lower())
-        elif isinstance(stmt, ast.If):
-            targets |= collect_jump_targets(stmt.body)
-            for branch in stmt.elifs:
-                targets |= collect_jump_targets(branch.body)
-            targets |= collect_jump_targets(stmt.else_body)
-        elif isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-            targets |= collect_jump_targets(stmt.body)
-        elif isinstance(stmt, ast.TryCatch):
-            for branch in stmt.catches:
-                targets |= collect_jump_targets(branch.body)
-    return targets
+    return {stmt.label.lower() for stmt in walk_statements(body) if isinstance(stmt, ast.Goto | ast.Gosub)}
 
 
 def has_required_return_path(body: list[ast.Stmt], jump_targets: set[str] | None = None) -> bool:
@@ -441,6 +451,8 @@ def has_required_return_path(body: list[ast.Stmt], jump_targets: set[str] | None
         # CALLRET 把 callable 的结果当作本 SUB 的返回值交出去，和 RETURN 一样终结路径
         if isinstance(stmt, ast.Return | ast.CallRet):
             return True
+        if isinstance(stmt, ast.Scope):
+            return has_required_return_path(stmt.body, jump_targets)
         # 带 ELSE 的 IF：当 then、所有 ELSE IF、ELSE 分支都保证返回时，整条 IF 必定返回
         if isinstance(stmt, ast.If) and stmt.else_body:
             if (
@@ -473,16 +485,8 @@ def check_await_placement(body: list[ast.Stmt], is_async: bool, in_try: bool = F
             _reject_await_here(is_async, in_try, stmt.line_no)
         elif isinstance(stmt, ast.AwaitStmt) and isinstance(stmt.expr, ast.AwaitExpr):
             _reject_await_here(is_async, in_try, stmt.line_no)
-        elif isinstance(stmt, ast.If):
-            check_await_placement(stmt.body, is_async, in_try)
-            for branch in stmt.elifs:
-                check_await_placement(branch.body, is_async, in_try)
-            check_await_placement(stmt.else_body, is_async, in_try)
-        elif isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-            check_await_placement(stmt.body, is_async, in_try)
-        elif isinstance(stmt, ast.TryCatch):
-            for branch in stmt.catches:
-                check_await_placement(branch.body, is_async, in_try=True)
+        for nested in _child_bodies(stmt):
+            check_await_placement(nested, is_async, in_try or isinstance(stmt, ast.TryCatch))
 
 
 def check_return(
@@ -517,7 +521,7 @@ def check_return(
             check_body(branch.body, symbols)
         check_body(stmt.else_body, symbols)
         return
-    if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
+    if isinstance(stmt, ast.Scope | ast.ForLoop | ast.WhileLoop):
         check_body(stmt.body, symbols)
         return
     if isinstance(stmt, ast.TryCatch):
@@ -550,7 +554,7 @@ def check_return(
     if stmt.expr is not None:
         expr_type = type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs)
         reject_unowned_buffer_calls(stmt.expr, uses, allow_root=owned_handle_root_ok(return_type, expr_type))
-        require_assignable(return_type, expr_type, stmt.line_no)
+        require_store_assignable(return_type, expr_type, stmt.expr, uses)
 
 
 def check_stmt(
@@ -577,7 +581,7 @@ def check_stmt(
             check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
             expr_type = type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs)
             reject_unowned_buffer_calls(stmt.expr, uses, allow_root=owned_handle_root_ok(stmt.type_spec, expr_type))
-            require_assignable(stmt.type_spec, expr_type, stmt.line_no)
+            require_store_assignable(stmt.type_spec, expr_type, stmt.expr, uses)
     elif isinstance(stmt, ast.Assign):
         if isinstance(stmt.target, ast.VarRef):
             symbol = resolve_symbol_path(stmt.target.name, symbols, entities, stmt.line_no)
@@ -595,6 +599,13 @@ def check_stmt(
             target_type = type_of(stmt.target, symbols, subs, entities, uses, external_modules, c_funcs)
         else:
             raise SonCompileError("赋值目标必须是变量、数组元素或 ^指针", stmt.line_no)
+        borrow_signature = container_borrow_signature(stmt.expr, symbols, entities, uses) if stmt.mode == "borrow" else None
+        if borrow_signature is not None and isinstance(stmt.expr, ast.CallExpr):
+            check_managed_container_call(
+                stmt.expr, borrow_signature, symbols, subs, entities, uses,
+                external_modules, c_headers, c_libs, c_funcs, borrow_target=target_type,
+            )
+            return
         check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         if stmt.mode != "copy" and (is_sub_ptr(target_type) or isinstance(stmt.expr, ast.SubRef)):
             # 函数引用是只读的值：借用和复制没有区别，所以 f= 退化成普通赋值检查；
@@ -607,7 +618,7 @@ def check_stmt(
             return
         expr_type = type_of(stmt.expr, symbols, subs, entities, uses, external_modules, c_funcs)
         reject_unowned_buffer_calls(stmt.expr, uses, allow_root=owned_handle_root_ok(target_type, expr_type))
-        require_assignable(target_type, expr_type, stmt.line_no)
+        require_store_assignable(target_type, expr_type, stmt.expr, uses)
     elif isinstance(stmt, ast.Print):
         if stmt.expr is not None:
             check_expr(stmt.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
@@ -626,10 +637,11 @@ def check_stmt(
         sub = subs.get(stmt.name.lower()) or resolve_external_sub(stmt.name, uses, external_modules)
         c_func = resolve_c_func(stmt.name, c_funcs)
         if sub is None and c_func is None:
-            callee = callable_symbol_type(stmt.name, symbols, entities, stmt.line_no)
+            instance_name = subs.instance.name if isinstance(subs, FunctionTable) else "<main>"
+            callee = callable_binding(stmt.name, symbols, entities, stmt.line_no, instance_name)
             if callee is None:
                 raise SonCompileError(f"未知 SUB 或 C 函数: {stmt.name}", stmt.line_no)
-            signature = sub_signature(callee)
+            signature = callee.signature
             if (signature.inner or VOID).name != "VOID":
                 raise SonCompileError("带返回值的 callable 必须通过 `x = CALL name(...)` 使用", stmt.line_no)
             check_call_args(stmt.name, stmt.args, signature, symbols, subs, entities, uses, external_modules, stmt.line_no, c_headers, c_libs, c_funcs)
@@ -651,7 +663,8 @@ def check_stmt(
             raise SonCompileError(f"未知 SUB: {stmt.call_name}", stmt.line_no)
         if sub.is_async:
             raise SonCompileError("TRY CALL 不能作用于 ASYNC SUB", stmt.line_no)
-        check_call_args(stmt.call_name, stmt.args, sub, symbols, subs, entities, uses, external_modules, stmt.line_no, c_headers, c_libs, c_funcs)
+        check_call_args(stmt.call_name, stmt.args, sub,
+                        symbols, subs, entities, uses, external_modules, stmt.line_no, c_headers, c_libs, c_funcs)
         for branch in stmt.catches:
             branch_symbols = symbols.copy()
             branch_symbols[branch.alias.lower()] = Symbol(branch.alias, ast.TypeSpec("ERROR"), False)
@@ -665,6 +678,11 @@ def check_stmt(
         symbol = require_symbol(stmt.name, symbols, stmt.line_no)
         if not is_error(symbol.type_spec):
             raise SonCompileError("THROW 只能抛出 ERROR 变量", stmt.line_no)
+    elif isinstance(stmt, ast.Scope):
+        block_scope = symbols.copy()
+        for inner in stmt.body:
+            check_stmt(inner, block_scope,
+                       subs, entities, uses, external_modules, labels, c_headers, c_libs, c_funcs)
     elif isinstance(stmt, ast.If):
         check_expr(stmt.condition, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         # 每个分支一份子作用域：codegen 把块内 DIM 发射在 C 的 `{ }` 里，
@@ -788,16 +806,6 @@ def _gosub_in(body: list[ast.Stmt]) -> bool:
     return False
 
 
-def _child_bodies(stmt: ast.Stmt) -> list[list[ast.Stmt]]:
-    if isinstance(stmt, ast.If):
-        return [stmt.body, *(branch.body for branch in stmt.elifs), stmt.else_body]
-    if isinstance(stmt, ast.ForLoop | ast.WhileLoop):
-        return [stmt.body]
-    if isinstance(stmt, ast.TryCatch):
-        return [branch.body for branch in stmt.catches]
-    return []
-
-
 def check_callable_flow(sub: ast.Subroutine) -> None:
     """NEW SUB / CALLRET 的结构约束，和 check_await_placement 一样是纯语法层的扫描。
 
@@ -875,6 +883,8 @@ def check_expr(
         if not isinstance(expr.expr, ast.VarRef):
             raise SonCompileError("@ 只能用于变量", expr.line_no)
         reject_address_of_constant(expr.expr.name, symbols, uses, external_modules, expr.line_no)
+        if has_explicit_resources(type_of(expr.expr, symbols, subs, entities, uses, external_modules, c_funcs), entities, external_modules):
+            raise SonCompileError("不能对托管资源取裸地址；受检操作请使用 AS REF 参数", expr.line_no)
         type_of(expr, symbols, subs, entities, uses, external_modules, c_funcs)
     elif isinstance(expr, ast.SubRef):
         ref_type = type_of(expr, symbols, subs, entities, uses, external_modules, c_funcs)
@@ -889,6 +899,11 @@ def check_expr(
             )
     elif isinstance(expr, ast.Cast):
         check_expr(expr.expr, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        source_type = type_of(expr.expr, symbols, subs, entities, uses, external_modules, c_funcs)
+        if any(has_explicit_resources(kind, entities, external_modules) for kind in (source_type, expr.type_spec)):
+            raise SonCompileError("CAST 不能创建或剥离托管资源的所有权", expr.line_no)
+        reject_unsupported_type(expr.type_spec, expr.line_no, allow_entity=True, entities=entities, uses=uses, external_modules=external_modules)
+    elif isinstance(expr, ast.NewContainer):
         reject_unsupported_type(expr.type_spec, expr.line_no, allow_entity=True, entities=entities, uses=uses, external_modules=external_modules)
     elif isinstance(expr, ast.Index):
         check_expr(expr.base, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
@@ -940,6 +955,7 @@ def check_expr(
         binary_fn = resolve_binary_function(expr.name, uses)
         list_fn = resolve_list_function(expr.name, uses)
         map_fn = resolve_map_function(expr.name, uses)
+        container_fn = resolve_managed_container_function(expr, uses, symbols, entities)
         gui_fn = resolve_gui_function(expr.name, uses)
         if is_math_function(expr.name, "POW", uses):
             if len(expr.args) != 2:
@@ -963,14 +979,23 @@ def check_expr(
                 reject_unowned_buffer_calls(arg, uses)
                 require_assignable(param_type, arg_type, arg.line_no)
             return
+        elif container_fn is not None:
+            check_managed_container_call(expr, container_fn,
+                                         symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+            return
         elif net_fn is not None or file_fn is not None or desktop_fn is not None or binary_fn is not None or list_fn is not None or map_fn is not None or gui_fn is not None:
             params, _ret = net_fn or file_fn or desktop_fn or binary_fn or list_fn or map_fn or gui_fn
             if len(expr.args) != len(params):
                 raise SonCompileError(f"{expr.name} 需要 {len(params)} 个参数，实际给了 {len(expr.args)} 个", expr.line_no)
-            for arg, param_type in zip(expr.args, params):
+            for index, (arg, param_type) in enumerate(zip(expr.args, params)):
                 check_expr(arg, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
                 arg_type = type_of(arg, symbols, subs, entities, uses, external_modules, c_funcs)
                 reject_unowned_buffer_calls(arg, uses)
+                effect = builtin_effect(expr.name, uses)
+                if is_managed_resource(arg_type) and effect is not None and index < len(effect.arguments) and same_handle_kind(param_type, replace(arg_type, managed=False)):
+                    if not isinstance(arg, ast.VarRef):
+                        raise SonCompileError("托管资源操作需要变量或字段；请先接管返回值", arg.line_no)
+                    continue
                 require_assignable(param_type, arg_type, arg.line_no)
             return
         elif expr.name.upper() in {"NUMBER", "STRING"}:
@@ -1109,7 +1134,24 @@ def resolve_symbol_path(
     return Symbol(name, current_type, symbol.mutable, symbol.by_ref)
 
 
+def require_store_assignable(target: ast.TypeSpec, source: ast.TypeSpec, expr: ast.Expr, uses: dict[str, str]) -> None:
+    if isinstance(expr, ast.NewContainer) and not same_type_spec(target, source):
+        raise SonCompileError(
+            f"容器类型不符：声明是 {describe_type(target)}，构造的是 {describe_type(source)}", expr.line_no,
+        )
+    if is_managed_resource(target) and isinstance(expr, ast.CallExpr):
+        effect = builtin_effect(expr.name, uses)
+        if effect is not None and effect.fresh_handle == (target.subtype or "").upper():
+            if same_handle_kind(replace(target, managed=False), source):
+                return
+    require_assignable(target, source, expr.line_no)
+
+
 def require_assignable(target: ast.TypeSpec, source: ast.TypeSpec, line_no: int) -> None:
+    if is_managed_resource(target) or is_managed_resource(source):
+        if same_type_spec(target, source) or (is_managed_resource(target) and is_null(source)):
+            return
+        raise SonCompileError(f"{describe_type(target)} 与 {describe_type(source)} 不能隐式互转；托管值只能接管新资源", line_no)
     if target.array_size is not None or source.array_size is not None:
         raise SonCompileError("数组不能整体赋值或作为标量传递，请通过下标访问元素", line_no)
     # 函数引用 / callable 放在最前：后面那条「SYMBOL 什么都收」以及 PTR 与数值互通的宽松
@@ -1150,6 +1192,100 @@ def require_assignable(target: ast.TypeSpec, source: ast.TypeSpec, line_no: int)
     if is_ptr(target) and (is_ptr(source) or is_numeric(source)):
         return
     raise SonCompileError("赋值两侧类型不兼容，请用 NUMBER() 或 STRING() 显式转换", line_no)
+
+
+def check_managed_container_call(
+    expr: ast.CallExpr,
+    signature: tuple[list[ast.TypeSpec], ast.TypeSpec],
+    symbols: dict[str, Symbol],
+    subs: dict[str, ast.Subroutine],
+    entities: dict[str, ast.EntityDef],
+    uses: dict[str, str],
+    external_modules: dict[str, ModuleExports],
+    c_headers: dict[str, ast.UseCHeader],
+    c_libs: dict[str, ast.UseLibrary],
+    c_funcs: dict[str, ast.CFunctionDecl],
+    *,
+    borrow_target: ast.TypeSpec | None = None,
+) -> None:
+    """托管容器成员调用的类型检查。
+
+签名已经按实参容器算好，元素位填的是真实元素类型，所以这里只剩逐位比对；第一位的
+容器身份由重载解析本身保证——它只认托管容器变量。
+
+`borrow_target` 只在 `目标 f= 容器.BORROW(...)` 这一条路上有值，见 check_container_borrow。
+"""
+    params, ret = signature
+    if len(expr.args) != len(params):
+        raise SonCompileError(f"{expr.name} 需要 {len(params)} 个参数，实际给了 {len(expr.args)} 个", expr.line_no)
+    if container_member(expr) == "BORROW":
+        check_container_borrow(expr, ret, borrow_target, entities, external_modules)
+    reject_copying_an_exclusive_element(expr, params[0], expr.line_no)
+    for arg, param_type in zip(expr.args, params):
+        check_expr(arg, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
+        arg_type = type_of(arg, symbols, subs, entities, uses, external_modules, c_funcs)
+        reject_unowned_buffer_calls(arg, uses)
+        require_assignable(param_type, arg_type, arg.line_no)
+
+
+def container_member(expr: ast.CallExpr) -> str:
+    return (split_module_member(expr.name) or ("", ""))[1].upper()
+
+
+def container_borrow_signature(
+    expr: ast.Expr,
+    symbols: dict[str, Symbol],
+    entities: dict[str, ast.EntityDef],
+    uses: dict[str, str],
+) -> tuple[list[ast.TypeSpec], ast.TypeSpec] | None:
+    """这个表达式是不是一个托管容器的 BORROW 调用，是就给出它的签名。"""
+    if not isinstance(expr, ast.CallExpr) or container_member(expr) != "BORROW":
+        return None
+    return resolve_managed_container_function(expr, uses, symbols, entities)
+
+
+def check_container_borrow(
+    expr: ast.CallExpr,
+    element: ast.TypeSpec,
+    target_type: ast.TypeSpec | None,
+    entities: dict[str, ast.EntityDef],
+    external_modules: dict[str, ModuleExports],
+) -> None:
+    """BORROW 交出的是容器里那一格存储的视图，不是副本。
+
+所以它只认 `目标 f= 容器.BORROW(...)`：落到普通 `=` 或者嵌在别的表达式里，同一份
+STRING／句柄就会多出第二个拥有者，块尾和容器析构各释放一次。目标得是哪种变量、
+借用期间容器冻结多久，由 ownership 预检接着管——那是顺序敏感的状态，这里判不了。
+"""
+    if target_type is None:
+        raise SonCompileError(
+            f"{expr.name} 交出的是容器里那一格的借用视图，只能用 `目标 f= {expr.name}(...)` 接住；要一份自己的副本用 GET，要把元素搬出来用 TAKE",
+            expr.line_no)
+    if not resource_traits(element, entities, external_modules).has_resources:
+        raise SonCompileError(
+            f"{describe_type(element)} 没有资源可借，直接用 GET 取值", expr.line_no)
+    if not same_type_spec(target_type, element):
+        raise SonCompileError(
+            f"f= 两侧类型必须完全一致（借用共享同一块存储，不做隐式转换）：目标是 "
+            f"{describe_type(target_type)}，BORROW 给出的是 {describe_type(element)}", expr.line_no)
+
+
+_COPYING_IN_MEMBERS = {"PUSH": "PUSH_MOVE", "INSERT": "INSERT_MOVE", "SET": "SET_MOVE"}
+
+
+def reject_copying_an_exclusive_element(expr: ast.CallExpr, container: ast.TypeSpec, line_no: int) -> None:
+    element = container.inner
+    member = (split_module_member(expr.name) or ("", ""))[1].upper()
+    if element is None or element_copyable(element):
+        return
+    if member in _COPYING_IN_MEMBERS:
+        raise SonCompileError(
+            f"{describe_type(element)} 是独占的，{member} 会复制它；请用 "
+            f"{_COPYING_IN_MEMBERS[member]} 把所有权转进容器", line_no)
+    if member == "GET":
+        raise SonCompileError(
+            f"{describe_type(element)} 是独占的，GET 会复制它；要取出请用 TAKE（转出所有权），只读访问请用 BORROW",
+            line_no)
 
 
 def check_symbol_algebra_call(
@@ -1199,6 +1335,11 @@ def check_call_args(
         check_expr(arg, symbols, subs, entities, uses, external_modules, c_headers, c_libs, c_funcs)
         arg_type = type_of(arg, symbols, subs, entities, uses, external_modules, c_funcs)
         reject_unowned_buffer_calls(arg, uses)
+        traits = resource_traits(arg_type, entities, external_modules)
+        if traits.explicit and isinstance(sub, ast.CFunctionDecl):
+            raise SonCompileError("托管资源不能传入 C FFI；请保持裸 HANDLE 边界", arg.line_no)
+        if traits.explicit and traits.move_only and not param.by_ref:
+            raise SonCompileError("独占资源不能按值传参；请使用 AS REF", arg.line_no)
         if param.by_ref:
             if not isinstance(arg, ast.VarRef):
                 raise SonCompileError(f"REF 参数 {param.name} 必须传入变量", arg.line_no)
@@ -1289,9 +1430,11 @@ def reject_unsupported_type(
 ) -> None:
     # 数组：校验元素类型即可（元素类型 = 去掉 array_size）
     if type_spec.array_size is not None:
-        element = ast.TypeSpec(type_spec.name, type_spec.subtype, type_spec.inner, params=type_spec.params)
+        element = replace(type_spec, array_size=None)
         if is_callable_value(element):
             raise SonCompileError("数组暂不支持 SUB / PTR TO SUB 元素类型", line_no)
+        if element.managed:
+            raise SonCompileError("定长数组暂不支持托管 HANDLE 元素，请使用独立拥有变量", line_no)
         # 支持值类型和 STRING 元素；SYMBOL/ERROR/ENTITY 数组需逐元素深拷贝，留待后续
         if element.name in {"SYMBOL", "ERROR", "ENTITY"}:
             raise SonCompileError(f"数组暂不支持 {element.name} 元素类型，当前支持 NUM/BOOL/HANDLE/CPTR/PTR/STRING", line_no)
@@ -1302,12 +1445,20 @@ def reject_unsupported_type(
     if type_spec.name in {"NUM", "STRING", "ERROR", "SYMBOL", "CPTR", "BOOL"}:
         return
     if type_spec.name == "HANDLE":
+        if type_spec.managed:
+            try:
+                handle_drop_function(type_spec)
+            except SonCompileError as exc:
+                raise SonCompileError(str(exc), line_no) from exc
         if not type_spec.subtype:
             raise SonCompileError("HANDLE 必须指定 kind，例如 HANDLE AS FILE", line_no)
         return
     if type_spec.name == "PTR":
         if type_spec.inner is not None:
-            reject_unsupported_type(type_spec.inner, line_no, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
+            inner = type_spec.inner
+            if inner.managed or (inner.name == "ENTITY" and entities is not None and has_explicit_resources(inner, entities, external_modules or {})):
+                raise SonCompileError("PTR 不能绕过托管资源的借用检查；请使用 AS REF 参数", line_no)
+            reject_unsupported_type(inner, line_no, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
         return
     if type_spec.name == "SUB":
         for param in type_spec.params or ():
@@ -1321,6 +1472,14 @@ def reject_unsupported_type(
             raise SonCompileError("PROMISE 必须写成 `PROMISE OF <类型>`", line_no)
         reject_unsupported_async_result(type_spec.inner, line_no, "PROMISE 结果类型")
         reject_unsupported_type(type_spec.inner, line_no, allow_void=True, allow_entity=allow_entity, entities=entities, uses=uses, external_modules=external_modules)
+        return
+    if type_spec.name in {"LIST", "MAP"}:
+        if type_spec.inner is None:
+            raise SonCompileError(f"{type_spec.name} 必须写成 `{type_spec.name} OF <元素类型>`", line_no)
+        reject_unsupported_type(type_spec.inner, line_no, allow_entity=True, entities=entities, uses=uses, external_modules=external_modules)
+        element = type_spec.inner
+        if preset_value_ops(element) is None and not is_managed_handle(element) and element.name not in {"STRING", "SYMBOL", "ERROR", "SUB"}:
+            raise SonCompileError(f"托管容器暂不支持 {describe_type(element)} 元素：它的复制／析构胶水还没接入", line_no)
         return
     if allow_entity and type_spec.name == "ENTITY":
         if entities is not None and (type_spec.subtype or "").lower() not in entities and not external_entity_exists(type_spec.subtype or "", uses or {}, external_modules or {}):
@@ -1400,14 +1559,8 @@ def resolve_external_sub(
     uses: dict[str, str],
     external_modules: dict[str, ModuleExports],
 ) -> ast.Subroutine | None:
-    split = split_module_member(name)
-    if split is None:
-        return None
-    alias, member = split
-    module = external_modules.get(alias)
-    if module is None:
-        return None
-    return module.subs.get(member.lower())
+    binding = resolve_function_binding(name, {}, external_modules, {})
+    return binding.declaration if binding is not None and isinstance(binding.declaration, ast.Subroutine) else None
 
 
 def resolve_external_const(

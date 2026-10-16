@@ -37,6 +37,15 @@ _PREFIX_PREC = 11
 # Python 都是这个约定。BNOT 是位运算，仍然走 _UNARY_PREC。
 _NOT_PREC = _PRECEDENCE["="]
 
+# `NEW` 后面紧跟的类型关键字。不在这里拦的话，它会退化成变量 `NEW`，然后这些词被当成
+# 尾随垃圾，报出「表达式后存在无法解析的内容」—— 一句没提 NEW 的诊断。这里只抄了一份
+# 名单而不是从 parser 导入：parser 反向依赖本模块，模块级导入会成环。
+_NEW_REJECTED_TYPE_WORDS = frozenset({
+    "NUM", "LONG", "DOUBLE", "FLOAT", "STRING", "SYMBOL", "ERROR", "CPTR",
+    "BOOL", "VOID", "ENTITY", "HANDLE", "PTR", "TO", "PROMISE", "OF", "AS",
+    "SUB", "MANAGED", "FILE",
+})
+
 
 def parse_expr(text: str, line_no: int) -> ast.Expr:
     parser = ExprParser(tokenize_expr(text, line_no), line_no)
@@ -97,6 +106,31 @@ class ExprParser:
             if word == "CAST":
                 type_spec = self.parse_cast_type()
                 return ast.Cast(self.line_no, type_spec, self.parse(_PREFIX_PREC))
+            # 语句层的 NEW 已经被占了两次（`NEW SUB name FROM ptr` 造 callable、
+            # `THROW NEW ERR_X` 造错误），都在语句解析里成句吃掉，走不到表达式层；
+            # 它们后面跟的是用户自定义名字，撞不上 LIST/MAP 这两个保留字。
+            if word == "NEW" and self.tokens[self.i].kind == "IDENT" \
+                    and self.tokens[self.i].value.upper() in {"LIST", "MAP"}:
+                return ast.NewContainer(self.line_no, self.parse_container_type())
+            # `NEW NUM AS LONG`、`NEW PROMISE OF T` 这类：用户想构造但不是容器。放过去的话
+            # 这些类型关键字会被当成尾随垃圾，报出「表达式后存在无法解析的内容」——一句
+            # 完全没提 NEW 的诊断。在这里说清楚 NEW 能构造什么。
+            if word == "NEW" and self.tokens[self.i].kind == "IDENT" \
+                    and self.tokens[self.i].value.upper() in _NEW_REJECTED_TYPE_WORDS \
+                    and self.tokens[self.i].value.upper() != "SUB":
+                raise SonCompileError(
+                    f"`NEW` 只能构造托管容器，请写成 `NEW LIST OF <元素类型>` 或 `NEW MAP OF <元素类型>`；"
+                    f"`{self.tokens[self.i].value}` 不是容器类型",
+                    self.line_no,
+                )
+            # `NEW SUB` 是语句不是表达式，走到这里说明有人把它塞进了赋值右侧。
+            # 和上面那条分开，免得把「放错位置」说成「类型写错」。
+            if word == "NEW" and self.tokens[self.i].kind == "IDENT" \
+                    and self.tokens[self.i].value.upper() == "SUB":
+                raise SonCompileError(
+                    "`NEW SUB` 是语句，不产生值，只能独立成句（`NEW SUB handler FROM @foo()`）",
+                    self.line_no,
+                )
             # AWAIT / SYNC 和 CALL 同属语句级关键字，表达式层不认识它们。提前拦下，
             # 否则会被读成变量 `AWAIT` 再在后面的操作数上撞出指向无关位置的诊断。
             if word in {"AWAIT", "SYNC"}:
@@ -154,7 +188,23 @@ class ExprParser:
         )
 
     def parse_cast_type(self) -> ast.TypeSpec:
-        from .parser import _parse_type_parts, CAST_TYPE_KEYWORDS
+        from .parser import CAST_TYPE_KEYWORDS
+
+        return self._collect_type_tokens(CAST_TYPE_KEYWORDS, "CAST 后面必须跟类型")
+
+    def parse_container_type(self) -> ast.TypeSpec:
+        """`NEW LIST OF T` 里的类型部分。当前 token 是 LIST/MAP。
+
+        白名单比 CAST 宽：容器天生托管，元素可以递归写成 `LIST OF`／`MAP OF`，所以
+        容器关键字本身也得吃；元素还能是 ENTITY/HANDLE 这类后面跟用户自定义名字的形态，
+        那由 `_collect_type_tokens` 的特例收尾。
+        """
+        from .parser import _TYPE_DECL_KEYWORDS
+
+        return self._collect_type_tokens(_TYPE_DECL_KEYWORDS, "NEW 后面必须跟 LIST OF T 或 MAP OF T")
+
+    def _collect_type_tokens(self, keywords: frozenset[str], missing: str) -> ast.TypeSpec:
+        from .parser import _parse_type_parts
 
         type_tokens: list[str] = []
         while True:
@@ -169,12 +219,12 @@ class ExprParser:
                 self.i += 1
                 break
             upper = token.value.upper()
-            if upper not in CAST_TYPE_KEYWORDS:
+            if upper not in keywords:
                 break
             type_tokens.append(upper)
             self.i += 1
         if not type_tokens:
-            raise SonCompileError("CAST 后面必须跟类型", self.line_no)
+            raise SonCompileError(missing, self.line_no)
         return _parse_type_parts(type_tokens, self.line_no)
 
     def parse_args(self) -> list[ast.Expr]:

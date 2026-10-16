@@ -65,6 +65,7 @@ RUNTIME_SIGNATURES: dict[str, str] = {
     "sa_promise_fulfill_long": "declare void @sa_promise_fulfill_long(i64, i64)",
     "sa_promise_fulfill_double": "declare void @sa_promise_fulfill_double(i64, double)",
     "sa_promise_fulfill_handle": "declare void @sa_promise_fulfill_handle(i64, i64)",
+    "sa_promise_fulfill_owned_handle": "declare void @sa_promise_fulfill_owned_handle(i64, i64, ptr)",
     "sa_promise_fulfill_str": "declare void @sa_promise_fulfill_str(i64, ptr)",
     "sa_promise_fulfill_void": "declare void @sa_promise_fulfill_void(i64)",
     "sa_promise_take_long": "declare i64 @sa_promise_take_long(i64)",
@@ -222,3 +223,11 @@ RUNTIME_SIGNATURES: dict[str, str] = {
     "_setjmp": "declare i32 @_setjmp(ptr, ptr) returns_twice",
     "llvm.frameaddress": "declare ptr @llvm.frameaddress.p0(i32 immarg)",
 }
+
+# 托管句柄的析构三件套命名统一（见 runtime 的 SA_DEFINE_HANDLE_DROP），按前缀批量注入，
+# 这样新接一个 kind 只需要在 resource_traits 里登记前缀，不用两边各抄三行声明。
+RUNTIME_SIGNATURES.update({
+    f"{prefix}_{suffix}": f"declare {result} @{prefix}_{suffix}({argument})"
+    for prefix in ("sa_file", "sa_binary", "sa_net_stream", "sa_net_tcp_listener", "sa_net_udp", "sa_gui_window")
+    for suffix, result, argument in (("drop", "void", "i64"), ("drop_value", "void", "ptr"), ("close_owned", "i32", "ptr"))
+})

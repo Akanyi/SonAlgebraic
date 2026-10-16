@@ -45,6 +45,7 @@ _FEATURE_NAMES = {
     "BINARY": "binary",
     "LIST": "list",
     "MAP": "map",
+    "CONTAINER": "container",
     "GUI": "gui",
     "ASYNC": "async",
 }
@@ -203,6 +204,20 @@ def _closes(chunk: list[str]) -> bool:
     return text.endswith((";", "}"))
 
 
+def _macro_generated(clean: str) -> set[str]:
+    """顶层宏调用展开出来的函数名。
+
+    BINARY 的 12 个 pack/unpack 和各资源 kind 的 drop 三件套都没有可扫描的定义行，
+    名字只出现在宏实参里：`SA_BIN_PACK_FN(sa_binary_pack_u16_le, 2, 0)`、
+    `SA_DEFINE_HANDLE_DROP(sa_file_drop, sa_file_drop_value, sa_file_close_owned, ...)`。
+    实参里顺带被算进来的既有符号（closer、错误缓冲）本来就定义在同一段代码里，重复登记不影响取舍。
+    """
+    names: set[str] = set()
+    for arguments in re.findall(r"^SA_[A-Z0-9_]+\((.*)\)\s*$", clean, re.MULTILINE):
+        names |= set(re.findall(r"\bsa_[a-z0-9_]+\b", arguments))
+    return names
+
+
 def _provides_of(text: str) -> set[str]:
     """片段定义了哪些符号。
 
@@ -213,8 +228,10 @@ def _provides_of(text: str) -> set[str]:
     if clean.lstrip().startswith("enum"):
         return set(re.findall(r"\b(SA_[A-Z0-9_]+)\b", clean))
     if clean.lstrip().startswith("#"):
-        # 平台 guard 块：块里定义的函数全算它提供的
-        return set(re.findall(r"^(?:static\s+)?[A-Za-z_][\w\s\*]*?\b(sa_[a-z0-9_]+)\s*\(", clean, re.MULTILINE))
+        # 平台 guard 块：块里定义的函数全算它提供的。纯宏定义块提供的是宏名本身——
+        # 宏体里的函数带缩进，扫不到定义行，引用方要的也是宏名。
+        return (set(re.findall(r"^(?:static\s+)?[A-Za-z_][\w\s\*]*?\b(sa_[a-z0-9_]+)\s*\(", clean, re.MULTILINE))
+                | set(re.findall(r"^#define\s+(sa_[a-z0-9_]+|SA_[A-Z0-9_]+)", clean, re.MULTILINE)))
     return {_fragment_name(text)}
 
 
@@ -250,8 +267,7 @@ def fragments() -> tuple[Fragment, ...]:
                 provides |= set(re.findall(r"^#define\s+(sa_[a-z0-9_]+|SA_[A-Z0-9_]+)", clean, re.MULTILINE))
                 provides |= set(re.findall(r"^\s*(SA_[A-Z0-9_]+)\s*=", clean, re.MULTILINE))
                 provides |= _defined_globals(text)
-                # 宏展开生成的函数：SA_BIN_PACK_FN(sa_binary_pack_u16_le, 2, 0)
-                provides |= set(re.findall(r"^SA_BIN_(?:UN)?PACK_FN\((sa_[a-z0-9_]+)", clean, re.MULTILINE))
+                provides |= _macro_generated(clean)
                 result.append(
                     Fragment(
                         name=f"feature:{'|'.join(sorted(names))}@{first + 1}",

@@ -9,9 +9,10 @@ from .entities import EntitiesMixin
 from .exprs import ExprsMixin
 from .program import ProgramMixin
 from .stmts import StmtsMixin
+from .value_ops import ValueOpsMixin
 
 
-class CGen(ProgramMixin, CoroutinesMixin, StmtsMixin, ExprsMixin, BuiltinsMixin, EntitiesMixin, CGenBase):
+class CGen(ProgramMixin, CoroutinesMixin, StmtsMixin, ExprsMixin, BuiltinsMixin, EntitiesMixin, ValueOpsMixin, CGenBase):
     """C 后端生成器：把 CheckedProgram 变成一份 .c 文本。
 
     状态字段全在 CGenBase（dataclass）里，这里不再 @dataclass：Mixin 不带字段，再装饰一次

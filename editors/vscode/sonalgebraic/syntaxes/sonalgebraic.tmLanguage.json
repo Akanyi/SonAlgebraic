@@ -74,7 +74,7 @@
       ]
     },
     "block-end": {
-      "match": "(?<!\\S)\\.(ENDSUB|ENDIF|ENDENTITY|ENDENUM|ENDFOR|ENDWHILE|ENDTRY)\\b",
+      "match": "(?<!\\S)\\.(ENDSUB|ENDSCOPE|ENDIF|ENDENTITY|ENDENUM|ENDFOR|ENDWHILE|ENDTRY)\\b",
       "name": "keyword.control.end-block.sonalgebraic"
     },
     "declaration-keywords": {
@@ -82,7 +82,7 @@
       "name": "storage.type.declaration.sonalgebraic"
     },
     "control-keywords": {
-      "match": "\\b(ELSE\\s+IF|END\\s+IF|CALLRET|GOSUB|AWAIT|SYNC|IF|THEN|ELSE|FOR|TO|STEP|WHILE|GOTO|RETURN|CALL|TRY|CATCH|TRACEBACK|THROW|NEW|END|CLS|PRINT|INPUT)\\b",
+      "match": "\\b(ELSE\\s+IF|END\\s+(?:IF|SCOPE)|SCOPE|CALLRET|GOSUB|AWAIT|SYNC|IF|THEN|ELSE|FOR|TO|STEP|WHILE|GOTO|RETURN|CALL|TRY|CATCH|TRACEBACK|THROW|NEW|END|CLS|PRINT|INPUT)\\b",
       "name": "keyword.control.sonalgebraic"
     },
     "type-keywords": {

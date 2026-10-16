@@ -135,9 +135,20 @@ def test_rejects_type_mismatch() -> None:
     expect_error(_main("20 DIM a AS STRING AS VAR\n30 DIM b AS SYMBOL AS VAR\n40 a m= b"), "两侧类型必须完全一致")
 
 
-def test_rejects_expression_or_field_path_as_source() -> None:
+def test_rejects_expression_as_source() -> None:
     expect_error(_main('20 DIM a AS STRING AS VAR\n30 a m= "lit"'), "右侧必须是一个变量")
-    expect_error(_BOX + _main("20 DIM a AS STRING AS VAR\n30 DIM b AS ENTITY AS Box AS VAR\n40 a m= b.text"), "右侧必须是一个变量")
+
+
+def test_accepts_field_path_as_move_source_and_tracks_moved_field() -> None:
+    body = (
+        '20 DIM a AS STRING AS VAR\n30 DIM b AS ENTITY AS Box AS VAR\n'
+        '40 b.text = "owned"\n50 a m= b.text\n60 PRINT a\n70 PRINT b.n'
+    )
+    source = _BOX + _main(body)
+    check_program(parse_program(source))
+    c_text = compile_user_c(source)
+    assert "sa_a = sa_b.text;\n    sa_b.text = NULL;" in c_text
+    expect_error(_BOX + _main(body + "\n80 PRINT b.text"), "已被 m= 移走: b.text")
 
 
 def test_rejects_self_assign() -> None:

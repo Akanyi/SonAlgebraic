@@ -15,6 +15,8 @@ class TypeSpec:
     # 复用 Param 而不是另造一个「无名参数」类型，是为了让签名能直接喂给 check_call_args /
     # call_args_with_prelude 这些吃 `.params` 的现成路径；名字和行号不参与 same_type_spec 比较。
     params: "tuple[Param, ...] | None" = None
+    # 旧 HANDLE 保持裸令牌语义；托管必须显式选择，不能由资源 kind 暗中决定。
+    managed: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,12 @@ class Stmt:
 @dataclass(frozen=True)
 class NoOp(Stmt):
     pass
+
+
+@dataclass(frozen=True)
+class Scope(Stmt):
+    """独立词法作用域：可见性与资源生命周期不再依赖人为构造的条件分支。"""
+    body: list["Stmt"]
 
 
 @dataclass(frozen=True)
@@ -344,6 +352,17 @@ class Index(Expr):
 class CallExpr(Expr):
     name: str
     args: list[Expr]
+
+
+@dataclass(frozen=True)
+class NewContainer(Expr):
+    """`NEW LIST OF T` / `NEW MAP OF T`：托管容器唯一的构造点。
+
+    元素类型必须写在构造处。靠赋值左侧反推看着省事，但容器句柄会经参数、字段、返回值
+    流转，任何一处反推失败就得到一张元素大小是猜的 ops 表——之后每次 PUSH 的字节步长
+    都是错的，而错误只在运行到那一格时才炸。写死在这儿，类型检查在声明处就能拦住。
+    """
+    type_spec: TypeSpec
 
 
 @dataclass(frozen=True)

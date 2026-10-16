@@ -14,6 +14,7 @@
   - [F-string](#f-string)
   - [运算符与优先级](#运算符与优先级)
   - [控制流](#控制流)
+    - [SCOPE](#scope)
     - [IF / ELSE IF / ELSE](#if--else-if--else)
     - [FOR](#for)
     - [WHILE](#while)
@@ -61,7 +62,7 @@ END
 
 编译器会在解析前按出现顺序补上 `10, 20, 30...`。源码里已有的行号会被整体重写，不予保留。
 
-**所有变量先声明后使用，声明必须写全可变性。**
+**所有变量先声明后使用；DIM 默认可变，推荐显式写出 `AS VAR`。**
 
 **所有可执行代码包在 `SUB` 里，入口是 `SUB main AS PUBLIC AS VOID`。** 顶层只能有声明和最后的 `CALL main` / `END`。
 
@@ -79,7 +80,7 @@ END
 
 ## 声明 DIM 与 CONST
 
-`DIM` 声明变量，类型和修饰符用 `AS` 串起来，**结尾必须是 `AS VAR`**：
+`DIM` 声明变量，类型和修饰符用 `AS` 串起来。**结尾的 `AS VAR` 可以省略，但推荐显式写明**：
 
 ```basic
 10 DIM counter AS NUM AS LONG AS VAR
@@ -94,7 +95,7 @@ END
 100 END
 ```
 
-漏掉 `AS VAR` 会报 `DIM 声明必须以 AS VAR 结尾标明可变性`。`NUM` 也不能单独出现，必须带 `LONG` / `DOUBLE` / `FLOAT` 子类型。
+`DIM message AS STRING` 与 `DIM message AS STRING AS VAR` 等价；`CONST` 仍不能带 `AS VAR`。`NUM` 不能单独出现，必须带 `LONG` / `DOUBLE` / `FLOAT` 子类型。
 
 `CONST` 声明常量，必须带初始值：
 
@@ -109,7 +110,7 @@ END
 80 END
 ```
 
-`DIM` 和 `CONST` 都可以写在 `SUB` 内部作为局部声明。局部声明是**块作用域**：`IF` / `FOR` / `WHILE` / `CATCH` 块内声明的变量在块外不可见（与生成 C 的 `{ }` 一致）。兄弟分支可以声明同名变量，但不允许遮蔽外层已有的同名局部。
+`DIM` 和 `CONST` 都可以写在 `SUB` 内部作为局部声明。局部声明是**块作用域**：`SCOPE` / `IF` / `FOR` / `WHILE` / `CATCH` 块内声明的变量在块外不可见（与生成 C 的 `{ }` 一致）。兄弟分支可以声明同名变量，但不允许遮蔽外层已有的同名局部。
 
 ### 万能关键字 AS
 
@@ -224,7 +225,7 @@ END
 | | `BAND` | 按位与 |
 | | `BXOR` | 按位异或 |
 | | `BOR` | 按位或 |
-| | `=` `==` `!=` `<>` `<` `<=` `>` `>=` | 比较。`=` 和 `==` 同义，`!=` 和 `<>` 同义 |
+| | `=` `==` `!=` `<>` `<` `<=` `>` `>=` | 比较。`=` 和 `==` 同义；不等于推荐使用 `!=`，`<>` 保留兼容 |
 | | `NOT` | 逻辑非 |
 | | `AND` | 逻辑与 |
 | 最低 | `OR` | 逻辑或 |
@@ -271,11 +272,11 @@ END
 70 built = "a long string that would be wasteful to copy"
 80 result m= built
 90 PRINT result
-100 IF result <> "" THEN
+100 SCOPE
 110 DIM view AS STRING AS VAR
 120 view f= result
 130 PRINT view
-140 END IF
+140 .ENDSCOPE
 150 result = "still mine"
 160 DIM box AS ENTITY AS Box AS VAR
 170 DIM moved AS ENTITY AS Box AS VAR
@@ -287,17 +288,17 @@ END
 230 END
 ```
 
-第 80 行之后 `built` 已经不存在了：读它、写它、取它的地址、把它传 `AS REF`，都会报 `变量已被 m= 移走`。第 120 行的 `view` 死在 `END IF`，之后 `result` 解冻，第 150 行才能正常赋值。
+第 80 行之后 `built` 已经不存在了：读它、写它、取它的地址、把它传 `AS REF`，都会报 `变量已被 m= 移走`。第 120 行的 `view` 死在 `.ENDSCOPE`，之后 `result` 解冻，第 150 行才能正常赋值。
 
 规则清单：
 
 - **只对托管类型有效**。数值、`BOOL`、`HANDLE`、`PTR`、数组、`PROMISE` 一律拒绝。两侧类型必须完全一致，没有隐式转换。
-- **右侧必须是一个裸变量**：不能是表达式、字段路径或 `CALL`。
+- **右侧必须是变量或 ENTITY 字段路径**：不能是表达式或 `CALL`；移动字段后该字段不可再读，其他字段仍可使用。
 - `m=` 的源必须是本 SUB 拥有的东西：局部 `DIM`，或按值传入的 `STRING` / `ENTITY` 参数。全局、`AS REF` 参数、`CONST`、按值传入的 `SYMBOL` / `ERROR` 参数都不行。
 - `m=` 的目标可以是局部、全局、`AS REF` 参数或 `ENTITY` 字段。
-- **任一分支移走就算死**：`IF` 里移走的变量，`END IF` 之后同样不能再用。**循环里不能移走循环外声明的变量**，因为下一轮迭代会读到已经空掉的值。
+- **合流时检查仍可达的分支**：任一继续执行的分支移走变量，`END IF` 之后就不能再用；已经 `RETURN` / `THROW` / `CALLRET` 的分支不影响其他路径。互斥分支可以分别移动同一个源。**循环里不能移走循环外声明的变量**，因为下一轮迭代会读到已经空掉的值。
 - `f=` 的目标必须是**与这条语句同一个块里 `DIM` 的局部变量**；源不能是全局。借用者存活期间，源和借用者都不能被赋值、`m=`、取地址、传 `AS REF` 或 `IO.INPUT`；读、按值传参、作为 `=` 的源（深拷贝）都随意。
-- 含 `GOTO` / `GOSUB` 的 SUB 里不能用 `f=` / `m=`。
+- 使用 `SCOPE` 的 SUB 支持受检的同层 `GOTO` 和向外跳出，不能跳过局部声明或借用绑定，回边不能改变存活变量的所有权状态；向外跳出先释放退出块的资源。没有 `SCOPE` 的旧跳转代码、以及含 `GOSUB` 的 SUB，仍不支持 `f=` / `m=`。
 - `DIM` / `CONST` 的初始化只支持 `=`。
 
 移走之后再碰源变量，编译器会指着那一行报错：
@@ -318,6 +319,31 @@ END
 第 60 行报 `变量已被 m= 移走: b`。其他常见的拦截：给数值变量写 `n m= k` 报 `m= 只适用于 STRING / SYMBOL / ERROR、callable 实体和含托管字段的 ENTITY`；`v f= s` 之后再 `s = "x"` 报 `变量已被 f= 借出`；在 `IF` 里给外层 `DIM` 的变量做 `f=` 报 `f= 的目标必须是与该语句同一个块里 DIM 的局部变量`。所有权检查是顺序敏感的状态机，每个 SUB 只报第一处错，修掉再看下一处。
 
 ## 控制流
+
+### SCOPE
+
+`SCOPE … .ENDSCOPE`（也接受 `END SCOPE`）创建独立词法块，不执行条件判断。只想限制局部变量或借用的寿命时，用它代替人为构造的 `IF`。
+
+块内声明只在块内可见，不能遮蔽仍可见的绑定；兄弟块可以声明同名变量，C/native 和协程帧均为它们保留独立存储。托管资源在正常块尾、提前返回、异常退出和安全向外 `GOTO` 时逆序释放。协程挂起时资源留在帧内，完成、失败或取消时清理。
+
+```basic
+10 SUB main AS PUBLIC AS VOID
+20 SCOPE
+30 DIM message AS STRING AS VAR
+40 message = "first block"
+50 PRINT message
+60 .ENDSCOPE
+70 SCOPE
+80 DIM message AS NUM AS LONG AS VAR
+90 message = 42
+100 PRINT message
+110 END SCOPE
+120 .ENDSUB
+130 CALL main
+140 END
+```
+
+使用独立作用域的 SUB 不能跳入另一个块，也不能跳过或重复执行仍存活块内的局部声明、借用绑定。跨层 `GOSUB` 暂不支持；同层跳转仍受初始化边界约束。
 
 ### IF / ELSE IF / ELSE
 

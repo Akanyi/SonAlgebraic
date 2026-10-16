@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 from ..core import ast
 from ..core.errors import SonCompileError
@@ -133,7 +134,7 @@ class Parser:
 
         if not text or upper.startswith("REM"):
             return ast.NoOp(line.no)
-        if upper in {".ENDSUB", "END IF", ".ENDIF"}:
+        if upper in {".ENDSUB", "END IF", ".ENDIF", "END SCOPE", ".ENDSCOPE"}:
             raise SonCompileError(f"孤立的 `{text}`", line.no)
 
         if _starts_word(upper, "DIM") or _starts_word(upper, "CONST"):
@@ -157,6 +158,8 @@ class Parser:
             return new_sub
         if _starts_word(upper, "TRY"):
             return self.parse_try(line, text)
+        if upper == "SCOPE":
+            return self.parse_scope(line)
         if _starts_word(upper, "IF"):
             return self.parse_if(line, text)
         if _starts_word(upper, "FOR"):
@@ -238,6 +241,18 @@ class Parser:
             return ast.ThrowNew(line.no, new_match.group(1).upper(), parse_expr(new_match.group(2), line.no))
         _validate_name(rest, line.no)
         return ast.ThrowVar(line.no, rest)
+
+    def parse_scope(self, line: SourceLine) -> ast.Scope:
+        body: list[ast.Stmt] = []
+        while not self.at_end():
+            upper = self.peek().text.strip().upper()
+            if upper in {"END SCOPE", ".ENDSCOPE"}:
+                self.i += 1
+                return ast.Scope(line.no, body)
+            if _is_block_terminator(upper) or _starts_word(upper, "SUB") or _starts_word(upper, "ASYNC"):
+                break
+            body.append(self.parse_statement())
+        raise SonCompileError("SCOPE 缺少 END SCOPE 或 .ENDSCOPE", line.no)
 
     def parse_if(self, line: SourceLine, text: str) -> ast.If:
         match = re.match(r"^IF\s+(.+)\s+THEN$", text, re.IGNORECASE)
@@ -393,9 +408,8 @@ class Parser:
         mutable = kind == "DIM"
 
         if mutable:
-            if len(type_tokens) < 2 or type_tokens[-2].upper() != "AS" or type_tokens[-1].upper() != "VAR":
-                raise SonCompileError("DIM 声明必须以 `AS VAR` 标明可变性", line.no)
-            type_tokens = type_tokens[:-2]
+            if len(type_tokens) >= 2 and [token.upper() for token in type_tokens[-2:]] == ["AS", "VAR"]:
+                type_tokens = type_tokens[:-2]
         elif any(t.upper() == "VAR" for t in type_tokens):
             raise SonCompileError("CONST 不能带 `AS VAR`", line.no)
         elif expr_text is None:
@@ -408,9 +422,7 @@ class Parser:
             raise SonCompileError("声明缺少类型", line.no)
 
         element_type = _parse_type_tokens(type_tokens[1:], line.no)
-        type_spec = element_type if array_size is None else ast.TypeSpec(
-            element_type.name, element_type.subtype, element_type.inner, array_size, element_type.params
-        )
+        type_spec = element_type if array_size is None else replace(element_type, array_size=array_size)
 
         return ast.Declaration(
             name,
@@ -556,7 +568,7 @@ def _after_keyword(text: str, keyword: str) -> str:
 # 不属于自己的终结符都要立刻停手且不消费，由外层块去报「缺少对应终结符」。否则终结符
 # 会被当成普通语句解析，报出来的是「无法解析的语句: .ENDFOR」这种指向无关行的级联噪音，
 # 真正的根因（某个块没闭合）反而一个字都看不到。
-_BLOCK_TERMINATORS = {".ENDSUB", ".ENDFOR", ".ENDWHILE", ".ENDIF", "END IF", "ELSE", ".ENDTRY", ".ENDENTITY", ".ENDENUM"}
+_BLOCK_TERMINATORS = {".ENDSUB", ".ENDFOR", ".ENDWHILE", ".ENDIF", "END IF", ".ENDSCOPE", "END SCOPE", "ELSE", ".ENDTRY", ".ENDENTITY", ".ENDENUM"}
 
 
 def _is_block_terminator(upper: str) -> bool:
@@ -590,11 +602,13 @@ def _read_as_parts(tokens: list[str], line_no: int) -> list[str]:
 _TYPE_DECL_KEYWORDS = frozenset({
     "NUM", "LONG", "DOUBLE", "FLOAT",
     "STRING", "SYMBOL", "ERROR", "CPTR", "BOOL", "VOID",
-    "ENTITY", "HANDLE", "PTR", "TO", "PROMISE", "OF", "AS", "SUB",
+    "ENTITY", "HANDLE", "PTR", "TO", "PROMISE", "OF", "AS", "SUB", "MANAGED", "FILE",
+    "LIST", "MAP",
 })
 # CAST 不接受 PROMISE OF——那是 async 的返回类型，语言里不允许强转过去。
 # 也不接受 SUB：强转出来的签名是假的，经函数引用调用时会按错的 ABI 传参。
-CAST_TYPE_KEYWORDS = _TYPE_DECL_KEYWORDS - {"PROMISE", "OF", "SUB"}
+# 容器同理：强转改不了元素类型，只会把两张不兼容的 ops 表混在一个句柄上。
+CAST_TYPE_KEYWORDS = _TYPE_DECL_KEYWORDS - {"PROMISE", "OF", "SUB", "MANAGED", "FILE", "LIST", "MAP"}
 
 
 def _parse_type_parts(parts: list[str], line_no: int) -> ast.TypeSpec:
@@ -605,6 +619,13 @@ def _parse_type_tokens(tokens: list[str], line_no: int) -> ast.TypeSpec:
     if not tokens:
         raise SonCompileError("声明缺少类型", line_no)
     first = tokens[0].upper()
+    if first == "FILE" and len(tokens) == 1:
+        return ast.TypeSpec("HANDLE", "FILE", managed=True)
+    if first == "MANAGED":
+        inner = _parse_type_tokens(tokens[1:], line_no)
+        if inner.name != "HANDLE" or inner.managed:
+            raise SonCompileError("MANAGED 只能修饰 HANDLE AS Kind", line_no)
+        return replace(inner, managed=True)
     if first == "SUB" or first.startswith("SUB("):
         # 签名里嵌着参数表，调用方按空白切出来的 token 会把括号拆散，拼回去整体再解析。
         return _parse_sub_type(" ".join(tokens), line_no)
@@ -627,6 +648,13 @@ def _parse_type_tokens(tokens: list[str], line_no: int) -> ast.TypeSpec:
         # PROMISE OF <类型>：结果类型放进 inner，与 PTR TO T 同构
         inner = _parse_type_tokens(tokens[2:], line_no)
         return ast.TypeSpec("PROMISE", inner=inner)
+    if first in {"LIST", "MAP"}:
+        # LIST OF T / MAP OF T：元素类型进 inner，和 PROMISE OF T 同构。容器天生托管，
+        # 源码里不写 MANAGED——`HANDLE AS LIST` 那条旧路仍然是手动管理的裸句柄，两者互不相干。
+        if len(tokens) < 3 or tokens[1].upper() != "OF":
+            raise SonCompileError(f"{first} 必须写成 `{first} OF <元素类型>`", line_no)
+        inner = _parse_type_tokens(tokens[2:], line_no)
+        return ast.TypeSpec(first, inner=inner, managed=True)
     if len(tokens) == 1 and first in {"STRING", "SYMBOL", "ERROR", "CPTR", "VOID", "BOOL"}:
         return ast.TypeSpec(first)
     raise SonCompileError("无法识别的类型声明", line_no)

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from ...analysis.typesys import is_error, is_string, is_sub_type, is_symbol
+from ...analysis.typesys import is_error, is_managed_resource, is_string, is_sub_type, is_symbol
 from ...core import ast
 from ...core.errors import SonCompileError
 from ...core.names import entity_c_name, module_symbol_prefix, split_module_member
-from .base import NativeGenBase
+from .base import NativeGenBase, VarSlot
 
 
 class EntitiesMixin(NativeGenBase):
@@ -52,7 +52,7 @@ class EntitiesMixin(NativeGenBase):
         raise SonCompileError(f"ENTITY {entity.name} 没有字段: {field_name}", line_no)
 
     def type_has_managed_resources(self, type_spec: ast.TypeSpec, inside_entity: bool = False) -> bool:
-        if is_string(type_spec) or is_error(type_spec) or is_sub_type(type_spec):
+        if is_managed_resource(type_spec) or is_string(type_spec) or is_error(type_spec) or is_sub_type(type_spec):
             return True
         if is_symbol(type_spec):
             return True
@@ -89,7 +89,9 @@ class EntitiesMixin(NativeGenBase):
         for index, field in reversed(list(enumerate(entity.fields))):
             field_ptr = self.next_temp()
             self.emit(f"  {field_ptr} = getelementptr inbounds {self.llvm_type(type_spec)}, ptr {ptr}, i64 0, i32 {index}")
-            if self.is_string_scalar(field.type_spec):
+            if is_managed_resource(field.type_spec):
+                self.emit_free_slot(VarSlot(field.name, field.type_spec, field_ptr))
+            elif self.is_string_scalar(field.type_spec):
                 tmp = self.next_temp()
                 self.use_runtime("free")
                 self.emit(f"  {tmp} = load ptr, ptr {field_ptr}")
