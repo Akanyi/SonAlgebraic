@@ -88,8 +88,12 @@ def test_c_return_of_temp_adopts_instead_of_copying() -> None:
     cc = c_text[c_text.find("static char* sa_cc(char* sa_a) {"):c_text.find("static char* sa_nested(void) {")]
     assert 'char* sa_tmp_4 = sa_str_concat(sa_a, "!");\n    char* sa_tmp_3 = sa_tmp_4;\n    free(sa_a);\n    return sa_tmp_3;' in cc
     nested = c_text[c_text.find("static char* sa_nested(void) {"):c_text.find("static char* sa_lit(void) {")]
-    # 内层 wrap 的结果是外层的实参，用完释放；外层结果被 RETURN 接管
-    assert 'char* sa_tmp_6 = sa_wrap("n");\n    char* sa_tmp_7 = sa_wrap(sa_tmp_6);\n    char* sa_tmp_5 = sa_tmp_7;\n    free(sa_tmp_6);\n    return sa_tmp_5;' in nested
+    # 内层结果在外层调用成功和抛错时都释放；成功路径把外层结果交给 RETURN。
+    assert 'char* sa_tmp_6 = sa_wrap("n");' in nested
+    assert 'sa_tmp_7 = sa_wrap(sa_tmp_6);' in nested
+    assert 'free(sa_tmp_6);\n        sa_throw_dispatch();' in nested
+    assert 'char* sa_tmp_5 = sa_tmp_7;\n    free(sa_tmp_6);\n    return sa_tmp_5;' in nested
+    assert "sa_strdup(" not in nested
     assert 'char* sa_tmp_8 = sa_strdup("lit");' in c_text
 
 
@@ -104,7 +108,9 @@ def test_c_caller_adopts_returned_string_and_frees_discarded_ones() -> None:
     assert 'char* sa_tmp_3 = sa_wrap("abc");\n        free(sa_tag);\n        sa_tag = sa_tmp_3;' in body
     assert "sa_set_string(&sa_tag" not in body
     assert "char* sa_tmp_4 = sa_wrap(sa_tag);\n        sa_print_string(sa_tmp_4);\n        free(sa_tmp_4);" in body
-    assert 'char* sa_tmp_5 = sa_wrap("dim");\n    free(sa_d);\n    sa_d = sa_tmp_5;' in body
+    assert re.search(
+        r'char\* sa_tmp_5 = sa_wrap\("dim"\);\s+free\(sa_d\);\s+sa_d = sa_tmp_5;', body,
+    )
     assert 'char* sa_tmp_6 = sa_wrap("discard");\n        free(sa_tmp_6);' in body
 
 

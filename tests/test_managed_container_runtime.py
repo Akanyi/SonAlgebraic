@@ -96,7 +96,7 @@ static void probe_key_copy(void* target, const void* source) {
        同一块内存，堆直接坏掉（0xC0000374）。这里出的错不会报在任何一行上。 */
     char* const* from = (char* const*)source;
     char** to = (char**)target;
-    *to = *from ? strdup(*from) : NULL;
+    *to = *from ? sa_strdup(*from) : NULL;
     if (*from && !*to) exit(1);
 }
 static void probe_key_free(void* value) {

@@ -80,7 +80,7 @@ def test_feature_blocks_are_kept_whole() -> None:
     整块取舍才安全。
     """
     features = {name for fragment in slicer.fragments() for name in fragment.features}
-    assert features == {"net", "file", "desktop", "binary", "list", "map", "gui", "async"}
+    assert features == {"net", "file", "desktop", "binary", "list", "map", "gui", "async", "container"}
 
 
 def test_feature_code_is_not_pulled_in_by_symbol_reference() -> None:
